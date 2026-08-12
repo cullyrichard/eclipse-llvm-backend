@@ -13,9 +13,20 @@ int↔float conversions are implemented and verified correct on
 See `examples/test_float*.c` for the verified test programs and their
 expected output.
 
-`double` (f64) is **not** implemented — it would need genuine 64-bit
-integer support this backend doesn't have (see the main backend
-`README.md`'s "Known limitations").
+`double` (f64) is **not** implemented as a genuine 64-bit type — instead,
+`double` is a 32-bit alias for `float` on this target (`DoubleFormat =
+IEEEsingle` in the Clang `TargetInfo`, the same choice AVR-GCC/Clang make
+by default), since real 64-bit `double` would need genuine 64-bit integer
+support this backend doesn't have (see the main backend `README.md`'s
+"Known limitations"). This is what makes `float` arguments passed
+through `printf(...)`'s varargs (which C always promotes to `double`)
+work at all: `va_arg(ap, double)` reads the same 32-bit bit pattern
+`float` already uses, no separate 64-bit path involved.
+
+Printing a `float` is `print_float(f)` (declared in `stdio.h`), **not**
+`printf("%f", f)` — see "Why print_float isn't wired into printf" below
+for why that's a deliberate, budget-driven design choice, not a missing
+feature.
 
 ## Known limit: the shared page-zero budget
 
@@ -108,6 +119,27 @@ them hard enough to surface.
    into the existing, already-robust `BR_CC` path instead, which gets
    re-invoked for any brcond node regardless of when it's introduced.
 
+7. **Storing a 32-bit value through a pointer *parameter* silently
+   discards it.** Found while implementing `print_float`'s decimal-digit
+   helper (`u32_div10`, originally `u32 u32_div10(u32 val, u32
+   *rem_out)`): the quotient (an ordinary 2-word return) always came back
+   correct, but `*rem_out = rem` never actually reached the caller's
+   variable — read back as whatever was already there (0, in every test).
+   Confirmed via an isolated repro (a single non-recursive call, no
+   aliasing, no globals) that this is a genuine, previously-unexercised
+   backend defect, not a logic bug in the caller. Nothing else in this
+   file writes a wide value through a pointer *parameter* — the existing
+   statics (`sf_add_aM` etc.) were adopted for frame-size reasons (see
+   below), which happened to sidestep this too, so it went undetected
+   until `print_float` specifically needed a "return two values" shape
+   with a small enough footprint that pure statics-communication was the
+   more natural choice. Worked around the same way: `u32_div10` now
+   returns the quotient only and communicates the remainder through a
+   static (`u32_div10_rem`) instead of a pointer. The actual root cause
+   in SelectionDAG lowering was not isolated — flagged as a follow-up
+   task, since it could affect other, not-yet-written code that
+   legitimately wants an output-pointer parameter.
+
 ## A hard-won lesson on frame size
 
 Several soft-float functions (`sf_add`, `__mulsf3`, `__divsf3`) needed
@@ -138,3 +170,45 @@ of full 32-bit masks where possible, fields reused across pipeline
 stages rather than duplicated), split into `_extract` / `_align` (or
 equivalent middle step) / `_finish` functions. See `eclipse_rt.c`'s
 soft-float section for the actual code and its own inline comments.
+`print_float` needed the exact same treatment later (split into
+`print_float_extract`/`print_float_frac`, communicating through
+`pf_frac_bits`/`pf_fbits_n`) — confirming this isn't a one-off pattern
+specific to the original three functions, but the standard shape any
+sufficiently involved 32-bit-juggling function on this target needs.
+
+## Why `print_float` isn't wired into `printf`'s `%f`
+
+The first implementation put `%f` directly in `printf()`'s format-string
+switch, calling `print_float` from there. This broke **every** program
+that calls `printf()` at all, float or not: `printf()` is called by
+nearly every program, and `internalize`/`globaldce` (see `eclipse-cc`'s
+`build_and_assemble`) decides what's reachable from a plain, static IR
+call graph — it can't see that a given call site's format string never
+contains `"%f"`. A `printf` that calls `print_float` unconditionally
+makes `print_float`, and everything it transitively calls, permanently
+reachable from *any* program that calls `printf`. Confirmed empirically:
+a bare `printf("%d\n", 42)` failed to assemble ("Address out of range"
+on dozens of soft-float symbols) once `%f` lived inside `printf`'s
+switch — the entire shared 256-word page-zero budget was gone before
+`main` did anything.
+
+This is fundamentally different from how the float-arithmetic RTLIB
+calls (`__addsf3` etc.) stay invisible to non-float programs: `llc`
+inserts *those* during instruction selection, after
+internalize/globaldce has already run, so they're invisible to it either
+way — exactly why `eclipse-cc`'s iterative "Undefined symbol" retry loop
+exists (see its own comment). `print_float` is an ordinary, explicit C
+call with no such trick available, so it has to stay opt-in: programs
+call `print_float(f)` directly instead of `printf("%f", f)`. Non-float
+programs (still the common case) pay nothing for its existence.
+
+Even as a standalone function, `print_float` isn't free: it inherently
+needs `__fixsfsi` (for the integer part) and, to avoid an even larger
+cost, deliberately does *not* need `__subsf3`/`__mulsf3` (see its own
+comment in `eclipse_rt.c` — the fraction is extracted directly from the
+mantissa bits instead of via `(f - (float)(long)f) * 1000000.0f`, which
+would have pulled in all of `sf_add` and `sf_mul` just to print a
+number). Confirmed empirically that even `print_float` *alone*, with the
+naive subtract-and-multiply approach, blew the page-zero budget on its
+own — the mantissa-bit-extraction rewrite was necessary, not just an
+optimization.

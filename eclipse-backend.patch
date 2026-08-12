@@ -204,10 +204,10 @@ index 000000000..3c7f03129
 +}
 diff --git a/clang/lib/Basic/Targets/Eclipse.h b/clang/lib/Basic/Targets/Eclipse.h
 new file mode 100644
-index 000000000..03f97c06b
+index 000000000..0307994e6
 --- /dev/null
 +++ b/clang/lib/Basic/Targets/Eclipse.h
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,135 @@
 +//===--- Eclipse.h - Declare Eclipse target feature support -----*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -234,6 +234,7 @@ index 000000000..03f97c06b
 +
 +#include "clang/Basic/TargetInfo.h"
 +#include "clang/Basic/TargetOptions.h"
++#include "llvm/ADT/APFloat.h"
 +#include "llvm/Support/Compiler.h"
 +#include "llvm/TargetParser/Triple.h"
 +
@@ -265,14 +266,27 @@ index 000000000..03f97c06b
 +    LongAlign = LongLongAlign = 16;
 +
 +    // No hand-verified Eclipse FPU opcodes exist yet either (same
-+    // README section) — float/double are given their normal IEEE sizes
-+    // so `float`/`double` remain usable *types*, relying on the
-+    // backend's default soft-float (libcall) legalization rather than
-+    // real hardware FP instructions.
++    // README section) — float relies on the backend's soft-float
++    // (libcall) runtime rather than real hardware FP instructions.
 +    FloatWidth = 32;
 +    FloatAlign = 16;
-+    DoubleWidth = LongDoubleWidth = 64;
++
++    // `double` is a 32-bit IEEE-754 *single*-precision alias for `float`
++    // on this target — the same choice AVR-GCC/AVR-Clang made (see
++    // clang/lib/Basic/Targets/AVR.h) for the same underlying reason: a
++    // real 64-bit `double` needs genuine 64-bit integer arithmetic to
++    // implement (mantissa shifts/adds/etc.), which this backend doesn't
++    // have (see README.md "Known limitations"), while the existing f32
++    // soft-float runtime (eclipse_rt.c) is already verified working.
++    // Setting DoubleFormat to IEEEsingle (not just DoubleWidth=32) is
++    // what actually makes Clang emit LLVM IR type `float` for C `double`
++    // (ASTContext::getFloatTypeSemantics drives CodeGenTypes::ConvertType)
++    // — without it, `double` would still be legalized as a 64-bit value
++    // this backend can't lower. `long double` is aliased the same way,
++    // matching AVR's precedent again.
++    DoubleWidth = LongDoubleWidth = 32;
 +    DoubleAlign = LongDoubleAlign = 16;
++    DoubleFormat = LongDoubleFormat = &llvm::APFloat::IEEEsingle();
 +
 +    PointerWidth = PointerAlign = 16;
 +    SuitableAlign = 16;
@@ -318,10 +332,9 @@ index 000000000..03f97c06b
 +
 +  std::string_view getClobbers() const override { return ""; }
 +
-+  // Not actually functional yet: the LLVM backend doesn't implement
-+  // ISD::VASTART/VAARG (see README.md "Known limitations" — no C
-+  // varargs support). This is a placeholder so TargetInfo has *an*
-+  // answer, not a claim that `<stdarg.h>` works on this target.
++  // `va_list` is just a plain pointer into the flat software stack (see
++  // EclipseISelLowering.cpp's LowerVASTART/LowerVAARG) — verified working
++  // end to end via eclipse_rt.c's printf/scanf.
 +  BuiltinVaListKind getBuiltinVaListKind() const override {
 +    return TargetInfo::CharPtrBuiltinVaList;
 +  }

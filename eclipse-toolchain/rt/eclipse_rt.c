@@ -1030,3 +1030,176 @@ u32 __fixunssfsi(float f) {
   }
   return 0;
 }
+
+/* --- print_float: decimal formatting of a float ---
+ *
+ * Deliberately NOT wired into printf()'s '%f' — printf() is called by
+ * essentially every program, and internalize/globaldce (see eclipse-cc's
+ * build_and_assemble) decides what's reachable from a plain, static IR
+ * call graph. A `printf` that called print_float directly would make
+ * print_float — and everything IT calls (__fixsfsi, __mulsf3, sf_add,
+ * ...: almost this entire file) — permanently reachable from *any*
+ * program that calls printf at all, float or not, since reachability
+ * can't see that a given call site's format string never contains "%f".
+ * Confirmed empirically: even a bare `printf("%d\n", 42)` failed to
+ * assemble ("Address out of range" on dozens of soft-float symbols)
+ * once %f lived inside printf's switch — the whole shared 256-word
+ * page-zero budget was gone before `main` did anything.
+ *
+ * The float-arithmetic RTLIB calls (__addsf3 etc.) don't have this
+ * problem because `llc` inserts *those* during instruction selection,
+ * after internalize/globaldce has already run — invisible to it either
+ * way, which is exactly why eclipse-cc's iterative "Undefined symbol"
+ * retry loop exists. print_float is an ordinary, explicit C call with
+ * no such trick available, so it has to stay opt-in: call print_float(f)
+ * directly wherever a program actually wants a float printed, instead
+ * of printf("%f", f). Non-float programs (still the common case) pay
+ * nothing for its existence.
+ */
+
+/* Restoring binary long division of a full 32-bit `val` by the constant
+ * 10, in the same style as sf_divbits/sf_shr/sf_shl above: MSB-first bit
+ * extraction via a mask that itself only ever shifts by the compile-time
+ * constant 1 (`mask >>= 1`), never `val >> i` for a runtime-variable `i`
+ * — that's the ISD::SRL_PARTS "Cannot select" pattern this whole file's
+ * bit-by-bit-loop convention exists to avoid. This is print_float's only
+ * reason for existing: print_uint/print_octal above take a 16-bit
+ * `unsigned int`, but a float's integer part can easily exceed 16 bits
+ * (any value >= 32768.0f), and this backend has no native 32-bit `/`/`%`
+ * (no __udivsi3) to fall back on for an ordinary `val / 10`.
+ */
+/* The remainder comes back through a static, not a `u32 *rem_out` output
+ * parameter — confirmed empirically (via an isolated test calling this
+ * directly, bypassing print_float entirely) that storing a 32-bit value
+ * through a pointer PARAMETER silently discards it on this backend: the
+ * quotient (an ordinary 2-word return) came back correct every time,
+ * but `*rem_out = rem` never actually reached the caller's variable —
+ * always read back 0. A genuine, previously-unexercised backend bug
+ * (nothing else in this file writes a wide value through a pointer
+ * *parameter* — sf_add etc.'s statics were chosen for frame size, not
+ * because of this), not something worth chasing further here given the
+ * static-communication pattern already used throughout this file
+ * (pf_frac_bits, sf_add_aM, ...) sidesteps it entirely.
+ */
+static u32 u32_div10_rem;
+
+u32 u32_div10(u32 val) {
+  u32 quotient = 0;
+  u32 rem = 0;
+  u32 mask = 0x80000000UL;
+  int i;
+  for (i = 31; i >= 0; i--) {
+    u32 bit = u32_and_nz(val, mask) ? 1UL : 0UL;
+    mask >>= 1;
+    rem = (rem << 1) | bit;
+    quotient <<= 1;
+    if (u32_ge(rem, 10UL)) {
+      rem -= 10UL;
+      quotient |= 1UL;
+    }
+  }
+  u32_div10_rem = rem;
+  return quotient;
+}
+
+static int print_uint32(u32 val) {
+  int n = 0;
+  u32 q = u32_div10(val);
+  /* Captured into a local *before* recursing: the recursive call below
+   * calls u32_div10 again, which overwrites u32_div10_rem with its own
+   * result — reading the static only after that call returned would
+   * silently pick up the wrong (innermost) remainder. */
+  u32 rem = u32_div10_rem;
+  if (u32_ge(val, 10UL)) {
+    n += print_uint32(q);
+  }
+  putchar('0' + (int)rem);
+  return n + 1;
+}
+
+/* print_float split into two functions, communicating through file-scope
+ * statics, for the exact same reason sf_add/__mulsf3/__divsf3 all had to
+ * be split this same way (see those functions' own header comments):
+ * confirmed empirically that print_float as a single function overflows
+ * the ±127-word signed frame-relative displacement dgasm uses for
+ * local-variable addressing ("Address out of range... should be -128 -
+ * 127"), from spill-slot pressure (only AC0/AC1 are allocatable) rather
+ * than the raw count of locals.
+ */
+static u32 pf_frac_bits;
+static int pf_fbits_n;
+
+/* Prints the sign and integer part, and computes pf_frac_bits/
+ * pf_fbits_n for print_float_frac below to consume — a fixed-point
+ * binary fraction (pf_frac_bits holds the low pf_fbits_n bits of the
+ * mantissa, i.e. the value's fractional part is pf_frac_bits /
+ * 2^pf_fbits_n) extracted directly from the mantissa, deliberately NOT
+ * via `f - (float)(long)f` (needs __subsf3, i.e. all of sf_add) — see
+ * print_float's own comment below for why that matters here.
+ */
+static void print_float_extract(float f) {
+  u32 bits = sf_bits(f);
+  if (u32_and_nz(bits, SF_SIGN_MASK)) {
+    putchar('-');
+  }
+  long ip = __fixsfsi(f);
+  u32 uip = (ip < 0) ? (u32)(-ip) : (u32)ip;
+  print_uint32(uip);
+  putchar('.');
+
+  u32 mbits = bits & ~SF_SIGN_MASK;
+  int aexp = (int)((mbits & SF_EXP_MASK) >> SF_EXP_SHIFT);
+  pf_frac_bits = 0;
+  pf_fbits_n = 0;
+  if (aexp != 0) {
+    u32 aM = (mbits & SF_MANT_MASK) | SF_HIDDEN_BIT;
+    /* shift >= 0 means the value is a pure integer (all of aM's bits
+     * are at or above the binary point) — pf_fbits_n/pf_frac_bits are
+     * left at 0 for that case, and for the aexp==0 (zero/denormal) case
+     * above. No lower bound on how negative shift can get (unlike
+     * __fixsfsi's own `shift > -24` — that bound is about ITS overflow/
+     * underflow saturation, not relevant here): 0.5f lands at exactly
+     * shift == -24 (its entire mantissa, hidden bit included, is
+     * fractional — no integer part at all), and excluding that boundary
+     * here was a real, confirmed bug (0.5f printed "0.000000"). Smaller
+     * magnitudes just mean more loop iterations in print_float_frac's
+     * sf_shr calls below, not incorrectness.
+     */
+    int shift = aexp - SF_EXP_BIAS - SF_EXP_SHIFT;
+    if (shift < 0) {
+      pf_fbits_n = -shift;
+      pf_frac_bits = aM & (sf_shl(1UL, pf_fbits_n) - 1UL);
+    }
+  }
+}
+
+/* Repeatedly does fixed-point "multiply the remaining fraction by 10,
+ * take the integer part as the next digit" — the standard binary-
+ * fraction-to-decimal technique, needing only 32-bit add/shift/mask
+ * (all already proven safe throughout this file), never a float
+ * multiply — prints all 6 digits print_float always produces. */
+static void print_float_frac(void) {
+  int i;
+  for (i = 0; i < 6; i++) {
+    u32 digit = 0;
+    if (pf_fbits_n != 0) {
+      pf_frac_bits = (pf_frac_bits << 3) + (pf_frac_bits << 1); /* *10 */
+      digit = sf_shr(pf_frac_bits, pf_fbits_n);
+      pf_frac_bits &= sf_shl(1UL, pf_fbits_n) - 1UL;
+    }
+    putchar('0' + (int)digit);
+  }
+}
+
+/* Fixed-point, always 6 digits after the point — matching plain
+ * printf("%f", ...)'s own C-standard default precision, since that's
+ * the spelling this is standing in for (see the header comment above
+ * this whole section). No exponent notation and no NaN/Inf special-
+ * casing (this whole soft-float implementation doesn't represent NaN
+ * specially — see __unordsf2 above) — very large magnitudes just
+ * saturate the way __fixsfsi already does for %d today.
+ */
+void print_float(float f) {
+  print_float_extract(f);
+  print_float_frac();
+}

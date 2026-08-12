@@ -28,4 +28,24 @@ int printf(const char *fmt, ...);
  */
 int scanf(const char *fmt, ...);
 
+/* Prints `f` fixed-point with 6 digits after the decimal point (no
+ * exponent notation, no NaN/Inf), followed by nothing (no trailing
+ * newline) — same rounding/precision behavior as printf("%f", f), but
+ * NOT reachable through printf() itself: printf() is called by nearly
+ * every program on this target, and wiring float formatting into its
+ * '%f' case would make the *entire* soft-float runtime (eclipse_rt.c's
+ * "soft float" section — sf_add, __mulsf3, __fixsfsi, ...) statically
+ * reachable from any program that calls printf at all, whether it uses
+ * %f or not, permanently consuming this target's shared 256-word
+ * page-zero budget. Confirmed empirically: even printf("%d\n", 42)
+ * failed to assemble once %f lived inside printf's switch. Call this
+ * directly instead: print_float(3.5f) rather than printf("%f", 3.5f).
+ * No extra opt-in needed beyond just calling it — non-float programs
+ * that never call print_float still pay nothing for its existence.
+ * Returns nothing (unlike printf, no character count) — dropping that
+ * bookkeeping was part of what got this under the ±127-word per-
+ * function frame limit; see print_float's own comment in eclipse_rt.c.
+ */
+void print_float(float f);
+
 #endif

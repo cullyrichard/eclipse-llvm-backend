@@ -33,8 +33,10 @@ described there are the kind that are easy to reintroduce by accident.
     linker/sections, so page-zero data must precede code textually; see
     its own header comment for the full reasoning, including the
     long-jump relaxation it also does).
-  - `rt/` — the C runtime library: `stdio.h` (`printf`/`scanf`, now
-    including `float`/`%o` support), `string.h`, `stdlib.h`, `ctype.h`,
+  - `rt/` — the C runtime library: `stdio.h` (`printf`/`scanf`, `%o`
+    support, plus `print_float(float)` for printing floats — deliberately
+    a separate function rather than `printf`'s `%f`, see
+    `SOFT_FLOAT_NOTES.md` for why), `string.h`, `stdlib.h`, `ctype.h`,
     device I/O macros, and (`rt/eclipse_rt.c`'s tail half) a full
     IEEE-754 single-precision soft-float implementation — see
     `SOFT_FLOAT_NOTES.md`.
@@ -212,6 +214,19 @@ individually — each fits comfortably within the page-zero budget.
 to exceed that budget — see its own header comment and
 `SOFT_FLOAT_NOTES.md`'s "Known limit" section.
 
+`examples/test_print_float.c` exercises `print_float` — the way to
+actually *print* a float (see "Why print_float isn't wired into printf"
+in `SOFT_FLOAT_NOTES.md` for why it isn't `printf("%f", ...)`):
+
+```bash
+./eclipse-toolchain/eclipse-cc -o /tmp/test_print_float.simh examples/test_print_float.c
+{ cat /tmp/test_print_float.simh; echo 'dep PC 100'; echo 'run 100'; echo 'quit'; } | eclipseemu
+```
+
+Expect `3.000000`, `0.500000`, `-2.250000`, `100000.000000` — no retry
+message this time (`print_float` needs no float-arithmetic libcalls, by
+design; see `SOFT_FLOAT_NOTES.md`).
+
 ## Real hardware
 
 `eclipse-compile.sh input.c output.ab` compiles to the real DG
@@ -236,7 +251,10 @@ issues in `SOFT_FLOAT_NOTES.md` — could easily resurface in new code that
 touches wide (32-bit) values or multi-word globals).
 
 Natural next steps, roughly in order of how contained they are:
-- `double` (f64) soft-float support — same approach as `float`, but
+- Genuine 64-bit `double` (f64) soft-float support — `double` currently
+  aliases 32-bit `float` (see `SOFT_FLOAT_NOTES.md`), which is fine for
+  most purposes but loses precision on values that need real double
+  range/precision. Real support needs the same approach as `float`, but
   needs genuine 64-bit integer support this backend doesn't have yet
   (see the main backend `README.md`'s "Known limitations").
 - Extending frame-relative addressing beyond the current ±127-word limit
