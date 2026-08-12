@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# eclipse-cc: compile one or more C source files to a runnable dgasm/
+# eclipseemu program for the Data General Nova/Eclipse LLVM backend.
+#
+# Usage: eclipse-cc [-o out.simh] file.c [file.c ...]
+#
+# Pipeline: clang -cc1 (one .ll per source, incl. the runtime library) ->
+# llvm-link (merge into one module) -> opt -internalize,globaldce (strip
+# whichever runtime-library functions the program doesn't actually call
+# — page-zero data is a hard, shared 256-word budget across the *whole*
+# program; every unused function's constant pool/call-slot/etc. eats
+# into it for nothing, confirmed empirically: eclipse_rt.c linked in
+# whole overflows page-zero on its own once enough of it exists) -> llc
+# -> reorder_asm.py (dgasm has no linker/sections, so page-zero data
+# must precede code textually — see reorder_asm.py's own comment) ->
+# dgasm.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LLVM_BUILD="${LLVM_BUILD:-$HOME/dev/llvm-build}"
+CLANG="$LLVM_BUILD/bin/clang"
+LLC="$LLVM_BUILD/bin/llc"
+LLVM_LINK="$LLVM_BUILD/bin/llvm-link"
+OPT="$LLVM_BUILD/bin/opt"
+RT_SRC="$SCRIPT_DIR/rt/eclipse_rt.c"
+REORDER="$SCRIPT_DIR/reorder_asm.py"
+TRIPLE="eclipse-dg-none"
+RESOURCE_DIR="$("$CLANG" -print-resource-dir)"
+
+out="a.simh"
+sources=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) sources+=("$1"); shift ;;
+  esac
+done
+
+if [ ${#sources[@]} -eq 0 ]; then
+  echo "eclipse-cc: no input files" >&2
+  exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+ll_files=()
+
+compile_one() {
+  local src="$1" base ll
+  base="$(basename "${src%.*}")"
+  ll="$work/${base}.ll"
+  # -nostdsysteminc: without it, -cc1 (bypassing the normal driver, which is
+  # what would otherwise set this up) falls through to the *host*
+  # machine's real system headers on a bare #include <...> lookup — e.g.
+  # <stdio.h> silently resolving to glibc's, whose declarations (FILE*,
+  # va_list layout, 64-bit size_t, ...) are wrong for this 16-bit
+  # freestanding target. -isystem "$RESOURCE_DIR/include" keeps clang's
+  # own compiler-provided headers (stdarg.h, stddef.h) reachable, since
+  # those aren't part of this project's own headers. -I "rt/include" is
+  # this project's real <stdio.h>/<string.h>/<ctype.h>/<stdlib.h>; -I
+  # "rt" is kept for "eclipse_rt.h" (quoted-include backward
+  # compatibility — see eclipse_rt.h).
+  "$CLANG" -cc1 -triple "$TRIPLE" -nostdsysteminc \
+    -isystem "$RESOURCE_DIR/include" \
+    -I "$SCRIPT_DIR/rt/include" -I "$SCRIPT_DIR/rt" \
+    -emit-llvm "$src" -o "$ll"
+  ll_files+=("$ll")
+}
+
+for src in "${sources[@]}"; do
+  compile_one "$src"
+done
+compile_one "$RT_SRC"
+
+merged="$work/merged.ll"
+"$LLVM_LINK" -S "${ll_files[@]}" -o "$merged"
+
+# Only `main` needs to survive as an external symbol — this is always
+# the whole program (dgasm has no separate-compilation/linking model),
+# so anything unreachable from it is genuinely dead, not "might be used
+# by another translation unit later" the way it would be in a normal
+# multi-TU build.
+#
+# The soft-float runtime symbols are a special case: `llc`'s own codegen
+# inserts calls to these (float arithmetic/compare/convert get
+# "softened" into libcalls during instruction selection, not visible as
+# explicit IR calls) *after* this opt pass has already run — so from
+# globaldce's point of view they're unreferenced and get stripped, even
+# on programs that genuinely need them. Confirmed empirically
+# ("Undefined symbol: __fixsfsi" at the dgasm step on any program using
+# `float`).
+#
+# Protecting all of them unconditionally, always, was tried first and
+# rejected: it costs real page-zero budget even for a program using
+# just one float op, confirmed to push an otherwise-small,
+# single-float-function program over the shared 256-word ceiling on its
+# own (see eclipse_rt.c's soft-float section header comment and
+# README.md's "Known limitations") — before this program even had a
+# chance to need more than one or two of the fourteen. So instead:
+# iteratively discover exactly which ones this specific program needs.
+# Each retry adds only the symbols dgasm *just* reported undefined
+# (there can be more than one still-undefined per pass — e.g. protecting
+# __addsf3 alone doesn't pull in __fixsfsi too, they're independent
+# libcalls) and tries again, stopping as soon as a pass reports no *new*
+# undefined-symbol names (either success, or a genuine failure — page-
+# zero overflow from needing too many at once, or a real undefined
+# symbol unrelated to soft-float — that finding more names won't fix.
+build_and_assemble() {
+  local pub_api="$1"
+  local stripped="$work/stripped.ll"
+  "$OPT" -S -passes="internalize,globaldce" \
+    -internalize-public-api-list="$pub_api" \
+    "$merged" -o "$stripped"
+
+  local asm="$work/out.s"
+  "$LLC" -mtriple="$TRIPLE" -filetype=asm "$stripped" -o "$asm"
+
+  local reordered="$work/out_r.s"
+  python3 "$REORDER" "$asm" "$reordered"
+
+  dgasm -t eclipse_s140 -f simh -o "$out" "$reordered"
+}
+
+protected="main"
+pass=1
+while :; do
+  if output="$(build_and_assemble "$protected" 2>&1)"; then
+    echo "$output"
+    break
+  fi
+  missing="$(echo "$output" | grep -oE 'Undefined symbol: __[A-Za-z0-9_]+' \
+             | sed 's/Undefined symbol: //' | sort -u)"
+  new="$(comm -23 <(echo "$missing") <(echo "$protected" | tr ',' '\n' | sort -u))"
+  if [ -z "$new" ] || [ "$pass" -ge 15 ]; then
+    echo "$output" >&2
+    exit 1
+  fi
+  echo "eclipse-cc: retrying with $(echo "$new" | tr '\n' ' ')protected (needed by this program)" >&2
+  protected="$protected,$(echo "$new" | tr '\n' ',' | sed 's/,$//')"
+  pass=$((pass + 1))
+done
+
+echo "eclipse-cc: wrote $out"
