@@ -2882,10 +2882,10 @@ index 000000000..126c6b68b
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.h b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
 new file mode 100644
-index 000000000..5ae7c4a10
+index 000000000..87023efbb
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,262 @@
 +//===-- EclipseISelLowering.h - Eclipse DAG Lowering Interface -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -3024,6 +3024,55 @@ index 000000000..5ae7c4a10
 +  EVT getOptimalMemOpType(LLVMContext &Context, const MemOp &Op,
 +                           const AttributeList &FuncAttributes) const override {
 +    return Op.isAligned(Align(2)) ? MVT::Other : MVT::i8;
++  }
++
++  // Same word-vs-byte confusion as getOptimalMemOpType above, hitting a
++  // different generic transform: TargetLowering::SimplifySetCC's "shorten
++  // the load feeding `(and load, const) == 0`" combine (TargetLowering.cpp,
++  // the `(LHS is '(and load, const)' ...` block) and DAGCombiner's sibling
++  // ReduceLoadWidth/ReduceLoadOpStoreWidth combines. Given `if (b & (1L <<
++  // 27))` on a 32-bit local `b`, this generic combine sees that only bit 27
++  // is ever demanded, notices all of the mask's set bits fall inside a
++  // single *byte* of the 32-bit value, and rewrites the whole `and load,
++  // const` into a narrower i8 load at that byte's offset plus a
++  // correspondingly right-shifted 8-bit mask (here: an i8 load at byte
++  // offset 0 ANDed with 0x08, standing in for the original `and (i32 load),
++  // 0x08000000`). That rewrite is only sound on hardware where an i8 load
++  // at a nonzero/interior byte offset actually extracts *that specific
++  // byte*, right-justified — true on essentially every byte-addressable
++  // target, but not this one: Eclipse has no LDB/STB (see this file's
++  // header comment on `char` storage), so EclipseISelDAGToDAG's i8-extload
++  // selection just loads the *containing 16-bit word verbatim*, unshifted.
++  // Declaring i8 EXTLOAD-from-i16 "Legal" above is correct only for loads
++  // that were already i8 in the IR (a real `char`, stored one-per-word, top
++  // byte always zero — no actual narrowing happens); it does not hold for
++  // an i8 load *synthesized* by narrowing a wider (e.g. i32) load down to
++  // one byte of a multi-word value, which is exactly what these combines
++  // do. Left unguarded, the synthesized load returns the whole word
++  // (e.g. 2048 = 0x0800) while the combine's precomputed mask (0x08)
++  // targets the low 8 bits it *assumed* the load would land in — so
++  // `AND(2048, 8)` is always 0 regardless of the true value of `b`,
++  // silently mis-evaluating the branch condition. Confirmed directly via
++  // `llc -debug-only=isel` on `if (b & (1L << 27)) b -= 1L << 28;`: the
++  // pre-legalization combine rewrote `and i32 %load, 134217728` into `and
++  // i8 %narrowload, 8`, and the emitted LDFI loaded the unshifted high word
++  // — the branch was silently never taken for *any* value of `b`, which
++  // from the C level looked like "the if-branch's store to `b` gets
++  // discarded" (see EclipseFrameLowering.cpp / PerformDAGCombine's WORD_ADD
++  // for the two sibling wide-value-addressing bugs this was first suspected
++  // to be a third instance of — it isn't; nothing downstream of the branch
++  // is wrong, the branch condition itself is computed wrong). Vetoing only
++  // i8 here leaves every width Eclipse actually supports untouched: i16
++  // reductions, and reducing a >16-bit load down to one of its already
++  // word-aligned i16 halves (handled correctly elsewhere by the type
++  // legalizer's own multi-word splitting), both still fire normally.
++  bool shouldReduceLoadWidth(
++      SDNode *Load, ISD::LoadExtType ExtTy, EVT NewVT,
++      std::optional<unsigned> ByteOffset = std::nullopt) const override {
++    if (NewVT == MVT::i8)
++      return false;
++    return TargetLowering::shouldReduceLoadWidth(Load, ExtTy, NewVT,
++                                                  ByteOffset);
 +  }
 +
 +  // Inline asm: the escape hatch for device I/O instructions (SKPDN,

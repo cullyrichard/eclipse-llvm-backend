@@ -19,6 +19,16 @@ own original relative order. See llvm/lib/Target/Eclipse/EclipseAsmPrinter.h
 in the Eclipse LLVM backend for why this lives here instead of in the
 backend itself.
 
+Full pipeline (see main(), and each stage's own section below):
+sanitize_identifiers -> reorder -> dedup_constants -> relax_long_jumps.
+dedup_constants merges byte-identical constant-pool entries that LLVM's
+per-function MachineConstantPool emits independently in every function
+that happens to use the same literal value — confirmed to reclaim 100+
+duplicate page-zero words in real programs (see its own section below).
+relax_long_jumps must run last since it computes real addresses from the
+final line layout; dedup_constants must run before it for exactly that
+reason (removing duplicate lines changes addresses).
+
 Usage: reorder_asm.py < in.s > out.s
    or: reorder_asm.py in.s out.s
 """
@@ -252,16 +262,101 @@ def relax_long_jumps(text: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# --- constant-pool deduplication -------------------------------------------
+#
+# LLVM's MachineConstantPool is *per function* — the same literal value
+# (e.g. the exponent bias, a hidden-bit mask half, a loop bound) used in
+# several different functions gets a separate, independently-named CPI
+# entry in each one, even though the value is byte-identical. Confirmed
+# empirically on eclipse_rt.c's soft-float section (which reuses a small
+# set of constants extremely heavily across sf_add/sf_mul/sf_div/
+# __fixsfsi/print_float/...): well over 100 duplicate single-word page-
+# zero slots in one real program, out of a 256-word total budget.
+#
+# Every CPI entry is exactly one 16-bit word — EclipseAsmPrinter::
+# emitConstantPool emits one `var CPIn_m = value` line per
+# MachineConstantPool entry, and this backend's type legalizer splits any
+# wider-than-i16 constant into independent i16 halves *before* it reaches
+# the constant pool (confirmed by reading emitConstantPool directly: it
+# only ever handles a plain ConstantInt via getSExtValue(), never a
+# multi-word value) — so entries are safe to dedupe purely by value, with
+# no multi-word grouping/pairing to worry about. And every *reference* is
+# a bare `LDA/STA ac,CPIn_m` symbol operand — confirmed by grepping real
+# generated assembly for every CPI use, none are offset against a
+# neighboring entry (e.g. no `CPIn_m+1`) — so nothing depends on any two
+# CPI entries being adjacent or a fixed distance apart, and a plain
+# "rename every reference to the surviving symbol" is sufficient.
+#
+# Other page-zero `var` kinds (*_SLOT, *_PTR, *_offN) are deliberately
+# NOT touched here: their symbol names are already derived from their
+# target (e.g. `var foo_SLOT = foo`), so LLVM's own symbol table already
+# gives them natural, automatic sharing — a given target only ever gets
+# one slot declaration no matter how many call/reference sites there
+# are. CPI entries are the one kind that's genuinely duplicated today,
+# because MachineConstantPool has no equivalent cross-function identity.
+#
+# Runs after reorder() (so the var lines this cares about are already
+# gathered together) and before relax_long_jumps() (which computes exact
+# addresses from the *final* line layout — it must see the post-dedup
+# file, not count the soon-to-be-removed duplicate lines).
+
+CPI_DECL_RE = re.compile(r"^\s*var\s+(CPI\d+_\d+)\s*=\s*(.+?)\s*$")
+IDENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _rewrite_idents(line: str, rename: dict) -> str:
+    """Substitutes identifier tokens per `rename`, skipping the contents of
+    double-quoted string literals — same quote-awareness as
+    sanitize_identifiers above, and for the same reason (a string
+    literal's own text must never be touched, even if it happens to
+    contain something that looks like a CPI name)."""
+    parts = []
+    pos = 0
+    for m in QUOTED_RE.finditer(line):
+        parts.append(IDENT_TOKEN_RE.sub(lambda t: rename.get(t.group(0), t.group(0)),
+                                         line[pos:m.start()]))
+        parts.append(m.group(0))
+        pos = m.end()
+    parts.append(IDENT_TOKEN_RE.sub(lambda t: rename.get(t.group(0), t.group(0)),
+                                     line[pos:]))
+    return "".join(parts)
+
+
+def dedup_constants(text: str) -> str:
+    lines = text.splitlines()
+    canonical_for_value = {}
+    rename = {}
+    drop = set()
+
+    for i, line in enumerate(lines):
+        m = CPI_DECL_RE.match(line)
+        if not m:
+            continue
+        name, value = m.group(1), m.group(2)
+        existing = canonical_for_value.get(value)
+        if existing is None:
+            canonical_for_value[value] = name
+        else:
+            rename[name] = existing
+            drop.add(i)
+
+    if not rename:
+        return "\n".join(lines) + "\n"
+
+    out = [_rewrite_idents(line, rename) for i, line in enumerate(lines) if i not in drop]
+    return "\n".join(out) + "\n"
+
+
 def main() -> int:
     if len(sys.argv) == 3:
         with open(sys.argv[1], "r") as f:
             text = f.read()
-        result = relax_long_jumps(reorder(sanitize_identifiers(text)))
+        result = relax_long_jumps(dedup_constants(reorder(sanitize_identifiers(text))))
         with open(sys.argv[2], "w") as f:
             f.write(result)
     elif len(sys.argv) == 1:
         text = sys.stdin.read()
-        sys.stdout.write(relax_long_jumps(reorder(sanitize_identifiers(text))))
+        sys.stdout.write(relax_long_jumps(dedup_constants(reorder(sanitize_identifiers(text)))))
     else:
         print("usage: reorder_asm.py [in.s out.s]", file=sys.stderr)
         return 2

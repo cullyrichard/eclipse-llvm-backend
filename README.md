@@ -32,8 +32,11 @@ described there are the kind that are easy to reintroduce by accident.
     passthrough setup, if applicable).
   - `reorder_asm.py` — a required post-processing pass (dgasm has no
     linker/sections, so page-zero data must precede code textually; see
-    its own header comment for the full reasoning, including the
-    long-jump relaxation it also does).
+    its own header comment for the full reasoning), which also does
+    long-jump relaxation and cross-function constant-pool deduplication
+    (reclaims page-zero budget LLVM's per-function constant pool
+    otherwise wastes on duplicate literal values — see
+    `SOFT_FLOAT_NOTES.md`'s "Known limit" section).
   - `rt/` — the C runtime library: `stdio.h` (`printf`/`scanf`, `%o`
     support, plus `print_float(float)` for printing floats — deliberately
     a separate function rather than `printf`'s `%f`, see

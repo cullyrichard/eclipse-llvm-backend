@@ -43,6 +43,26 @@ protecting soft-float symbols from dead-code-elimination for the
 specific functions your program actually calls — see the comment in
 either script for how.
 
+**`reorder_asm.py` now deduplicates constant-pool entries** (its
+`dedup_constants` pass): LLVM's `MachineConstantPool` is *per function*,
+so the same literal value used in several different functions — very
+common across this file's `sf_add`/`sf_mul`/`sf_div`/`__fixsfsi`/
+`print_float`/... helpers, which all reuse a small set of constants
+(exponent bias, mask halves, loop bounds) — got a separate, independently
+named page-zero word in each one, even though the value was identical.
+Confirmed to reclaim 100+ duplicate words in a real program combining
+several soft-float functions, and on its own resolved a real page-zero
+overflow in a program combining device I/O, several `printf` calls, and
+float conversion — see `dedup_constants`'s own comment in
+`reorder_asm.py` for the full reasoning (why it's safe: every constant-
+pool entry is exactly one 16-bit word with no multi-word grouping to
+preserve, and every reference is a bare symbol operand with no offset
+arithmetic against a neighbor). This is a strict improvement — it
+reclaims genuine waste, not the floor cost of a program's actually-
+unique data — so combining *many* distinct float capabilities in one
+program can still exceed the budget; it just takes more to get there
+now.
+
 ## Bugs found and fixed along the way
 
 None of these were specific to soft-float in the sense of "float math is
@@ -139,6 +159,41 @@ them hard enough to surface.
    in SelectionDAG lowering was not isolated — flagged as a follow-up
    task, since it could affect other, not-yet-written code that
    legitimately wants an output-pointer parameter.
+
+8. **A load-narrowing DAG combine silently misread wide-value bit
+   tests.** `TargetLowering::SimplifySetCC` has a generic combine that
+   rewrites `(wide_value & constant) == 0`-shaped comparisons into a
+   narrower, byte-sized load at a shifted offset — a sound optimization
+   on byte-addressable hardware, since only one byte of the wide value
+   is ever tested. This backend has no byte-addressing instructions at
+   all, and its declaration that an i8 `EXTLOAD`-from-i16 is `Legal` was
+   only ever intended for genuine `char` values (which occupy a whole
+   16-bit word here, top byte always zero) — not for the DAG combiner to
+   reuse when narrowing into the *middle* of a wider (32-bit) multi-word
+   value. Left unguarded, the synthesized narrow load returned the
+   whole, unshifted word instead of the intended byte, while the
+   combine's precomputed mask still targeted the low bits it *assumed*
+   the load would land in — so `if (wide_var & constant)` silently
+   evaluated the wrong way whenever the constant's set bit wasn't in the
+   low byte (e.g. `if (mant_int & (1L << 27)) mant_int -= (1L << 28);`
+   never took the branch, for any value of `mant_int`). Found while
+   writing a standalone routine to decode a hardware FPU's raw
+   fixed-point output back into a `float` — not part of the shipped
+   soft-float runtime itself, but exactly the kind of 32-bit
+   bit-manipulation code that exercises this class of bug the same way
+   soft-float's own arithmetic does. Confirmed directly via `llc
+   -debug-only=isel`: the combine rewrote `and i32 %load, 134217728`
+   into `and i8 %narrowload, 8`, and the emitted `LDFI` loaded the
+   unshifted high word regardless of the true value being tested. Fixed
+   by overriding `TargetLowering::shouldReduceLoadWidth`
+   (`EclipseISelLowering.h`) to veto the narrowing specifically when
+   `NewVT == MVT::i8` — see that override's own comment for the full
+   reasoning, including why every other width Eclipse actually uses
+   (i16 reductions, and reducing a >16-bit load down to one of its
+   already word-aligned i16 halves) is left untouched. Verified against
+   a minimal repro, against the FPU-decode routine that surfaced it, and
+   against a regression sweep of several existing example programs, all
+   passing.
 
 ## A hard-won lesson on frame size
 
