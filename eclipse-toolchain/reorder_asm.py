@@ -20,14 +20,19 @@ in the Eclipse LLVM backend for why this lives here instead of in the
 backend itself.
 
 Full pipeline (see main(), and each stage's own section below):
-sanitize_identifiers -> reorder -> dedup_constants -> relax_long_jumps.
+sanitize_identifiers -> reorder -> dedup_constants -> relax_long_jumps ->
+fix_stack_pointer.
 dedup_constants merges byte-identical constant-pool entries that LLVM's
 per-function MachineConstantPool emits independently in every function
 that happens to use the same literal value — confirmed to reclaim 100+
 duplicate page-zero words in real programs (see its own section below).
-relax_long_jumps must run last since it computes real addresses from the
-final line layout; dedup_constants must run before it for exactly that
-reason (removing duplicate lines changes addresses).
+relax_long_jumps must run after dedup_constants since it computes real
+addresses from the final line layout, and removing duplicate lines
+changes addresses. fix_stack_pointer must run last of all, for the same
+"final addresses only" reason, plus one more: relax_long_jumps can itself
+grow the program (new long-jump slots), which shifts where the program's
+data actually ends — see fix_stack_pointer's own section below for why
+that end address matters.
 
 Usage: reorder_asm.py < in.s > out.s
    or: reorder_asm.py in.s out.s
@@ -170,8 +175,9 @@ def _string_literal_word_count(escaped_body: str) -> int:
 
 def compute_addresses(lines):
     """Returns (label_addr: name -> address, line_addr: per-line address
-    or None for zero-width/non-statement lines), replicating dgasm's own
-    pass1 sequential address assignment."""
+    or None for zero-width/non-statement lines, end_addr: the address one
+    past the last word dgasm will actually deposit), replicating dgasm's
+    own pass1 sequential address assignment."""
     addr = 0o100  # dgasm's own default before any `org`
     label_addr = {}
     line_addr = [None] * len(lines)
@@ -200,7 +206,7 @@ def compute_addresses(lines):
         # EclipseInstrInfo.td's file header — so nothing multi-word).
         line_addr[i] = addr
         addr += 1
-    return label_addr, line_addr
+    return label_addr, line_addr, addr
 
 
 def _data_block_end(lines) -> int:
@@ -226,7 +232,7 @@ def relax_long_jumps(text: str) -> str:
     }
 
     for _ in range(50):  # bounded fixed-point iteration; see module doc
-        label_addr, line_addr = compute_addresses(lines)
+        label_addr, line_addr, _end_addr = compute_addresses(lines)
         new_slots = []
         changed = False
         for i, line in enumerate(lines):
@@ -347,16 +353,114 @@ def dedup_constants(text: str) -> str:
     return "\n".join(out) + "\n"
 
 
+# --- stack-pointer placement -----------------------------------------------
+#
+# Bug found while verifying bug #8's fix (see SOFT_FLOAT_NOTES.md): with
+# only two allocatable registers (AC0/AC1), almost everything on this
+# target spills to a software stack, implemented as a page-zero cell
+# (`_SP`) holding the current top-of-stack address, pushed/popped via
+# `STA n,@_SP` / `DSZ _SP,0` (see EclipseAsmPrinter.cpp's call-lowering).
+# `EclipseAsmPrinter::emitStartOfAsmFile` always hardcoded its *initial*
+# value to `020000` (8192 decimal) — chosen once, with no relationship to
+# how much data the final program would actually contain.
+#
+# reorder() above deliberately moves every *bulk* (non-page-zero) global —
+# every string literal and file-scope static, i.e. everything that isn't a
+# page-zero pointer slot or constant-pool entry — to the very end of the
+# file, so dgasm deposits it at the *highest* addresses the program uses.
+# That address grows with the linked program's size (more functions
+# pulled in — even ones genuinely dead at runtime: `eclipse-cc`'s
+# symbol-protection mechanism has to keep a libcall's own code reachable
+# to satisfy dgasm's "Undefined symbol" check even for a program that
+# never actually reaches it, e.g. protecting `__ltsf2` for a `<`
+# comparison also pulls in `sf_cmp` and its own helpers). Nothing before
+# this pass ever compared that growing address against the fixed 8192
+# stack origin sitting right above it: a small program leaves a large gap,
+# but a large enough one can shrink that gap until ordinary call/recursion
+# depth (e.g. `print_uint32`'s one-recursive-call-per-decimal-digit)
+# drives the stack pointer down *into* that data — silently corrupting
+# live globals and strings, and, once deep enough, a saved return address,
+# producing exactly the "a string prints with garbled characters, then
+# execution runs away to the reset vector" failure this was found from.
+# Confirmed directly: examining word 0102 (the cell holding the live `_SP`
+# value) mid-run on the failing repro showed it reaching decimal 7605
+# while that same program's own data extended to 7755 — the stack had
+# already descended into live data before the eventual crash. dgasm itself
+# never catches this: unlike the hard page-zero (0-255) ceiling it
+# enforces for every `LDA`/`STA` displacement, it has no equivalent check
+# for "does the stack collide with static data" — to dgasm, both are just
+# plain memory words.
+#
+# Fixed here, not in the backend: EclipseAsmPrinter emits _SP's value long
+# before the final program layout exists (dedup_constants and
+# relax_long_jumps haven't run yet, and it has no way to know what else
+# will or won't end up linked in). This pass runs last of all, once
+# compute_addresses can see the *actual* final end-of-program address, and
+# repoints `_SP` comfortably above it instead of trusting a fixed guess.
+# dgasm's own MAX_MEMORY_WORDS (confirmed by reading assembler.c directly)
+# is 65536 — this ISA's full 16-bit address space — so there's abundant
+# room: STACK_MARGIN below leaves far more headroom than any call/
+# recursion depth this backend's calling convention could plausibly reach
+# (the failing repro above only ever descended a few hundred words before
+# corrupting something), while still failing loudly — instead of silently
+# emitting an invalid or wrapped address — on the pathological case of a
+# program whose own data nearly fills that space outright.
+
+STACK_MARGIN = 4096  # words reserved for the software stack above the
+                      # program's own highest data address — see this
+                      # section's comment for why this is generous.
+MAX_MEMORY_WORDS = 65536  # dgasm's own limit (assembler.c), this ISA's
+                           # full 16-bit address space.
+
+SP_DECL_RE = re.compile(r"^(\s*var\s+_SP\s*=\s*)(\S+)(.*)$")
+
+
+def fix_stack_pointer(text: str) -> str:
+    lines = text.splitlines()
+    _label_addr, _line_addr, end_addr = compute_addresses(lines)
+
+    new_sp = end_addr + STACK_MARGIN
+    if new_sp >= MAX_MEMORY_WORDS:
+        print(
+            f"reorder_asm.py: program data extends to address {end_addr} "
+            f"({end_addr:#o}) — placing the stack {STACK_MARGIN} words "
+            f"above it would exceed this target's {MAX_MEMORY_WORDS}-word "
+            "address space. This program is too large for the software "
+            "stack to fit safely; shrink it (fewer linked runtime "
+            "functions, less string data) rather than trusting a smaller "
+            "margin.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    for i, line in enumerate(lines):
+        m = SP_DECL_RE.match(line)
+        if m:
+            lines[i] = f"{m.group(1)}{new_sp}{m.group(3)}"
+            break
+    else:
+        # EclipseAsmPrinter::emitStartOfAsmFile always emits exactly one
+        # `var _SP = ...` line — if that ever stops being true (a backend
+        # change, an input file from somewhere else), silently leaving the
+        # old value in place would resurrect exactly the bug this pass
+        # exists to fix, just without any error to point at. Fail loudly
+        # instead.
+        raise SystemExit("reorder_asm.py: no `var _SP = ...` line found — "
+                          "expected EclipseAsmPrinter to always emit one")
+
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     if len(sys.argv) == 3:
         with open(sys.argv[1], "r") as f:
             text = f.read()
-        result = relax_long_jumps(dedup_constants(reorder(sanitize_identifiers(text))))
+        result = fix_stack_pointer(relax_long_jumps(dedup_constants(reorder(sanitize_identifiers(text)))))
         with open(sys.argv[2], "w") as f:
             f.write(result)
     elif len(sys.argv) == 1:
         text = sys.stdin.read()
-        sys.stdout.write(relax_long_jumps(dedup_constants(reorder(sanitize_identifiers(text)))))
+        sys.stdout.write(fix_stack_pointer(relax_long_jumps(dedup_constants(reorder(sanitize_identifiers(text))))))
     else:
         print("usage: reorder_asm.py [in.s out.s]", file=sys.stderr)
         return 2

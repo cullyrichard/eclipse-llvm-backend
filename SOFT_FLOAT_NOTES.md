@@ -195,6 +195,60 @@ them hard enough to surface.
    against a regression sweep of several existing example programs, all
    passing.
 
+9. **The software stack's fixed origin had no margin against growing
+   static data, so it could silently collide with it.** With only two
+   allocatable registers (AC0/AC1), almost everything on this target
+   spills to a software stack — a page-zero cell (`_SP`) holding the
+   current top-of-stack address, pushed/popped via `STA n,@_SP` / `DSZ
+   _SP,0`. `EclipseAsmPrinter::emitStartOfAsmFile` always hardcoded its
+   *initial* value to `020000` (8192 decimal), chosen once with no
+   relationship to how much data the final linked program would actually
+   contain. Meanwhile `reorder_asm.py`'s `reorder()` deliberately moves
+   every *bulk* (non-page-zero) global — every string literal and
+   file-scope static — to the very end of the file, so dgasm deposits it
+   at the *highest* addresses the program uses, an address that grows
+   with the linked program's size (more functions pulled in, even ones
+   genuinely dead at runtime — see `eclipse-cc`'s symbol-protection
+   comment). Nothing ever compared that growing address against the fixed
+   8192 stack origin sitting right above it: a small program leaves a
+   large gap, but a large enough one shrinks that gap until ordinary
+   call/recursion depth (e.g. `print_uint32`'s one-recursive-call-per-
+   decimal-digit) drives the stack pointer down *into* that data —
+   silently corrupting live globals and strings, and, once deep enough, a
+   saved return address, causing execution to eventually run away to the
+   reset vector. Found the same way as bug #8: an isolated repro
+   (`calculate_value`/`scale_pow2`, this entry's own precursor) printed
+   its first value correctly on its own, but broke — the very same
+   `print_float` call, on the very same value — the instant a `<`
+   comparison against it was *also* present later in `main`, even though
+   the comparison's libcall (`__ltsf2`) hadn't been reached yet. That
+   pointed away from `print_float`/`calculate_value`'s own logic (neither
+   changes between the two programs) and toward something layout-
+   dependent. Confirmed directly: examining word 0102 (the cell holding
+   the live `_SP` value) mid-run on the failing program showed it
+   reaching decimal 7605 while that program's own data extended to 7755 —
+   the stack had already descended into live data before the eventual
+   crash. dgasm itself never catches this: unlike the hard page-zero
+   (0-255) ceiling it enforces for every `LDA`/`STA` displacement, it has
+   no equivalent check for "does the stack collide with static data" — to
+   dgasm, both are just plain memory words. Fixed in `reorder_asm.py`, not
+   the backend: `EclipseAsmPrinter` emits `_SP`'s value long before the
+   final program layout exists (before `dedup_constants`/
+   `relax_long_jumps` run, and with no way to know what else will or
+   won't end up linked in), so a new final pass, `fix_stack_pointer`,
+   runs last of all — once the true end-of-program address is known — and
+   repoints `_SP` comfortably (`STACK_MARGIN` = 4096 words) above it,
+   instead of trusting a fixed guess; it fails loudly, instead of
+   silently emitting an invalid address, if a program's own data ever
+   grew large enough to leave no safe room (dgasm's own 65536-word address
+   space ceiling, confirmed via `assembler.c`'s `MAX_MEMORY_WORDS`).
+   Verified against both branches of the failing repro (the negative and
+   positive `calculate_value`/`print_float`/`<`-compare paths) and a
+   regression sweep of the existing example programs, all passing;
+   `test_float.c`'s own documented page-zero-overflow failure (see "Known
+   limit" above) is unaffected, since that's a separate, still-enforced
+   budget this fix doesn't touch.
+
 ## A hard-won lesson on frame size
 
 Several soft-float functions (`sf_add`, `__mulsf3`, `__divsf3`) needed
