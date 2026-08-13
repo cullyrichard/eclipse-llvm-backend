@@ -1,5 +1,5 @@
 # Eclipse LLVM Backend — Setup Package
-
+# THIS PACKAGE WAS WRITTEN WITH CLAUDE. IT HAS BEEN TESTED WITH REAL HARDWARE. THERE ARE ALMOST CERTAINLY BUGS AND EDGE CASE. 
 This is a real LLVM/Clang backend targeting the Data General Nova/Eclipse
 S/140 (a 16-bit minicomputer from 1979-1986), plus a small toolchain wrapper
 and runtime library for compiling and running actual C programs on it (via
