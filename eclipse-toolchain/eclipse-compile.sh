@@ -21,17 +21,32 @@
 # run and checked against eclipseemu repeatedly). Treat it accordingly
 # until it's been tried on the actual target.
 #
-# Usage: eclipse-compile.sh input.c [output.eclipse]
+# Accepts multiple source files (e.g. a program plus a separately-compiled
+# helper library like fps.c) -- matches eclipse-cc's own -o-flag/multi-file
+# convention (see that script) for consistency between the two sibling
+# scripts. Previously took a single positional input file and an optional
+# second positional output path; that's why this now requires -o instead
+# of accepting the output as a second bare argument -- with multiple
+# sources, "the last argument that isn't a source" would be ambiguous.
+#
+# Usage: eclipse-compile.sh [-o output.eclipse] input.c [input2.c ...]
 
 set -euo pipefail
 
-if [ $# -lt 1 ]; then
-  echo "usage: eclipse-compile.sh input.c [output.eclipse]" >&2
+out=""
+sources=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) sources+=("$1"); shift ;;
+  esac
+done
+
+if [ ${#sources[@]} -eq 0 ]; then
+  echo "usage: eclipse-compile.sh [-o output.eclipse] input.c [input2.c ...]" >&2
   exit 1
 fi
-
-src="$1"
-out="${2:-${src%.*}.eclipse}"
+out="${out:-${sources[0]%.*}.eclipse}"
 
 LLVM_BUILD="${LLVM_BUILD:-$HOME/dev/llvm-build}"
 TOOLCHAIN="${TOOLCHAIN:-$HOME/dev/eclipse-toolchain}"
@@ -68,14 +83,22 @@ CC1_FLAGS=(-cc1 -triple "$TRIPLE" -nostdsysteminc
            -isystem "$RESDIR/include"
            -I "$TOOLCHAIN/rt/include" -I "$TOOLCHAIN/rt")
 
-echo "[1/7] clang -cc1: $src -> IR"
-"$CLANG" "${CC1_FLAGS[@]}" -emit-llvm "$src" -o "$work/prog.ll"
+ll_files=()
+n=0
+for src in "${sources[@]}"; do
+  n=$((n + 1))
+  echo "[1/7] clang -cc1: $src -> IR"
+  ll="$work/src$n.ll"
+  "$CLANG" "${CC1_FLAGS[@]}" -emit-llvm "$src" -o "$ll"
+  ll_files+=("$ll")
+done
 
 echo "[2/7] clang -cc1: runtime library -> IR"
 "$CLANG" "${CC1_FLAGS[@]}" -emit-llvm "$RT_SRC" -o "$work/rt.ll"
+ll_files+=("$work/rt.ll")
 
 echo "[3/7] llvm-link: merge"
-"$LLVM_LINK" -S "$work/prog.ll" "$work/rt.ll" -o "$work/merged.ll"
+"$LLVM_LINK" -S "${ll_files[@]}" -o "$work/merged.ll"
 
 echo "[4-7/7] opt/llc/reorder/dgasm: assemble to DG object/loader format"
 # Soft-float symbols need special handling: llc's own codegen inserts
@@ -92,8 +115,6 @@ echo "[4-7/7] opt/llc/reorder/dgasm: assemble to DG object/loader format"
 # adds only the symbols dgasm *just* reported undefined and tries again,
 # stopping as soon as a pass reports no *new* undefined-symbol names
 # (either success, or a genuine failure that finding more names won't fix).
-SOFTFLOAT_SYMS="__addsf3,__subsf3,__mulsf3,__divsf3,__eqsf2,__nesf2,__ltsf2,__lesf2,__gtsf2,__gesf2,__unordsf2,__floatsisf,__floatunsisf,__fixsfsi,__fixunssfsi"
-
 build_and_assemble() {
   local pub_api="$1"
   "$OPT" -S -passes="internalize,globaldce" \

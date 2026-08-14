@@ -41,16 +41,20 @@
 # target, and I have no way to test the serial/bootstrap half at all.
 # Try it on something disposable first if you can.
 #
-# Usage: eclipse-run.sh input.c
+# Usage: eclipse-run.sh input.c [input2.c ...]
+# Accepts multiple source files (e.g. a program plus a separately-compiled
+# helper library) -- forwarded straight through to eclipse-compile.sh,
+# which does the actual multi-file linking. See that script's own header
+# comment for why it needs -o instead of a second positional argument now.
 
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-  echo "usage: eclipse-run.sh input.c" >&2
+  echo "usage: eclipse-run.sh input.c [input2.c ...]" >&2
   exit 1
 fi
 
-src="$1"
+sources=("$@")
 
 # --- adjust these for your environment ---
 PORT="${PORT:-/dev/ttyUSB0}"
@@ -103,10 +107,10 @@ wait_for_port() {
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-ab="$work/$(basename "${src%.*}").ab"
+ab="$work/$(basename "${sources[0]%.*}").ab"
 
-echo "=== Compiling $src -> $ab ==="
-"$COMPILE_SCRIPT" "$src" "$ab"
+echo "=== Compiling ${sources[*]} -> $ab ==="
+"$COMPILE_SCRIPT" -o "$ab" "${sources[@]}"
 
 echo
 wait_for_port
