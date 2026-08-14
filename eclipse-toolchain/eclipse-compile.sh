@@ -104,17 +104,43 @@ build_and_assemble() {
   dgasm -t eclipse_s140 -f ab -o "$out" "$work/prog_r.s"
 }
 
+# dgasm's own exit code is not trustworthy here: confirmed empirically
+# (repeatedly, on real "Address out of range" page-zero overflows) that
+# it can print a real error and still exit 0 — the "Undefined symbol"
+# case happens to set a nonzero exit correctly, but that's dgasm's own
+# inconsistency, not something this script can rely on in general. Using
+# `if build_and_assemble ...; then` (trusting the exit code) meant any
+# *other* kind of dgasm error silently fell through as if it had
+# succeeded, printing "wrote $out" even though $out was never actually
+# (fully) written — i.e. dgasm's real errors were invisible. Fixed by
+# checking whether $out actually exists instead: that's true ground
+# truth regardless of what dgasm's exit code claims, and works for any
+# dgasm error type, not just the ones this script already knows how to
+# retry past. `rm -f "$out"` before each attempt so a stale file from an
+# earlier failed pass can't masquerade as this pass's success.
 protected="main"
 pass=1
 while :; do
-  if output="$(build_and_assemble "$protected" 2>&1)"; then
+  rm -f "$out"
+  output="$(build_and_assemble "$protected" 2>&1)" || true
+  if [ -f "$out" ]; then
     echo "$output"
     break
   fi
+  # `|| true` on both: under `set -e -o pipefail`, a `var=$(...)` assignment
+  # whose pipeline's *last-failing* command is `grep` finding zero matches
+  # (the normal, expected case once there's no "Undefined symbol" text left
+  # to find — e.g. dgasm's real failure this pass is something else
+  # entirely, like a genuine page-zero overflow) silently aborts the whole
+  # script right here, with exit status 0 — confirmed empirically, and a
+  # second, independent way dgasm's real errors were going invisible even
+  # after the $out-existence fix above. Without the guard, that abort skips
+  # the "dgasm failed" reporting below entirely.
   missing="$(echo "$output" | grep -oE 'Undefined symbol: __[A-Za-z0-9_]+' \
-             | sed 's/Undefined symbol: //' | sort -u)"
-  new="$(comm -23 <(echo "$missing") <(echo "$protected" | tr ',' '\n' | sort -u))"
+             | sed 's/Undefined symbol: //' | sort -u)" || true
+  new="$(comm -23 <(echo "$missing") <(echo "$protected" | tr ',' '\n' | sort -u))" || true
   if [ -z "$new" ] || [ "$pass" -ge 15 ]; then
+    echo "eclipse-compile.sh: dgasm failed:" >&2
     echo "$output" >&2
     exit 1
   fi
