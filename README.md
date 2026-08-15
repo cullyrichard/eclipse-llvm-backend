@@ -47,10 +47,17 @@ described there are the kind that are easy to reintroduce by accident.
 - `examples/` — known-working test programs. `examples/fps.h` factors
   out the FPS100 (device `054`) driver primitives (`fpu_out`/`fpu_in`,
   the `cmd_`/`fn_` protocol constants) from `test_fps_add.c` so any
-  future FPS100 program can reuse them. `examples/test_float*.c` are the
-  soft-float verification programs (see `SOFT_FLOAT_NOTES.md` for
-  expected output and the page-zero-budget caveat on combining many of
-  them into one program).
+  future FPS100 program can reuse them; `examples/fps.c` is a small
+  library built on those primitives (`load_psm`/`load_md`/`read_md`/
+  `fps_dma_host_out`, plus `calculate_value`/`scale_pow2` for decoding
+  the FPU's raw exponent/mantissa registers into a `float`) — link it in
+  alongside a program that needs it, e.g.
+  `eclipse-cc -o out.simh yourprogram.c fps.c` (see `eclipse-cc`'s own
+  usage note above on multi-file compilation). `examples/fps_dma_test.c`
+  is a small program exercising that library via the FPU's DMA path.
+  `examples/test_float*.c` are the soft-float verification programs (see
+  `SOFT_FLOAT_NOTES.md` for expected output and the page-zero-budget
+  caveat on combining many of them into one program).
 - `DEBUGGING_NOTES.md` — the `test_fps_add.c` investigation: what was
   tried, what was ruled out, and the actual root cause (now resolved).
 - `SOFT_FLOAT_NOTES.md` — the soft-float implementation: what's
