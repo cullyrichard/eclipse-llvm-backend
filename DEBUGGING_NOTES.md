@@ -401,6 +401,68 @@ bugs #6–#8 disturbed anything already verified: `test_fps_add.c` still
 shows 0/116 mismatches against `eclipseemu`, and the minimal `loop_test.c`
 repro from bug #5 still shows 0/32 mismatches.
 
+### 9. Runtime-variable array index through a loaded *pointer parameter* — same defect, third code path (fixed)
+
+Bugs #4 and #5 cover a compile-time-constant index into a global
+(fixed via `LEAGA`'s offset field) and a runtime index into a global
+(fixed via the `PerformDAGCombine` hook on `ISD::ADD`, recognizing a
+`WRAPPER`'d `GlobalAddress` base). Neither covers a third shape: a
+runtime index through an array reached via a **pointer parameter** —
+e.g. `load_psm(unsigned int pgm_addr, unsigned int fpu_pgm_len, const
+unsigned int fpu_pgm[])`, indexing `fpu_pgm[i+k]` inside its own load
+loop, once that loop lives in a real out-of-line function instead of
+being inlined at every call site.
+
+**Confirmed** (before the fix, via a minimal repro — a function taking
+`(int len, const unsigned int arr[])`, looping `for (i = 0; i < len;
+i++) printf("%d ", arr[i])`): printed `arr[0], arr[2], arr[4], ...`
+instead of `arr[0], arr[1], arr[2], ...` — the array index silently
+doubling, then running off the end of the array into adjacent memory
+once `i` exceeded half the real length.
+
+**Root cause**: the same byte-vs-word unit mismatch as bugs #4/#5, one
+base-pointer shape further removed. `PerformDAGCombine`'s operand
+detection only matches a `WRAPPER`'d `GlobalAddress` (a global) or a
+bare `ISD::FrameIndex` (a locally-declared array's own address) as the
+"this is a word-granular base pointer" signal. A pointer *parameter*'s
+value is neither — this backend reloads such values from their own
+stack slot at every use rather than keeping them live in a register
+across statement boundaries, so by the time the array-index `ADD`
+reaches this combine, the base operand is a plain `ISD::LOAD` — a shape
+the existing checks never considered, so the byte-scaled runtime offset
+never got halved.
+
+**Fix** (`EclipseISelLowering.cpp`, `PerformDAGCombine`): recognize a
+third case — exactly one of the `ADD`'s two operands is an `ISD::LOAD`
+— but only when this `ADD`'s own result is used directly as a
+load/store's base-pointer operand (confirmed against
+`EclipseISelDAGToDAG.cpp`'s `ISD::LOAD`/`ISD::STORE` handling: a
+non-`FrameIndex` base falls through completely unchanged to the generic
+`LDIND`/`STIND` pattern, so this `ADD` is still exactly that operand at
+the point the combine runs). The usage check matters: plenty of
+ordinary integer arithmetic adds two loaded values together with no
+pointer involved at all (`a[i] = b[j] + c[k]`), and halving one side of
+that blind would silently corrupt it. Gating on "feeds a memory access"
+is both necessary and sufficient to catch the parameter case without
+misfiring on unrelated arithmetic.
+
+Also added, in the same combine: when the offset being halved is
+already exactly `X+X` (this backend's `LowerShift` custom-lowers `x <<
+1` — how a byte-scale-by-2 usually reaches this point — into a literal
+self-add, not a `MUL`), skip the runtime `HALVE`/`UDIVrr` round trip
+entirely and use `X` directly. Doubling a value and then dividing it
+back by 2 via a real division instruction is pure waste; on a large
+enough program the extra instructions across every array access were
+enough to push a branch target past `dgasm`'s 0–255 page-relative `JMP`
+range, breaking compilation of an otherwise-unrelated file. This
+optimization applies to all three base-pointer cases, not just the new
+one.
+
+**Verified**: the minimal repro above now prints `0 1 2 3 ... 9` in
+order. Re-ran the full existing regression pass (package examples +
+every minimal repro built while isolating this bug) to confirm nothing
+else moved: no change in behavior anywhere else in the suite.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented
