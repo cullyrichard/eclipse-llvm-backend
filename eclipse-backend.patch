@@ -1726,10 +1726,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..126c6b68b
+index 000000000..15342f5c3
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1150 @@
+@@ -0,0 +1,1222 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2124,6 +2124,58 @@ index 000000000..126c6b68b
 +    Base = N1;
 +    Offset = N0;
 +    BaseIsFrameIndex = true;
++  } else if ((N0.getOpcode() == ISD::LOAD) != (N1.getOpcode() == ISD::LOAD)) {
++    // Neither operand is a bare FrameIndex or WRAPPER'd global, but
++    // exactly one is a fresh LOAD -- plausibly a pointer *value* read
++    // back from its own stack slot (e.g. a `const T arr[]` parameter, or
++    // any other local pointer variable: this backend reloads such values
++    // from memory at every use rather than keeping them live in a
++    // register across statement boundaries). Such a loaded pointer is
++    // exactly as word-granular as a global's or a local array's address
++    // — confirmed empirically: a runtime index into an array reached via
++    // a pointer *parameter* (as opposed to a locally-declared array,
++    // already covered by the FrameIndex case above) landed on element
++    // 2*i instead of element i, the identical symptom as the two bugs
++    // documented above this function, just reached through a base
++    // pointer shape neither existing case recognized.
++    //
++    // The one-operand-is-a-LOAD shape alone isn't a safe enough signal by
++    // itself, though: plenty of perfectly ordinary integer arithmetic
++    // adds two loaded values together with no pointer involved at all
++    // (e.g. `a[i] = b[j] + c[k]`), and halving one side of that would
++    // silently corrupt it. What actually distinguishes the runtime-GEP
++    // case is what this ADD's *result* feeds: pointer arithmetic is
++    // consumed directly as a LOAD/STORE's base-pointer operand, while
++    // ordinary arithmetic never is. EclipseISelDAGToDAG.cpp's ISD::LOAD/
++    // ISD::STORE handling confirms this ADD is still exactly that base-
++    // pointer operand at the point this combine runs — a non-FrameIndex
++    // base falls through to the generic LDIND/STIND pattern completely
++    // unchanged, so gating on that usage is both necessary and sufficient
++    // to catch this case without misfiring on unrelated arithmetic that
++    // never becomes an address.
++    bool FeedsMemoryAddress = llvm::any_of(N->users(), [&](SDNode *User) {
++      if (auto *LD = dyn_cast<LoadSDNode>(User))
++        return LD->getBasePtr().getNode() == N;
++      if (auto *ST = dyn_cast<StoreSDNode>(User))
++        return ST->getBasePtr().getNode() == N;
++      return false;
++    });
++    if (!FeedsMemoryAddress)
++      return SDValue();
++    if (N0.getOpcode() == ISD::LOAD) {
++      Base = N0;
++      Offset = N1;
++    } else {
++      Base = N1;
++      Offset = N0;
++    }
++    // A loaded pointer value has no analogous "already halved, embedded
++    // in the node" mechanism the way a global's LEAGA/offset-slot
++    // printing does (see the comment below) — treat it like the
++    // FrameIndex case: a compile-time-constant Offset here (e.g.
++    // `arr[3]` through a pointer parameter) still needs the same /2 fix,
++    // not just the runtime-index case.
++    BaseIsFrameIndex = true;
 +  } else {
 +    return SDValue();
 +  }
@@ -2169,6 +2221,26 @@ index 000000000..126c6b68b
 +
 +  SelectionDAG &DAG = DCI.DAG;
 +  SDLoc dl(N);
++
++  // A byte-scaled index of exactly 2 (an i16 element) commonly reaches
++  // here not as a MUL-by-constant but as a *self-add* (`X+X`) — LowerShift
++  // custom-lowers `X << 1` that way (see LowerShift's comment above), and
++  // GEP's own generic lowering will sometimes produce the multiply
++  // pre-strength-reduced into a shift too. Emitting a real runtime HALVE
++  // (an actual DIV instruction, see below) to undo an addend that's
++  // *already* visibly just `X+X` is pure waste — a real division for a
++  // value that's algebraically just X again — and on a program with many
++  // such array accesses the extra instructions are enough to push a
++  // branch target past dgasm's 0-255 page-relative JMP range (confirmed
++  // empirically: this was silently bloating every runtime GEP through a
++  // loaded pointer parameter enough to break an otherwise-fine program).
++  // Recognize the shape directly and skip the round trip.
++  if (Offset.getOpcode() == ISD::ADD &&
++      Offset.getOperand(0) == Offset.getOperand(1)) {
++    SDValue Halved = Offset.getOperand(0);
++    return DAG.getNode(EclipseISD::WORD_ADD, dl, MVT::i16, Base, Halved);
++  }
++
 +  SDValue TwoCP = DAG.getConstantPool(
 +      ConstantInt::get(*DAG.getContext(), APInt(16, 2)), MVT::i16);
 +  SDValue Two = LowerConstantPool(TwoCP, DAG);
