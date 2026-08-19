@@ -44,13 +44,22 @@ described there are the kind that are easy to reintroduce by accident.
     device I/O macros, and (`rt/eclipse_rt.c`'s tail half) a full
     IEEE-754 single-precision soft-float implementation — see
     `SOFT_FLOAT_NOTES.md`.
-- `examples/` — known-working test programs. `examples/fps.h` factors
-  out the FPS100 (device `054`) driver primitives (`fpu_out`/`fpu_in`,
-  the `cmd_`/`fn_` protocol constants) from `test_fps_add.c` so any
-  future FPS100 program can reuse them. `examples/test_float*.c` are the
-  soft-float verification programs (see `SOFT_FLOAT_NOTES.md` for
-  expected output and the page-zero-budget caveat on combining many of
-  them into one program).
+- `examples/` — known-working test programs. `examples/fps.h`/`fps.c`
+  factor the FPS100 (device `054`) driver out of `test_fps_add.c` into a
+  reusable library: `fpu_out`/`fpu_in` (macros, inlined for timing) plus
+  `load_psm`/`load_md`/`read_md`/`calculate_value` (real functions,
+  compiled separately and linked in via `eclipse-cc`'s multi-file
+  support — see `DEBUGGING_NOTES.md` bug #9 for the array-indexing
+  defect this shape of code exposed and how it was fixed).
+  `examples/test_fps_md.c` exercises `load_md`/`read_md` (loading and
+  reading back the FPU's MD registers directly, independent of running
+  a full microprogram); `examples/fps_dma_test.c` exercises the DMA
+  host-transfer path (`fps_dma_host_out`); `examples/fps_dma_test2.c`
+  exercises the raw DMA control/status registers (HMAH/HMAL/WC/APDMA/
+  CTL) via direct PIO, independent of the higher-level wrappers.
+  `examples/test_float*.c` are the soft-float verification programs (see
+  `SOFT_FLOAT_NOTES.md` for expected output and the page-zero-budget
+  caveat on combining many of them into one program).
 - `DEBUGGING_NOTES.md` — the `test_fps_add.c` investigation: what was
   tried, what was ruled out, and the actual root cause (now resolved).
 - `SOFT_FLOAT_NOTES.md` — the soft-float implementation: what's

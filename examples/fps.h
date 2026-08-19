@@ -48,6 +48,27 @@
         _fpu_r;                                                              \
     })
 
+    typedef struct{
+    int exp;
+    int mh;
+    int ml;
+} fps_word_struct;
+
+
+float scale_pow2(float x, int n);
+float calculate_value(int exp, int mh, int ml);
+void load_psm(unsigned int pgm_addr, unsigned int fpu_pgm_len, const unsigned int fpu_pgm[]);
+fps_word_struct read_md(unsigned int addr);
+void load_md(unsigned int md_addr,unsigned int md_len,const unsigned int md_arr[]); 
+
+/* hma is the *low* 16 bits of the host memory address only -- the high
+ * half is always sent as a hardcoded 0 in fps_dma_host_out's own body,
+ * never derived from hma, because host addresses here never exceed 16
+ * bits (for now). unsigned long* would be a 32-bit pointer, wrong for
+ * what this function actually dereferences (a single *hma read) and
+ * inconsistent with the actual definition in fps.c -- confirmed via a
+ * real "conflicting types" compile error before this was fixed. */
+int fps_dma_host_out(const unsigned int * hma,unsigned int apdma,unsigned int wc);
 /* -- FPU commands (write to the switch/function register) -- */
 #define cmd_wtsr 0021031  /* write switch register */
 #define cmd_wtfn 0022031  /* write function register (act on switch reg) */
@@ -55,20 +76,28 @@
 #define cmd_rdlt 0023030  /* read light/data register */
 
 /* -- FPU function codes -- */
+#define fn_load_ma   0001002
 #define fn_load_tma  0001003
 #define fn_load_ps_0 0001010
 #define fn_load_ps_1 0001030
 #define fn_load_ps_2 0001050
 #define fn_load_ps_3 0001370
+#define fn_load_md_1  0001035
+#define fn_load_md_2  0001055
+#define fn_load_md_3  0001175
+
+
+
 #define fn_start     0040000
 #define fn_stop      0100000
 
-#define fn_load_ma          0001002
+
+
+
 #define fn_examine_regmd    0002015  /* declared, unused -- matches the original */
 #define fn_examine_regmd_o1 0002035
 #define fn_examine_regmd_o2 0002055
 #define fn_examine_regmd_o3 0002075
 #define fn_examine_regpsa   0002000
 #define fn_examine_regtma   0002003
-
 #endif

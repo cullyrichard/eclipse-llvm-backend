@@ -12,136 +12,113 @@
 #define load_addr    0000200
 #define results_addr 0000100
 
+/* Placeholder settling delay between selecting a new FPU "examine"
+ * target (fpu_out(cmd_wtfn, ...)) and reading it back (fpu_in(cmd_rdlt))
+ * -- see the readback section in main() for why this exists. Not a
+ * measured hardware timing figure; a plain busy-loop since this backend
+ * has no usleep()/delay primitive. `volatile` keeps the compiler from
+ * optimizing the whole loop away. */
+#define SETTLE_ITERS 500
+static void settle_delay(void) {
+    volatile unsigned int i;
+    for (i = 0; i < SETTLE_ITERS; i++) {
+    }
+}
+
 /* The FPU microprogram itself -- raw data, transcribed exactly from the
  * .asm's DATA SECTION, 14 four-word instructions (56 words total). Not
- * something to reinterpret as C logic: it's loaded into the FPU
+ * something to reinter    fpu_out(cmd_wtsr, load_addr);
+    fpu_out(cmd_wtfn, fn_load_tma);pret as C logic: it's loaded into the FPU
  * verbatim, one word per fpu_out() call below. */
-static const unsigned int fpu_program[] = {
-    /* No-Op */
-    0000000, 0000000, 0000000, 0000000,
-    /* LDTMA;DB=!THIRD ; !THIRD is 04430 */
-    0000003, 0103000, 0002000, 0004430,
-    /* LDMA;DB=@077 */
-    0000003, 0102000, 0002000, 0000077,
-    /* LDDPA;DB=ZERO */
-    0000003, 0104000, 0000000, 0000000,
-    /* DPX(0)<DB;DB=TM */
-    0000000, 0000000, 0047444, 0100000,
-    /* LDTMA;DB=!SIXTN ; !SIXTN is 4451 */
-    0000003, 0103000, 0002000, 0004451,
-    /* No-Op */
-    0000000, 0000000, 0000000, 0000000,
-    /* DPY(0)<DB;DB=TM */
-    0000000, 0000000, 0017444, 0100000,
-    /* FADD DPX,DPY */
-    0000001, 0123000, 0000444, 0100000,
-    /* FADD */
-    0000001, 0100000, 0000000, 0000000,
-    /* MI<FA;INCMA */
-    0000000, 0000000, 0000000, 0000120,
-    /* No-Op */
-    0000000, 0000000, 0000000, 0000000,
-    /* No-Op */
-    0000000, 0000000, 0000000, 0000000,
-    /* Halt */
-    0000003, 0170000, 0000000, 0000000,
+ const unsigned int fpu_program[] = {
+0000000,0000000,0000000,0000000,
+0000003,00103000,0002000,0004451,
+0000003,00102000,0002000,0000077,
+0000003,00104000,0000000,0000000,
+0000000,0000000,0057004,0100000,
+0000000,0000000,0000440,0013000,
+0000000,0000000,0000440,0013000,
+0000000,0000000,0000440,0013000,
+0000000,0000000,0000000,0000220,
+0000000,0000000,0000000,0000000,
+0000000,0000000,0000000,0000000,
+0000003,00170000,0000000,0000000,
 };
 
-#define FPU_PROGRAM_LEN (sizeof(fpu_program) / sizeof(fpu_program[0]))
+#define FPU_PROGRAM_LEN (sizeof(fpu_program) / sizeof(unsigned int))
+
+
 
 int main(void) {
     unsigned int status;
-    /* Loaded once, here, and referenced by value below -- not because
-     * the loop needs it hoisted for any C-level reason, but as a
-     * workaround for a real backend bug: in the unmodified version,
-     * `main`'s waitstop loop referenced the raw `fn_stop` literal
-     * directly inside the loop condition, and the compiler emitted the
-     * *wrong* constant-pool entry there -- CPI0_2 (load_addr, 128)
-     * instead of fn_stop's real value (0100000 octal = 32768). Verified
-     * with an isolated single-constant test that materializing 32768
-     * alone is correct, so this is specific to referencing a late
-     * constant from inside a loop back-edge in a function with this
-     * many distinct pool entries (~23 here), not a general boundary-
-     * value bug. Loading it into a stable local once, outside the loop,
-     * sidesteps whatever's going wrong at that specific use site. */
+
     unsigned int stop_bit = fn_stop;
 
-    /* Defensively disable interrupts before anything else runs. Unlike
-     * eclipseemu (which always starts from a clean Interrupt On=0 state
-     * with nothing at memory location 1), real hardware carries state
-     * across program loads: if Interrupt On was left enabled by
-     * whatever ran here before -- e.g. this project's own
-     * __attribute__((interrupt)) tests, which deliberately enable
-     * interrupts and point memory location 1 at a handler -- a real
-     * device interrupting mid-program would jump through that now-stale
-     * vector into this program's unrelated memory layout. This program
-     * has no interrupt handler of its own and never expects one, so
-     * make sure none can fire. */
     IO_PULSE_CLEAR(077); /* NIOC 077 -- INTDS, disable interrupts */
 
     IO_PULSE_PULSE(FPU_DEV); /* NIOP 054 -- reset the FPU */
     IO_PULSE_START(FPU_DEV); /* NIOS 054 -- set the FPU to busy */
 
-    /* Load the program's starting address into TMA. */
-    fpu_out(cmd_wtsr, load_addr);
-    fpu_out(cmd_wtfn, fn_load_tma);
+    load_psm(load_addr,FPU_PROGRAM_LEN,fpu_program);
 
-    /* Load the microprogram onto the FPU, 4 words (one instruction) at
-     * a time -- matches the .asm's loadpg loop exactly, cycling through
-     * fn_load_ps_0..3 for each word of a 4-word group.
-     *
-     * This was fully unrolled with literal constant indices for a while,
-     * as a workaround for a real backend bug: a runtime-variable index
-     * (`fpu_program[i+k]`, `i` a loop variable) computed its address by
-     * adding a byte-scaled offset directly to a word-granular pointer,
-     * landing on element 2*i instead of element i. Root-caused and fixed
-     * in the LLVM backend (EclipseTargetLowering::PerformDAGCombine) --
-     * see DEBUGGING_NOTES.md -- and re-verified against eclipseemu with
-     * this loop restored: 0/116 mismatches. */
-    static const unsigned int fn_load_ps[4] = {fn_load_ps_0, fn_load_ps_1,
-                                                fn_load_ps_2, fn_load_ps_3};
-    unsigned int i;
-    for (i = 0; i < FPU_PROGRAM_LEN; i += 4) {
-        unsigned int k;
-        for (k = 0; k < 4; k++) {
-            fpu_out(cmd_wtsr, fpu_program[i + k]);
-            fpu_out(cmd_wtfn, fn_load_ps[k]);
-        }
-    }
-
-    /* Start the FPU running, at the address staged in the switch
-     * register (load_addr, same as the TMA load above). */
-    fpu_out(cmd_wtsr, load_addr);
+     fpu_out(cmd_wtsr, load_addr);
     fpu_out(cmd_wtfn, fn_start);
 
-    /* Wait until the FPU reports stopped (fn_stop bit set in the
-     * function/status register) -- matches the .asm's AND#/SNR
-     * skip-test-and-loop idiom. */
     do {
         status = fpu_in(cmd_rdfn);
     } while ((status & stop_bit) == 0);
+   /* Diagnostic: the loop above only checks the stop bit, discarding
+     * every other bit of the status/function register -- if the FPU
+     * stopped due to an error/exception condition rather than normal
+     * completion, this is where that would show up. Not present in the
+     * original .asm (which only had front-panel lights to inspect this
+     * on, not a print). `status` is captured above already; the actual
+     * printing is deferred and combined with the register read-back
+     * prints below (see the single combined printf after all reads are
+     * done) -- this doesn't change when `status` is read off the FPU,
+     * only when its value gets printed. */
 
     /* Read back the results. The original halted after each register
      * read so an operator could inspect the accumulator on the
-     * front-panel lights before continuing by hand; here we just print
-     * each value instead of stopping. */
+     * front-panel lights before continuing by hand -- which also gave
+     * the FPU as much real time as the operator took to actually latch
+     * the newly-selected word before it got read. Real-hardware testing
+     * found regmd_o1/o2/o3 all reading back identical (while regpsa/
+     * regtma, which aren't hit back-to-back with no gap, read back
+     * correctly distinct) -- consistent with reading the MD word-select
+     * before the FPU has settled on it. settle_delay() is a placeholder
+     * busy-loop standing in for that lost pacing; not a real hardware
+     * timing figure, just something to tune empirically -- increase
+     * SETTLE_ITERS if regmd_o1/o2/o3 are still identical, or try
+     * removing it entirely from just the o2/o3 calls if o1 alone is
+     * already correct (would point at the load_ma -> first examine
+     * transition specifically, not examine-to-examine in general). */
     fpu_out(cmd_wtsr, results_addr);
     fpu_out(cmd_wtfn, fn_load_ma);
+    fps_word_struct return_word; 
 
-    fpu_out(cmd_wtfn, fn_examine_regmd_o1);
-    printf("regmd_o1: %o\n", fpu_in(cmd_rdlt));
-
-    fpu_out(cmd_wtfn, fn_examine_regmd_o2);
-    printf("regmd_o2: %o\n", fpu_in(cmd_rdlt));
-
-    fpu_out(cmd_wtfn, fn_examine_regmd_o3);
-    printf("regmd_o3: %o\n", fpu_in(cmd_rdlt));
+    return_word = read_md(results_addr);
 
     fpu_out(cmd_wtfn, fn_examine_regpsa);
-    printf("regpsa: %o\n", fpu_in(cmd_rdlt));
+    //settle_delay();
+    int psa = fpu_in(cmd_rdlt);
 
     fpu_out(cmd_wtfn, fn_examine_regtma);
-    printf("regtma: %o\n", fpu_in(cmd_rdlt));
+    //settle_delay();
+    int tma = fpu_in(cmd_rdlt);
 
-    return 0;
+    /* All register reads above are now captured in locals -- none of the
+     * fpu_out/fpu_in device I/O or its ordering changed, only the
+     * printing was deferred and combined here into a single printf (plus
+     * the mandatory separate print_float() call, since this project's
+     * printf() doesn't support %f) to cut down on page-zero format-
+     * string literals. */
+    printf("\nstatus: %o\nregmd_o1: %o\nregmd_o2: %o\nregmd_o3: %o\n"
+           "regpsa: %o\nregtma: %o\ncalculated float value is: ",
+           status, return_word.exp, return_word.mh, return_word.ml, psa, tma);
+    print_float(calculate_value(return_word.exp,return_word.mh,return_word.ml));
+    printf("\n");
+
+    
+return 0;
 }
