@@ -685,10 +685,10 @@ index 000000000..11a9b3268
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
 new file mode 100644
-index 000000000..d4655680b
+index 000000000..b3a2870a5
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,640 @@
 +//===-- EclipseAsmPrinter.cpp - Eclipse LLVM assembly writer ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -704,6 +704,7 @@ index 000000000..d4655680b
 +#include "MCTargetDesc/EclipseMCTargetDesc.h"
 +#include "TargetInfo/EclipseTargetInfo.h"
 +#include "llvm/ADT/STLFunctionalExtras.h"
++#include "llvm/ADT/SmallVector.h"
 +#include "llvm/CodeGen/MachineConstantPool.h"
 +#include "llvm/CodeGen/MachineFunction.h"
 +#include "llvm/CodeGen/MachineInstr.h"
@@ -719,6 +720,8 @@ index 000000000..d4655680b
 +#include "llvm/Support/Compiler.h"
 +#include "llvm/Support/ErrorHandling.h"
 +#include "llvm/Support/raw_ostream.h"
++
++#include <functional>
 +
 +using namespace llvm;
 +
@@ -962,9 +965,105 @@ index 000000000..d4655680b
 +    }
 +  }
 +
-+  // Structs and anything else beyond a simple i16 scalar, string
-+  // literal, or numeric array aren't materialized yet — see README.md
-+  // "Known limitations".
++  // Struct initializer (e.g. `static fps_word_struct g = {...};`) —
++  // flattened field-by-field into one `var` line per word, in source
++  // field order, on the same "sequential `var` lines lay out
++  // contiguously, only the first keeps the real symbol name" convention
++  // emitArrayElements above already relies on. This backend has no
++  // padding to account for: every scalar field here is i16- or
++  // (32-bit-as-two-i16-words) granular (see the ConstantInt case above),
++  // so the field's own declaration order *is* its word order.
++  //
++  // This was a real, confirmed bug before this existed, not a
++  // hypothetical gap: a struct-typed global fell all the way through to
++  // the single-placeholder-word case below regardless of how many fields
++  // it actually had, so every field past the first silently aliased
++  // whatever global happened to be laid out immediately after it in
++  // page-zero — confirmed by tracing a 3-word `fps_word_struct` global
++  // whose `.mh`/`.ml` fields came back reading two bytes of an unrelated
++  // string constant's own text, and confirming the *values* computed
++  // going *into* the struct were correct at every call site the whole
++  // time (i.e. this was purely a storage-size bug, not a codegen bug in
++  // whatever computed the field values).
++  //
++  // flattenConstant recurses through nested aggregates (a struct field
++  // that's itself an array or struct, or vice versa) rather than only
++  // handling one level, since dgasm's sequential `var` layout needs the
++  // *fully* flattened word sequence regardless of how deep the C-level
++  // nesting is. A field type genuinely unsupported here (a pointer, a
++  // float — this target has no register class for either as a directly
++  // materializable constant) degrades to a single zero word for just
++  // that field rather than losing the fields around it.
++  std::function<void(const Constant *, Type *, SmallVectorImpl<int64_t> &)>
++      flattenConstant = [&](const Constant *C, Type *Ty,
++                             SmallVectorImpl<int64_t> &Out) {
++        if (!C || isa<ConstantAggregateZero>(C) || isa<UndefValue>(C)) {
++          if (auto *ST = dyn_cast<StructType>(Ty)) {
++            for (unsigned i = 0, e = ST->getNumElements(); i != e; ++i)
++              flattenConstant(nullptr, ST->getElementType(i), Out);
++          } else if (auto *AT = dyn_cast<ArrayType>(Ty)) {
++            for (unsigned i = 0, e = AT->getNumElements(); i != e; ++i)
++              flattenConstant(nullptr, AT->getElementType(), Out);
++          } else if (auto *IT = dyn_cast<IntegerType>(Ty)) {
++            unsigned NumWords = (IT->getBitWidth() + 15) / 16;
++            for (unsigned i = 0; i != NumWords; ++i)
++              Out.push_back(0);
++          } else {
++            Out.push_back(0); // unsupported leaf type
++          }
++          return;
++        }
++        if (const auto *CI = dyn_cast_or_null<ConstantInt>(C)) {
++          unsigned BitWidth = CI->getBitWidth();
++          if (BitWidth <= 16) {
++            Out.push_back(CI->getSExtValue());
++            return;
++          }
++          APInt Val = CI->getValue();
++          unsigned NumWords = (BitWidth + 15) / 16;
++          for (unsigned i = 0; i != NumWords; ++i) {
++            unsigned ShiftAmt = (NumWords - 1 - i) * 16;
++            Out.push_back(static_cast<int16_t>(
++                Val.lshr(ShiftAmt).trunc(16).getZExtValue()));
++          }
++          return;
++        }
++        if (const auto *CS = dyn_cast_or_null<ConstantStruct>(C)) {
++          for (unsigned i = 0, e = CS->getNumOperands(); i != e; ++i)
++            flattenConstant(CS->getOperand(i),
++                             CS->getOperand(i)->getType(), Out);
++          return;
++        }
++        if (const auto *CA = dyn_cast_or_null<ConstantArray>(C)) {
++          for (unsigned i = 0, e = CA->getNumOperands(); i != e; ++i)
++            flattenConstant(CA->getOperand(i),
++                             CA->getOperand(i)->getType(), Out);
++          return;
++        }
++        if (const auto *CDA = dyn_cast_or_null<ConstantDataArray>(C)) {
++          for (unsigned i = 0, e = CDA->getNumElements(); i != e; ++i)
++            Out.push_back(CDA->getElementAsAPInt(i).getSExtValue());
++          return;
++        }
++        Out.push_back(0); // unsupported leaf constant (e.g. a pointer)
++      };
++
++  if (isa<StructType>(GV->getValueType()) &&
++      (isa<ConstantStruct>(Init) || isa<ConstantAggregateZero>(Init))) {
++    SmallVector<int64_t, 8> Words;
++    flattenConstant(Init, GV->getValueType(), Words);
++    for (unsigned i = 0, e = Words.size(); i != e; ++i) {
++      std::string Name = i == 0 ? Sym->getName().str()
++                                 : (Sym->getName() + "_field" + Twine(i)).str();
++      OutStreamer->emitRawText(
++          ("var " + Twine(Name) + " = " + Twine(Words[i])).str());
++    }
++    return;
++  }
++
++  // Anything else beyond a simple i16 scalar, string literal, numeric
++  // array, or struct isn't materialized yet — see README.md "Known
++  // limitations".
 +  OutStreamer->emitRawText(
 +      ("var " + Twine(Sym->getName()) + " = 0 // TODO: unsupported initializer")
 +          .str());

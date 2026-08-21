@@ -463,6 +463,62 @@ order. Re-ran the full existing regression pass (package examples +
 every minimal repro built while isolating this bug) to confirm nothing
 else moved: no change in behavior anywhere else in the suite.
 
+### 10. Struct-typed globals lost every field past the first (fixed)
+
+Found via a standalone reproduction (`clobber.c`) built around the same
+`fps_word_struct { int exp, mh, ml; }` shape `fps.c`'s `read_md` returns:
+a `static fps_word_struct mainData;` global, written by value from a
+function's return and read back by field in a loop interleaved with
+`printf`.
+
+**Confirmed**: `mainData.mh`/`.ml` came back reading garbage — traced to
+the exact bytes of `"md"`, the first two characters of the *format
+string* laid out immediately after `mainData` in page-zero. The actual
+*values* computed and returned by the function were correct at every
+call site (checked directly in the generated IR/assembly) — this was
+purely a storage-size bug, not a codegen bug in whatever computed the
+struct's contents.
+
+**Root cause**: `EclipseAsmPrinter::emitGlobalVariable` had cases for a
+scalar, a string literal, and a numeric array initializer, each emitting
+the right number of `var` words — but no case at all for a struct
+initializer (`ConstantStruct`/a struct-typed `ConstantAggregateZero`).
+Every one fell through to the same single-placeholder-word case used for
+genuinely unsupported types (`var NAME = 0 // TODO: unsupported
+initializer`), regardless of how many fields the struct actually had.
+Since dgasm has no linker/sections — every `var` line just claims the
+next sequential word — a 3-word struct with only 1 word actually
+reserved for it meant the *next* global's `var` lines landed inside what
+C code still believed was `mainData`'s own storage, and `mainData`'s own
+later fields landed inside whatever came after that.
+
+**Fix** (`EclipseAsmPrinter.cpp`): a recursive `flattenConstant` helper
+that walks a struct's fields (or a zero-initialized struct type's
+element types) in order, emitting the exact same "each element gets a
+`var` line, only the very first keeps the real symbol name" convention
+`emitArrayElements` already established for arrays — recursing into any
+field that's itself a nested struct or array, so C-level nesting depth
+doesn't matter, only the fully-flattened word sequence dgasm actually
+needs. A field of a type genuinely unsupported here (a pointer, a float)
+degrades to a single zero word for just that field, matching this
+backend's existing "unsupported" fallback, rather than losing the fields
+around it.
+
+One bug caught in the fix itself before it shipped: the zero-initializer
+recursion path calls itself with a null `Constant*` (there's no real
+`Constant` object for "this field is implicitly zero" — only its
+`Type`), and the first version's top-of-function `isa<>` checks crashed
+outright on that null (`isa<> used on a null pointer`, confirmed via a
+zero-initialized-struct repro). Fixed by checking for null explicitly
+before the `isa<>` calls.
+
+**Verified**: both a non-zero-initialized and a zero-initialized 3-field
+struct global read and write every field correctly, with an adjacent
+string global immediately after confirmed untouched before *and* after
+writing through the struct. Re-ran the full existing regression pass
+(package examples, `clobber.c` itself) — no change in behavior anywhere
+else.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented
