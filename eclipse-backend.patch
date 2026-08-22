@@ -685,10 +685,10 @@ index 000000000..11a9b3268
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
 new file mode 100644
-index 000000000..b3a2870a5
+index 000000000..cc617d694
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,675 @@
 +//===-- EclipseAsmPrinter.cpp - Eclipse LLVM assembly writer ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -809,12 +809,37 @@ index 000000000..b3a2870a5
 +  OutStreamer->emitRawText("");
 +  if (HasMain) {
 +    OutStreamer->emitRawText("_start:");
++    // Real hardware SAVE/RTN (EclipseFrameLowering.cpp's prologue/
++    // epilogue) implicitly use three fixed memory locations as
++    // registers: 040 (stack pointer), 041 (frame pointer), 042 (stack
++    // limit) — see EclipseInstrInfo.td's SAVE/RET comments. Nothing
++    // hardware-resets these, so the very first thing this program does
++    // is deposit real starting values into them; 041 (frame pointer)
++    // needs no explicit init since main's own SAVE writes it before
++    // anything ever reads it. Confirmed empirically on eclipseemu:
++    // without this, main's own first SAVE computes a stack-limit check
++    // against whatever garbage (typically 0) location 042 already
++    // holds, overflows immediately, and traps through location 043 —
++    // which nothing has installed a handler at either — landing on an
++    // unhandled "JMP 0" loop. _STACKTOP is patched to a real,
++    // program-size-aware value by reorder_asm.py's fix_stack_pointer
++    // pass, exactly like the old `_SP` was; _STACKLIM is a fixed,
++    // generous constant near the top of this target's 65536-word
++    // address space (stack grows *upward* from _STACKTOP under real
++    // SAVE/RTN, the opposite direction from the old software stack, so
++    // the limit only needs to clear the hard ceiling, not track program
++    // size the way the starting point does).
++    OutStreamer->emitRawText("\tLDA 0,_STACKTOP");
++    OutStreamer->emitRawText("\tSTA 0,040");
++    OutStreamer->emitRawText("\tLDA 0,_STACKLIM");
++    OutStreamer->emitRawText("\tSTA 0,042");
 +    OutStreamer->emitRawText("\tJSR @main_SLOT,0");
 +    OutStreamer->emitRawText("\tHALT");
 +    OutStreamer->emitRawText("");
 +  }
 +  OutStreamer->emitRawText("// --- fixed runtime state ---");
-+  OutStreamer->emitRawText("var _SP = 020000");
++  OutStreamer->emitRawText("var _STACKTOP = 020000");
++  OutStreamer->emitRawText("var _STACKLIM = 0177700");
 +  OutStreamer->emitRawText("var _scratch = 0");
 +  OutStreamer->emitRawText("");
 +}
@@ -1186,12 +1211,19 @@ index 000000000..b3a2870a5
 +    const char *Skip = MI->getOpcode() == Eclipse::BGEU ? "SNC" : "SZC";
 +    StringRef Lhs = EclipseInstPrinter::getRegisterName(MI->getOperand(0).getReg());
 +    StringRef Rhs = EclipseInstPrinter::getRegisterName(MI->getOperand(1).getReg());
-+    OutStreamer->emitRawText("\tDSZ _SP,0");
-+    OutStreamer->emitRawText("\tSTA 2,@_SP");
++    // 040: fixed hardware stack-pointer location — same one real SAVE/
++    // RTN use natively (EclipseInstrInfo.td), not a separate `_SP`
++    // variable, so this scratch save/restore can never drift out of
++    // sync with the frame SAVE/RTN are managing at the same time. Real
++    // SAVE grows this stack *upward* (increment-then-store), so push
++    // here is ISZ-then-store and pop is load-then-DSZ — the opposite of
++    // what the old, purely-software `_SP` stack this replaced used.
++    OutStreamer->emitRawText("\tISZ 040,0");
++    OutStreamer->emitRawText("\tSTA 2,@040");
 +    OutStreamer->emitRawText((Twine("\tMOV ") + Lhs + ",2").str());
 +    OutStreamer->emitRawText((Twine("\tSUBZ ") + Rhs + ",2").str());
-+    OutStreamer->emitRawText("\tLDA 2,@_SP");
-+    OutStreamer->emitRawText("\tISZ _SP,0");
++    OutStreamer->emitRawText("\tLDA 2,@040");
++    OutStreamer->emitRawText("\tDSZ 040,0");
 +    OutStreamer->emitRawText((Twine("\tSUB# 2,2,") + Skip).str());
 +    OutStreamer->emitRawText(
 +        (Twine("\tJMP ") + MI->getOperand(2).getMBB()->getSymbol()->getName())
@@ -1270,12 +1302,15 @@ index 000000000..b3a2870a5
 +    int64_t Offset = MI->getOperand(1).getOffset() / Divisor;
 +    if (Offset != 0) {
 +      std::string OffSym = addOffsetSlot(Target, Offset);
-+      OutStreamer->emitRawText("\tDSZ _SP,0");
-+      OutStreamer->emitRawText("\tSTA 2,@_SP");
++      // 040: fixed hardware stack-pointer location, same one real SAVE/
++      // RTN use — see the BGEU/BLTU case above's comment (including on
++      // the ISZ/DSZ push/pop direction).
++      OutStreamer->emitRawText("\tISZ 040,0");
++      OutStreamer->emitRawText("\tSTA 2,@040");
 +      OutStreamer->emitRawText(("\tLDA 2," + Twine(OffSym)).str());
 +      OutStreamer->emitRawText((Twine("\tADD 2,") + Dst).str());
-+      OutStreamer->emitRawText("\tLDA 2,@_SP");
-+      OutStreamer->emitRawText("\tISZ _SP,0");
++      OutStreamer->emitRawText("\tLDA 2,@040");
++      OutStreamer->emitRawText("\tDSZ 040,0");
 +    }
 +    return;
 +  }
@@ -1491,10 +1526,10 @@ index 000000000..2c2b2c809
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEASMPRINTER_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseFrameLowering.cpp b/llvm/lib/Target/Eclipse/EclipseFrameLowering.cpp
 new file mode 100644
-index 000000000..2515b7be0
+index 000000000..6146f8afd
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseFrameLowering.cpp
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,192 @@
 +//===-- EclipseFrameLowering.cpp - Eclipse Frame Information -------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -1514,15 +1549,57 @@ index 000000000..2515b7be0
 +
 +using namespace llvm;
 +
++// StackGrowsUp, not StackGrowsDown: real hardware SAVE reserves its
++// "Words" local/temp area *above* the frame pointer (FP+1..FP+Words -
++// see emitPrologue's comment and EclipseInstrInfo.td's SAVE comment),
++// not below it. Locals need to live there, on the *opposite* side of
++// FP from arguments (which sit below FP, at FP-5 and beyond - see
++// LowerFormalArguments in EclipseISelLowering.cpp) and from SAVE's own
++// 5 pushed linkage words (also below FP, at FP through FP-4). Confirmed
++// the hard way this distinction matters: with StackGrowsDown (the
++// setting the old, software-only _SP calling convention this replaced
++// correctly used, since *that* stack did grow downward), LLVM's
++// generic PEI frame-object-offset pass placed ordinary locals at
++// negative FP-relative offsets same as arguments - for a function with
++// enough locals, or in a deep-enough call chain, that put a local
++// right on top of one of SAVE's own linkage words (observed: FP-4,
++// AC0's saved-caller-value slot, got overwritten mid-function and then
++// clobbered again by the epilogue's own return-value store - by the
++// time RTN read it back the real value was long gone, so RTN restored
++// garbage into AC2/PC and the program jumped to a bogus address).
++// Moving locals to the positive side removes the collision entirely
++// instead of just relocating it.
 +EclipseFrameLowering::EclipseFrameLowering(const EclipseSubtarget & /*STI*/)
-+    : TargetFrameLowering(TargetFrameLowering::StackGrowsDown, Align(2), 0) {}
++    : TargetFrameLowering(TargetFrameLowering::StackGrowsUp, Align(2), 2) {}
++// LocalAreaOffset = 2 (bytes = 1 word), not 0: offset 0 itself is also
++// reserved - it's SAVE's own return-address slot (mem[FP], the word
++// RTN reads to jump back to the caller). With LocalAreaOffset=0, PEI's
++// generic pass placed one function's spill/local object *at* offset 0
++// (confirmed by inspecting the generated assembly: "STA 0,0,2" in a
++// function using long-typed parameters), directly overwriting the
++// return address before RTN could read it back - the exact same class
++// of bug this whole StackGrowsUp change exists to fix, just relocated
++// by one word instead of eliminated. Shifting the local area to start
++// one word later closes that last gap.
 +
-+// `_SP` is a plain page-zero memory word, not a register: manipulated with
-+// ISZABS/DSZABS (ISZ/DSZ) plus single-level indirect LDABSI/STABSI — see
-+// docs/ECLIPSE_ISA_NOTES.md in the sibling `eccc` project for why (the
-+// hardware PSH/POP/SAVE/RTN stack instructions were tried and rejected as
-+// needing an OS-managed environment this bare-metal target doesn't have).
-+static const char *SPSym = "_SP";
++// Frame linkage (push/pop the caller's FP + return address, establish/
++// tear down this function's own frame pointer) is built entirely from
++// the real hardware SAVE/RTN instructions — see EclipseInstrInfo.td's
++// SAVE/RET(="RTN") definitions for the verified semantics and why this
++// is safe, contrary to this file's own history (this used to say real
++// hardware PSH/POP/SAVE/RTN "were tried and rejected as needing an
++// OS-managed environment this bare-metal target doesn't have" — an
++// unverified claim inherited from the sibling eccc project; direct
++// testing on eclipseemu found that's not actually true once the three
++// fixed hardware-register locations SAVE/RTN use are initialized once
++// at program start, see EclipseAsmPrinter.cpp's _start emission).
++//
++// Argument push/pop (emitPushPop/emitAdjCallStack, EclipseISelLowering.cpp)
++// and a couple of scratch-register save/restore sites (EclipseAsmPrinter.cpp,
++// EclipseInstrInfo.cpp's MUL/DIV expansion) still use a software
++// push/pop sequence — but now against the same fixed hardware stack-
++// pointer location (040) SAVE/RTN themselves use, not a separate `_SP`
++// variable, so the two never drift apart or overlap.
 +
 +void EclipseFrameLowering::emitPrologue(MachineFunction &MF,
 +                                         MachineBasicBlock &MBB) const {
@@ -1532,23 +1609,20 @@ index 000000000..2515b7be0
 +      *MF.getSubtarget<EclipseSubtarget>().getInstrInfo();
 +  MachineFrameInfo &MFI = MF.getFrameInfo();
 +
-+  // Push caller's FP (AC2).
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::DSZABS)).addExternalSymbol(SPSym);
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::STABSI))
-+      .addReg(Eclipse::AC2)
-+      .addExternalSymbol(SPSym);
-+  // Push return address (AC3, set by the caller's JSR).
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::DSZABS)).addExternalSymbol(SPSym);
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::STABSI))
-+      .addReg(Eclipse::AC3)
-+      .addExternalSymbol(SPSym);
-+  // FP := current stack top.
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::LDABS), Eclipse::AC2)
-+      .addExternalSymbol(SPSym);
-+  // Reserve locals + temps.
++  // SAVE pushes AC0/AC1/AC2/old-FP/AC3(retaddr) and reserves Words more
++  // local/temp words, all in a single instruction.
 +  uint64_t Words = MFI.getStackSize();
-+  for (uint64_t i = 0; i < Words; ++i)
-+    BuildMI(MBB, MBBI, DL, TII.get(Eclipse::DSZABS)).addExternalSymbol(SPSym);
++  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::SAVE)).addImm(Words);
++  // SAVE leaves the new frame pointer in AC3 (and hardware location
++  // 041) — copy into AC2 so every *other* frame-relative address
++  // computation already in this backend (eliminateFrameIndex,
++  // LowerFormalArguments, LowerVASTART/VAARG, ...) keeps working exactly
++  // as before, completely unmodified. Costs one extra instruction here
++  // but keeps this whole change contained to prologue/epilogue instead
++  // of touching every existing AC2-is-the-frame-pointer assumption
++  // throughout the backend.
++  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::MOVrr), Eclipse::AC2)
++      .addReg(Eclipse::AC3);
 +}
 +
 +void EclipseFrameLowering::emitEpilogue(MachineFunction &MF,
@@ -1557,18 +1631,28 @@ index 000000000..2515b7be0
 +  DebugLoc DL = MBBI != MBB.end() ? MBBI->getDebugLoc() : DebugLoc();
 +  const auto &TII =
 +      *MF.getSubtarget<EclipseSubtarget>().getInstrInfo();
-+  MachineFrameInfo &MFI = MF.getFrameInfo();
 +
-+  uint64_t Words = MFI.getStackSize();
-+  for (uint64_t i = 0; i < Words; ++i)
-+    BuildMI(MBB, MBBI, DL, TII.get(Eclipse::ISZABS)).addExternalSymbol(SPSym);
-+
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::LDABSI), Eclipse::AC3)
-+      .addExternalSymbol(SPSym);
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::ISZABS)).addExternalSymbol(SPSym);
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::LDABSI), Eclipse::AC2)
-+      .addExternalSymbol(SPSym);
-+  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::ISZABS)).addExternalSymbol(SPSym);
++  // RTN (the terminator this inserts before — see EclipseInstrInfo.td's
++  // RET definition, which now prints "RTN") unconditionally restores
++  // AC0/AC1 from whatever SAVE pushed at function entry: the *caller's*
++  // pre-call values, not this function's return value. Overwrite those
++  // two saved stack slots with the real return value — already computed
++  // into AC0/AC1 by this point via ordinary LowerReturn-generated code,
++  // unchanged — immediately before RTN runs, so what RTN pops back out
++  // *is* the return value. Slots are FP-4 (AC0) and FP-3 (AC1), matching
++  // SAVE's own push order (see its .td comment); AC2 already holds the
++  // frame pointer here (the prologue's MOV), so STFI's implicit ",2"
++  // base is exactly right. Harmless to do unconditionally even for a
++  // void function or one returning via a hidden sret pointer — nothing
++  // reads AC0/AC1 after such a call anyway.
++  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::STFI)).addReg(Eclipse::AC0).addImm(-4);
++  BuildMI(MBB, MBBI, DL, TII.get(Eclipse::STFI)).addReg(Eclipse::AC1).addImm(-3);
++  // No explicit local-space deallocation loop needed here, unlike the
++  // old per-word ISZABS epilogue: RTN resets the hardware stack pointer
++  // straight from the frame pointer (hardware location 041), discarding
++  // the whole frame — locals, temps, anything else — in one step, as
++  // part of the very same instruction that also restores AC0-AC3 and
++  // returns.
 +}
 +
 +MachineBasicBlock::iterator EclipseFrameLowering::eliminateCallFramePseudoInstr(
@@ -1825,10 +1909,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..15342f5c3
+index 000000000..df19e99c3
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1222 @@
+@@ -0,0 +1,1276 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2665,10 +2749,20 @@ index 000000000..15342f5c3
 +  MachineFunction &MF = DAG.getMachineFunction();
 +  MachineFrameInfo &MFI = MF.getFrameInfo();
 +
++  // FP-5 = first parameter (pushed last by the caller, so shallowest);
++  // FP-1/FP-2/FP-3/FP+0 are AC0/AC1/AC2/the return address, which real
++  // hardware SAVE pushes onto the *same* stack the caller's argument
++  // pushes already occupy, immediately below the callee's own SAVE (see
++  // EclipseInstrInfo.td's SAVE comment for the exact push order this
++  // offset is derived from, and DEBUGGING_NOTES.md for how this was
++  // found: this used to be a *positive* FP+2 offset under the old
++  // manual-push prologue, whose stack grew the opposite direction from
++  // real SAVE's — reusing that old positive offset unmodified after
++  // switching to SAVE landed on whichever of the callee's own just-
++  // pushed AC0-AC3 words happened to sit at that address instead of the
++  // caller's real arguments).
 +  for (unsigned i = 0, e = Ins.size(); i != e; ++i) {
-+    // FP+2 = first parameter (pushed last by the caller, so shallowest);
-+    // FP+0/FP+1 are the callee's own saved return address / caller FP.
-+    int FI = MFI.CreateFixedObject(kWordBytes, /*SPOffset*/ 2 + i,
++    int FI = MFI.CreateFixedObject(kWordBytes, /*SPOffset*/ -5 - (int)i,
 +                                    /*IsImmutable*/ true);
 +    SDValue FIN = DAG.getFrameIndex(FI, MVT::i16);
 +    InVals.push_back(DAG.getLoad(MVT::i16, dl, Chain, FIN,
@@ -2677,11 +2771,12 @@ index 000000000..15342f5c3
 +
 +  if (IsVarArg) {
 +    // The "..." arguments are pushed right-to-left same as any named
-+    // one (LowerCall), so they simply continue immediately after the
-+    // last named parameter at FP+2+Ins.size() — no distinct varargs
++    // one (LowerCall), so they simply continue immediately below the
++    // last named parameter at FP-5-Ins.size() — no distinct varargs
 +    // save area to build. va_start (LowerVASTART) just needs this frame
 +    // index's address.
-+    int FI = MFI.CreateFixedObject(kWordBytes, /*SPOffset*/ 2 + Ins.size(),
++    int FI = MFI.CreateFixedObject(kWordBytes,
++                                    /*SPOffset*/ -5 - (int)Ins.size(),
 +                                    /*IsImmutable*/ true);
 +    MF.getInfo<EclipseMachineFunctionInfo>()->setVarArgsFrameIndex(FI);
 +  }
@@ -2727,7 +2822,18 @@ index 000000000..15342f5c3
 +  // is a MachineFrameInfo *byte-size* convention (CreateFixedObject),
 +  // unrelated to this runtime-pointer increment. Using kWordBytes here
 +  // silently advanced two words per va_arg instead of one.
-+  SDValue NextPtr = DAG.getNode(ISD::ADD, dl, MVT::i16, VAList,
++  //
++  // SUB, not ADD: real hardware SAVE grows this stack *upward* (see
++  // EclipseInstrInfo.td's SAVE comment), so arguments pushed right-to-
++  // left land at *decreasing* addresses as va_arg walks left-to-right
++  // through them — the last-named parameter (where va_start points) is
++  // the highest address of the group, and each successive vararg sits
++  // one word *below* the last. Confirmed via a real repro: a printf
++  // call with two `%d` arguments printed the first one correctly and
++  // read garbage for the second when this incorrectly added instead —
++  // it was walking away from the pushed arguments instead of through
++  // them, off into whatever else happened to occupy higher addresses.
++  SDValue NextPtr = DAG.getNode(ISD::SUB, dl, MVT::i16, VAList,
 +                                 DAG.getConstant(1, dl, MVT::i16));
 +  SDValue Chain2 = DAG.getStore(Result.getValue(1), dl, NextPtr, VAListPtr,
 +                                 MachinePointerInfo());
@@ -2755,14 +2861,17 @@ index 000000000..15342f5c3
 +
 +  unsigned NumWords = Outs.size();
 +  // 0, not NumWords: PUSH (emitPushPop) already reserves its own word via
-+  // its own DSZABS before storing — ADJCALLSTACKDOWN reserving NumWords
-+  // *again* here double-decrements _SP per argument. Only the "up" side
-+  // needs NumWords, to release what PUSH actually reserved. A real,
-+  // empirically-found bug: with both sides at NumWords, _SP leaked one
-+  // word per pushed argument on every call, invisible in single-call-
-+  // depth tests but corrupting AC2/AC3 (frame pointer / return address)
-+  // after enough nested/looped calls — e.g. `puts()` calling `putchar()`
-+  // in its own loop leaked enough words to return through a garbage AC3.
++  // its own ISZABS before storing — ADJCALLSTACKDOWN reserving NumWords
++  // *again* here double-reserves the hardware stack pointer per
++  // argument. Only the "up" side needs NumWords, to release what PUSH
++  // actually reserved. A real, empirically-found bug (from before this
++  // targeted the same hardware-recognized stack location SAVE/RTN use —
++  // see emitPushPop's comment): with both sides at NumWords, the stack
++  // pointer leaked one word per pushed argument on every call, invisible
++  // in single-call-depth tests but corrupting AC2/AC3 (frame pointer /
++  // return address) after enough nested/looped calls — e.g. `puts()`
++  // calling `putchar()` in its own loop leaked enough words to return
++  // through a garbage AC3.
 +  Chain = DAG.getCALLSEQ_START(Chain, 0, 0, dl);
 +
 +  // Push right-to-left (last parameter pushed first) — see
@@ -2992,6 +3101,32 @@ index 000000000..15342f5c3
 +  return MergeMBB;
 +}
 +
++// Fixed hardware stack-pointer location (040 octal) — the same one real
++// SAVE/RTN use natively (EclipseInstrInfo.td).
++static constexpr int HWStackAddr = 040;
++
++// Argument push/pop still use a software DSZABS/STABSI/LDABSI/ISZABS
++// sequence rather than real hardware push/pop instructions (this
++// backend has none besides SAVE/RTN, which are frame-management, not
++// general push/pop — see EclipseInstrInfo.td). Critically, this targets
++// the *same* fixed hardware stack-pointer location SAVE/RTN themselves
++// use natively — not a separate `_SP` variable — so argument pushes for
++// a call made from inside a function's own body never drift out of
++// sync with, or overlap, whatever hardware location that function's own
++// SAVE-established frame is using.
++//
++// Direction matters and is easy to get backwards: real SAVE grows the
++// stack *upward* (it increments 040 before storing each pushed word —
++// see EclipseInstrInfo.td's SAVE comment and simh's eclipse_cpu.c, the
++// actual reference this was verified against), the *opposite* direction
++// from the old purely-software `_SP` stack this replaced, which grew
++// downward. Push here must therefore increment-then-store (ISZABS, not
++// DSZABS) and pop must load-then-decrement (then DSZABS, not ISZABS) —
++// getting this wrong doesn't fail loudly, it silently pushes arguments
++// in the wrong direction relative to (and colliding with) whatever the
++// caller's own SAVE-established frame just reserved, confirmed via a
++// real repro: a call's arguments read back as whatever the callee's own
++// prologue happened to leave at that address instead.
 +MachineBasicBlock *EclipseTargetLowering::emitPushPop(MachineInstr &MI,
 +                                                       MachineBasicBlock *MBB,
 +                                                       bool IsPush) const {
@@ -2999,14 +3134,14 @@ index 000000000..15342f5c3
 +  DebugLoc DL = MI.getDebugLoc();
 +  if (IsPush) {
 +    Register Src = MI.getOperand(0).getReg();
-+    BuildMI(*MBB, MI, DL, TII.get(Eclipse::DSZABS)).addExternalSymbol("_SP");
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::ISZABS)).addImm(HWStackAddr);
 +    BuildMI(*MBB, MI, DL, TII.get(Eclipse::STABSI))
 +        .addReg(Src)
-+        .addExternalSymbol("_SP");
++        .addImm(HWStackAddr);
 +  } else {
 +    Register Dst = MI.getOperand(0).getReg();
-+    BuildMI(*MBB, MI, DL, TII.get(Eclipse::LDABSI), Dst).addExternalSymbol("_SP");
-+    BuildMI(*MBB, MI, DL, TII.get(Eclipse::ISZABS)).addExternalSymbol("_SP");
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::LDABSI), Dst).addImm(HWStackAddr);
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::DSZABS)).addImm(HWStackAddr);
 +  }
 +  MI.eraseFromParent();
 +  return MBB;
@@ -3018,9 +3153,12 @@ index 000000000..15342f5c3
 +  const auto &TII = *MBB->getParent()->getSubtarget<EclipseSubtarget>().getInstrInfo();
 +  DebugLoc DL = MI.getDebugLoc();
 +  int64_t Words = MI.getOperand(0).getImm();
-+  unsigned Opc = IsDown ? Eclipse::DSZABS : Eclipse::ISZABS;
++  // Same increment-to-reserve/decrement-to-release direction as
++  // emitPushPop above, for the same reason (matching real SAVE's own
++  // upward growth) — see that function's comment.
++  unsigned Opc = IsDown ? Eclipse::ISZABS : Eclipse::DSZABS;
 +  for (int64_t i = 0; i < Words; ++i)
-+    BuildMI(*MBB, MI, DL, TII.get(Opc)).addExternalSymbol("_SP");
++    BuildMI(*MBB, MI, DL, TII.get(Opc)).addImm(HWStackAddr);
 +  MI.eraseFromParent();
 +  return MBB;
 +}
@@ -3364,10 +3502,10 @@ index 000000000..c7b0873e1
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.cpp b/llvm/lib/Target/Eclipse/EclipseInstrInfo.cpp
 new file mode 100644
-index 000000000..37ecf66b1
+index 000000000..00dd94ee4
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.cpp
-@@ -0,0 +1,257 @@
+@@ -0,0 +1,269 @@
 +//===-- EclipseInstrInfo.cpp - Eclipse Instruction Information ----------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -3556,7 +3694,15 @@ index 000000000..37ecf66b1
 +// entire reason this is a post-RA expansion rather than
 +// EmitInstrWithCustomInserter — nothing else can be scheduled or
 +// spilled into the middle of it anymore.
-+static const char *SPSym = "_SP";
++// Fixed hardware stack-pointer location (040 octal) — the same one real
++// SAVE/RTN use natively (see EclipseInstrInfo.td's SAVE/RET comments and
++// EclipseAsmPrinter.cpp's _start initialization), not a separate `_SP`
++// software variable: AC2 has to come off the frame pointer here (MUL/DIV
++// clobber AC0:AC1:AC2), and using the same hardware-recognized location
++// for that save/restore keeps it from ever drifting out of sync with
++// whatever SAVE/RTN or argument push/pop are doing to the real stack
++// pointer at the same time.
++static const int HWStackAddr = 040;
 +
 +bool EclipseInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
 +  unsigned Opc = MI.getOpcode();
@@ -3584,10 +3730,14 @@ index 000000000..37ecf66b1
 +  Register LHS = MI.getOperand(1).getReg();
 +  Register RHS = MI.getOperand(2).getReg();
 +
-+  BuildMI(MBB, MI, DL, get(Eclipse::DSZABS)).addExternalSymbol(SPSym);
++  // Real SAVE grows this stack *upward* (increment-then-store) — see
++  // EclipseInstrInfo.td's SAVE comment — so push here is ISZ-then-store
++  // and the matching pop below is load-then-DSZ, the opposite of what
++  // the old, purely-software `_SP` stack this replaced used.
++  BuildMI(MBB, MI, DL, get(Eclipse::ISZABS)).addImm(HWStackAddr);
 +  BuildMI(MBB, MI, DL, get(Eclipse::STABSI))
 +      .addReg(Eclipse::AC2)
-+      .addExternalSymbol(SPSym);
++      .addImm(HWStackAddr);
 +
 +  // NB: must be real MOVrr, not TargetOpcode::COPY — these are inserted
 +  // *before* the loop's current position in ExpandPostRAPseudos, so a
@@ -3619,8 +3769,8 @@ index 000000000..37ecf66b1
 +  }
 +
 +  BuildMI(MBB, MI, DL, get(Eclipse::LDABSI), Eclipse::AC2)
-+      .addExternalSymbol(SPSym);
-+  BuildMI(MBB, MI, DL, get(Eclipse::ISZABS)).addExternalSymbol(SPSym);
++      .addImm(HWStackAddr);
++  BuildMI(MBB, MI, DL, get(Eclipse::DSZABS)).addImm(HWStackAddr);
 +
 +  MI.eraseFromParent();
 +  return true;
@@ -3705,10 +3855,10 @@ index 000000000..4caee1b13
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEINSTRINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.td b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
 new file mode 100644
-index 000000000..e55661e34
+index 000000000..98fb20322
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
-@@ -0,0 +1,460 @@
+@@ -0,0 +1,506 @@
 +//===- EclipseInstrInfo.td - Eclipse Instruction defs ------*- tablegen -*-=//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4052,8 +4202,54 @@ index 000000000..e55661e34
 +// EclipseRet node (matched here via SDNPVariadic) — declaring it
 +// unconditionally would make void-returning functions falsely claim to
 +// read an AC0 nothing ever wrote, tripping the MachineVerifier.
++//
++// Prints "RTN" (the real hardware instruction — see SAVE below and
++// EclipseFrameLowering.cpp's prologue/epilogue), not a plain "JMP 0,3":
++// once EclipseFrameLowering's prologue uses SAVE to build the frame, the
++// matching epilogue must use hardware RTN to unwind it — RTN restores
++// AC0-AC3 and the stack/frame pointer from exactly what SAVE pushed, and
++// a plain JMP wouldn't undo any of that. Confirmed genuinely usable on
++// eclipseemu, contrary to this file's own history: previously documented
++// here as needing "an OS-managed frame environment this bare-metal
++// target doesn't have" (a claim inherited from the sibling eccc
++// project, never independently verified) — direct testing found that
++// claim doesn't hold once the three hardware-register locations SAVE/
++// RTN actually use (040 = stack pointer, 041 = frame pointer, 042 =
++// stack limit) are initialized once at program start (see
++// EclipseAsmPrinter.cpp's _start emission) — no trap ever fires, no OS
++// involved. The AC3 "Uses" below is unchanged from the old plain-JMP
++// version (still true: RTN, like the old JMP 0,3, ultimately needs the
++// return address the caller's JSR left there, though RTN reaches it
++// indirectly through the frame rather than jumping through AC3
++// directly).
 +let isReturn = 1, isTerminator = 1, isBarrier = 1, Uses = [AC3] in
-+def RET : EclipseInst<(outs), (ins), "JMP 0,3", [(EclipseRet)]>;
++def RET : EclipseInst<(outs), (ins), "RTN", [(EclipseRet)]>;
++
++// The hardware frame-setup instruction EclipseFrameLowering's prologue
++// uses in place of the old manual DSZABS/STABSI push sequence — see
++// RET's comment just above for why this is safe here (verified, not
++// just assumed) despite this file's older comments elsewhere still
++// describing PSH/POP/SAVE/RTN as unusable.
++//
++// $n is a genuine numeric immediate (not a var/symbol reference, unlike
++// every other operand in this backend) — dgasm parses "SAVE <N>" as a
++// real two-word instruction (opcode word + a following literal operand
++// word), confirmed directly. EclipseInstPrinter::printOperand already
++// prints plain immediates as decimal, which is what dgasm expects here.
++//
++// Real hardware semantics (from simh's eclipse_cpu.c, the actual
++// reference this was verified against): pushes AC0, AC1, AC2, the old
++// frame pointer (from location 041), and AC3 (the return address JSR
++// left there) — five words — then reserves $n more, and sets AC3 and
++// location 041 to the new frame pointer (the address of the just-pushed
++// return-address word). AC0/AC1/AC2 are only *read* here (pushed
++// verbatim), never altered — SAVE always runs before this function's
++// own body has assigned anything meaningful to AC0/AC1 anyway (it's the
++// very first thing the prologue does), so their pushed values are
++// whatever the caller happened to leave behind and are never consulted
++// again until RTN pops them back for the *caller's* use.
++let Uses = [AC0, AC1, AC2, AC3], Defs = [AC3] in
++def SAVE : EclipseInst<(outs), (ins i16imm:$n), "SAVE $n", []>;
 +
 +//===----------------------------------------------------------------------===//
 +// Interrupt return. The real hardware sequence is exactly two instructions,

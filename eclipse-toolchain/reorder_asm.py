@@ -12,8 +12,9 @@ page-zero displacement) and dgasm will reject the file with "Address out
 of range".
 
 This is pure line-oriented text manipulation, not a code transformation:
-the fixed preamble (comments, `org`, `dev`, `_start`, the initial `_SP`/
-`_scratch` declarations) stays exactly first, then every remaining `var `
+the fixed preamble (comments, `org`, `dev`, `_start`, the initial
+`_STACKTOP`/`_STACKLIM`/`_scratch` declarations) stays exactly first, then
+every remaining `var `
 line moves before every remaining non-`var` line, each group keeping its
 own original relative order. See llvm/lib/Target/Eclipse/EclipseAsmPrinter.h
 in the Eclipse LLVM backend for why this lives here instead of in the
@@ -355,64 +356,71 @@ def dedup_constants(text: str) -> str:
 
 # --- stack-pointer placement -----------------------------------------------
 #
-# Bug found while verifying bug #8's fix (see SOFT_FLOAT_NOTES.md): with
-# only two allocatable registers (AC0/AC1), almost everything on this
-# target spills to a software stack, implemented as a page-zero cell
-# (`_SP`) holding the current top-of-stack address, pushed/popped via
-# `STA n,@_SP` / `DSZ _SP,0` (see EclipseAsmPrinter.cpp's call-lowering).
-# `EclipseAsmPrinter::emitStartOfAsmFile` always hardcoded its *initial*
-# value to `020000` (8192 decimal) — chosen once, with no relationship to
-# how much data the final program would actually contain.
+# Bug found while verifying bug #8's fix (see SOFT_FLOAT_NOTES.md), fixed
+# again below in a different form once the calling convention moved onto
+# real hardware SAVE/RTN (see DEBUGGING_NOTES.md and EclipseInstrInfo.td's
+# SAVE/RET comments): the frame/local-storage stack SAVE/RTN manage lives
+# at a fixed hardware location (040 octal), initialized once at program
+# start (`_STACKTOP`, `_STACKLIM` — EclipseAsmPrinter.cpp's _start
+# emission) rather than a plain `_SP` software variable the way it used to
+# be. Argument push/pop (EclipseISelLowering.cpp's emitPushPop/
+# emitAdjCallStack) and a couple of scratch-save sites
+# (EclipseAsmPrinter.cpp, EclipseInstrInfo.cpp's MUL/DIV expansion) target
+# that same 040 location directly now too, so there's only ever one real
+# stack, not two drifting independently.
 #
-# reorder() above deliberately moves every *bulk* (non-page-zero) global —
-# every string literal and file-scope static, i.e. everything that isn't a
-# page-zero pointer slot or constant-pool entry — to the very end of the
-# file, so dgasm deposits it at the *highest* addresses the program uses.
-# That address grows with the linked program's size (more functions
+# Under real hardware SAVE, the stack grows *upward* from `_STACKTOP`
+# toward `_STACKLIM` — the opposite direction from the old software
+# stack, which grew downward from a high `_SP` toward the program's own
+# data sitting below it. That inversion is exactly why the two constants
+# need different treatment: `_STACKLIM` just needs to clear dgasm's own
+# 65536-word hard ceiling with room to spare, entirely independent of how
+# large any particular program's own data is — EclipseAsmPrinter.cpp's
+# default (`0177700`, decimal 65472) is already comfortably generous and
+# never needs patching. `_STACKTOP`, on the other hand, still needs
+# exactly the same dynamic fix `_SP` used to: reorder() above deliberately
+# moves every *bulk* (non-page-zero) global to the very end of the file,
+# so dgasm deposits it at the *highest* addresses the program uses, and
+# that address grows with the linked program's size (more functions
 # pulled in — even ones genuinely dead at runtime: `eclipse-cc`'s
 # symbol-protection mechanism has to keep a libcall's own code reachable
 # to satisfy dgasm's "Undefined symbol" check even for a program that
-# never actually reaches it, e.g. protecting `__ltsf2` for a `<`
-# comparison also pulls in `sf_cmp` and its own helpers). Nothing before
-# this pass ever compared that growing address against the fixed 8192
-# stack origin sitting right above it: a small program leaves a large gap,
-# but a large enough one can shrink that gap until ordinary call/recursion
-# depth (e.g. `print_uint32`'s one-recursive-call-per-decimal-digit)
-# drives the stack pointer down *into* that data — silently corrupting
-# live globals and strings, and, once deep enough, a saved return address,
-# producing exactly the "a string prints with garbled characters, then
-# execution runs away to the reset vector" failure this was found from.
-# Confirmed directly: examining word 0102 (the cell holding the live `_SP`
-# value) mid-run on the failing repro showed it reaching decimal 7605
-# while that same program's own data extended to 7755 — the stack had
-# already descended into live data before the eventual crash. dgasm itself
-# never catches this: unlike the hard page-zero (0-255) ceiling it
-# enforces for every `LDA`/`STA` displacement, it has no equivalent check
-# for "does the stack collide with static data" — to dgasm, both are just
-# plain memory words.
+# never actually reaches it). A `_STACKTOP` placed too close underneath
+# that growing address would leave the *upward*-growing stack too little
+# room before it starts colliding with `_STACKLIM`'s own ceiling on a
+# large enough program — the same class of problem the original `_SP` bug
+# was, just approached from the opposite direction. Confirmed directly (of
+# the original, downward-growing version of this bug): examining word
+# 0102 (the cell holding the live `_SP` value at the time) mid-run on the
+# failing repro showed it reaching decimal 7605 while that same program's
+# own data extended to 7755 — the stack had already descended into live
+# data before the eventual crash. dgasm itself never catches this class of
+# bug either way: unlike the hard page-zero (0-255) ceiling it enforces
+# for every `LDA`/`STA` displacement, it has no equivalent check for "does
+# the stack collide with static data" — to dgasm, both are just plain
+# memory words.
 #
-# Fixed here, not in the backend: EclipseAsmPrinter emits _SP's value long
-# before the final program layout exists (dedup_constants and
+# Fixed here, not in the backend: EclipseAsmPrinter emits `_STACKTOP`'s
+# value long before the final program layout exists (dedup_constants and
 # relax_long_jumps haven't run yet, and it has no way to know what else
 # will or won't end up linked in). This pass runs last of all, once
 # compute_addresses can see the *actual* final end-of-program address, and
-# repoints `_SP` comfortably above it instead of trusting a fixed guess.
-# dgasm's own MAX_MEMORY_WORDS (confirmed by reading assembler.c directly)
-# is 65536 — this ISA's full 16-bit address space — so there's abundant
-# room: STACK_MARGIN below leaves far more headroom than any call/
-# recursion depth this backend's calling convention could plausibly reach
-# (the failing repro above only ever descended a few hundred words before
-# corrupting something), while still failing loudly — instead of silently
-# emitting an invalid or wrapped address — on the pathological case of a
-# program whose own data nearly fills that space outright.
+# repoints `_STACKTOP` comfortably above it instead of trusting a fixed
+# guess. STACK_MARGIN below leaves far more headroom above the program's
+# own data than any call/recursion depth this backend's calling
+# convention could plausibly reach, while still failing loudly — instead
+# of silently emitting an invalid or wrapped address — on the pathological
+# case of a program whose own data nearly fills the address space outright.
 
-STACK_MARGIN = 4096  # words reserved for the software stack above the
-                      # program's own highest data address — see this
-                      # section's comment for why this is generous.
-MAX_MEMORY_WORDS = 65536  # dgasm's own limit (assembler.c), this ISA's
-                           # full 16-bit address space.
+STACK_MARGIN = 4096  # words of headroom between the program's own highest
+                      # data address and _STACKTOP — see this section's
+                      # comment for why this is generous.
+STACK_LIMIT = 0o177700  # must match EclipseAsmPrinter.cpp's _STACKLIM
+                         # default exactly — the real ceiling the
+                         # upward-growing hardware stack checks against,
+                         # not just dgasm's raw address-space limit.
 
-SP_DECL_RE = re.compile(r"^(\s*var\s+_SP\s*=\s*)(\S+)(.*)$")
+SP_DECL_RE = re.compile(r"^(\s*var\s+_STACKTOP\s*=\s*)(\S+)(.*)$")
 
 
 def fix_stack_pointer(text: str) -> str:
@@ -420,13 +428,13 @@ def fix_stack_pointer(text: str) -> str:
     _label_addr, _line_addr, end_addr = compute_addresses(lines)
 
     new_sp = end_addr + STACK_MARGIN
-    if new_sp >= MAX_MEMORY_WORDS:
+    if new_sp >= STACK_LIMIT:
         print(
             f"reorder_asm.py: program data extends to address {end_addr} "
             f"({end_addr:#o}) — placing the stack {STACK_MARGIN} words "
-            f"above it would exceed this target's {MAX_MEMORY_WORDS}-word "
-            "address space. This program is too large for the software "
-            "stack to fit safely; shrink it (fewer linked runtime "
+            f"above it would reach or exceed _STACKLIM ({STACK_LIMIT:#o}), "
+            "the hardware stack's own ceiling. This program is too large "
+            "for the stack to fit safely; shrink it (fewer linked runtime "
             "functions, less string data) rather than trusting a smaller "
             "margin.",
             file=sys.stderr,
@@ -440,13 +448,14 @@ def fix_stack_pointer(text: str) -> str:
             break
     else:
         # EclipseAsmPrinter::emitStartOfAsmFile always emits exactly one
-        # `var _SP = ...` line — if that ever stops being true (a backend
-        # change, an input file from somewhere else), silently leaving the
-        # old value in place would resurrect exactly the bug this pass
-        # exists to fix, just without any error to point at. Fail loudly
-        # instead.
-        raise SystemExit("reorder_asm.py: no `var _SP = ...` line found — "
-                          "expected EclipseAsmPrinter to always emit one")
+        # `var _STACKTOP = ...` line — if that ever stops being true (a
+        # backend change, an input file from somewhere else), silently
+        # leaving the old value in place would resurrect exactly the bug
+        # this pass exists to fix, just without any error to point at.
+        # Fail loudly instead.
+        raise SystemExit("reorder_asm.py: no `var _STACKTOP = ...` line "
+                          "found — expected EclipseAsmPrinter to always "
+                          "emit one")
 
     return "\n".join(lines) + "\n"
 

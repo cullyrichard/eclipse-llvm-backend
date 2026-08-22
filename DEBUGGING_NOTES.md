@@ -519,6 +519,144 @@ writing through the struct. Re-ran the full existing regression pass
 (package examples, `clobber.c` itself) — no change in behavior anywhere
 else.
 
+### 11. Replaced the software-only `_SP` calling convention with real hardware SAVE/RTN (fixed)
+
+Not a bug fix on its own — a from-scratch replacement of how every
+function call on this target works, undertaken because this backend's
+own comments and this project's `README.md` carried a claim, inherited
+from the sibling `eccc` project and never independently verified here:
+that real Nova/Eclipse hardware `PSH`/`POP`/`SAVE`/`RTN` "were tried and
+rejected as needing an OS-managed frame environment this bare-metal
+target doesn't have." Direct testing found that's not true for `SAVE`/
+`RTN` specifically, on `eclipseemu`'s CPU model.
+
+**What the claim actually was protecting against**: a genuine "Nova 3
+instructions" hardware option (`PSHA`/`POPA`/`SAV`/`RET`/`MTSP`/`MTFP`/
+`MFSP`/`MFFP`, confirmed real by finding a virtual-instruction-emulator
+trap handler for exactly this set in the DG SDK's `dgnasm_old/viemu/
+trap.asm`) that traps as "Unimplemented Instruction" on machines that
+don't have it — genuinely needing OS/software emulation there. But
+`eclipseemu`'s CPU model (see `simh/NOVA/eclipse_cpu.c`) implements
+`SAVE` (`0163710`) and `RTN` (`0127710`) *natively*, unconditionally,
+with no trap involved.
+
+**Verifying the real semantics**: `SAVE`/`RTN` use three fixed hardware
+memory locations — `040` (stack pointer), `041` (frame pointer), `042`
+(stack limit, checked on every `SAVE`) — plus `043` (overflow trap
+vector, only touched if the limit check fails). The very first test
+trapped, but only because `040`/`042` default to `0`, so any `SAVE`'s
+limit check trivially failed and trapped through the unhandled vector at
+`043`. Initializing both with two ordinary `STA` instructions at program
+start made `SAVE`/`RTN` work perfectly — no OS, no trap handler needed.
+Real semantics, confirmed against the simulator source and re-verified
+against actual `eclipseemu` runs: `SAVE N` pushes AC0, AC1, AC2, old-FP,
+AC3(+carry, the `JSR` return address) — 5 words, stack growing *upward*
+(increment-then-store) — then reserves `N` more words *above* that;
+leaves the new frame pointer in AC3 and `041`. `RTN` sets SP := FP,
+reads the return address from `mem[FP]` into PC, then pops AC3(old FP),
+AC2, AC1, AC0 in that order. Critically, `RTN` unconditionally restores
+AC0/AC1 to their *pre-call* values — an epilogue has to overwrite those
+two saved stack slots with the real return value before `RTN` runs, or
+the return value is silently lost.
+
+**The new convention** (mirrors the sibling `eccc` project's own
+verified design once the false OS-dependency claim was out of the way):
+prologue is `SAVE <Words>` + `MOV 3,2` (copy the new FP from AC3 into
+AC2, keeping the existing "AC2 is always the frame pointer" convention
+everywhere else in this backend unchanged); epilogue is `STA 0,-4,2` +
+`STA 1,-3,2` (overwrite AC0/AC1's SAVE-pushed slots with the real return
+value) followed by the now-implicit `RTN` (`RET`'s `AsmString` changed
+from `"JMP 0,3"` to `"RTN"` — same pattern-match, same flags, nothing
+else about it changed). No explicit local-deallocation loop needed:
+`RTN`'s `SP := FP` discards the whole frame in one step. Argument
+push/pop and a few scratch-register save/restore sites (`BGEU`/`BLTU`,
+`LEAGA`'s offset-add, `MUL`/`DIV`'s AC2 save) still use a software
+push/pop sequence, but now against the same fixed hardware address `040`
+`SAVE`/`RTN` themselves use — not a separate `_SP` variable — so the two
+can never drift apart. `_start` now initializes `040`/`042` from
+`_STACKTOP`/`_STACKLIM` (renamed from the old `_SP`; `_STACKTOP` is
+still dynamically rewritten by `reorder_asm.py`'s `fix_stack_pointer` to
+sit safely above the program's actual footprint, same mechanism as
+before, just representing the stack's *starting* point now rather than
+an absolute address that never changed).
+
+Three real bugs were found and fixed while bringing this up to full
+parity with the old convention:
+
+- **Push/pop direction mismatch.** The software push/pop sites
+  (argument passing, the three scratch-save spots above) still used the
+  old convention's decrement-to-reserve direction, left over from when
+  the stack grew *downward*. Against the same address `040` real `SAVE`
+  now grows *upward*, that direction is backwards — pushing an argument
+  from inside a function's own body could collide with and corrupt that
+  function's own `SAVE`-reserved frame. Caught by a single nested call
+  returning the wrong value (`add(5,3)` gave `AC0=0` instead of `8`);
+  fixed by flipping every one of these sites from decrement-to-reserve
+  to increment-to-reserve, matching `SAVE`'s own direction, and changing
+  incoming-argument addressing (`LowerFormalArguments`) from positive
+  `FP+2+i` to negative `FP-5-i` to match (arguments pushed before a
+  callee's own `SAVE` now land *below* the new FP, not above it).
+
+- **`va_arg` walked the wrong direction.** Even after the fix above, a
+  `printf` with two `%d` arguments printed the first correctly and read
+  garbage for the second. `LowerVAARG` advanced the `va_list` pointer
+  with `VAList + 1` — correct under the old downward-growing stack,
+  where each next-in-source-order vararg sat at a *higher* address, but
+  backwards now: with the whole stack growing upward, walking from one
+  right-to-left-pushed vararg to the next (in left-to-right C order)
+  means walking to progressively *lower* addresses. Fixed by changing
+  the advance from `ADD` to `SUB`.
+
+- **Ordinary locals could land on top of `SAVE`'s own pushed words.**
+  The most serious of the three, and the one that made the soft-float
+  runtime (`__addsf3`/`sf_add` and everything downstream) reliably
+  overflow the stack and trap at `PC 0`, while simpler programs (a
+  handful of sequential/nested/recursive calls) happened not to trigger
+  it. `EclipseFrameLowering`'s constructor still told LLVM's generic
+  frame-object-offset pass (`PrologEpilogInserter::
+  calculateFrameObjectOffsets`, which silently overwrites this target's
+  own offset-assignment loop in `processFunctionBeforeFrameFinalized` —
+  a pre-existing, documented quirk, left alone) to grow locals
+  *downward* from FP — the same side of FP as both `SAVE`'s own 5 pushed
+  linkage words (`FP` through `FP-4`) and pushed arguments (`FP-5` and
+  below). For a function with enough locals, or one with `long`/wide
+  parameters needing extra spill room, an ordinary local could get
+  assigned an offset already spoken for by one of those — confirmed
+  directly: a local float constant in `main` landed at `FP-4` (AC0's
+  `SAVE`-pushed slot) and was overwritten mid-function, then again by
+  the epilogue's own return-value store, so by the time `RTN` read that
+  slot back the real value was long gone — `RTN` restored a return
+  address of `0` from a different clobbered slot and the program jumped
+  straight into the trap. Root-caused by single-stepping `eclipseemu`
+  through the exact failing instruction sequence and reading `AC2`/
+  `mem[FP]`/`mem[FP-1..FP-4]` directly at the point of failure — all
+  five read back `0`, meaning nothing legitimate had ever written them.
+  Fixed by switching `EclipseFrameLowering` from `StackGrowsDown` to
+  `StackGrowsUp` (`Align(2)`, `LocalAreaOffset = 2`) — locals now start
+  one word *above* FP and grow upward from there, the opposite side of
+  FP from both `SAVE`'s linkage words and pushed arguments, so there's
+  no longer anywhere for the two to collide. `LocalAreaOffset` had to be
+  `2` (one word), not `0`: offset `0` itself is `SAVE`'s own
+  return-address slot, and with `LocalAreaOffset = 0` a spill/local
+  object still occasionally landed exactly there (confirmed in generated
+  assembly: `STA 0,0,2` in a function with `long`-typed parameters).
+
+**Verified**: the full existing regression pass — every package example,
+`clobber.c`, both struct-global tests — plus a new battery of
+hand-written tests exercising what the old convention's regression pass
+didn't specifically cover: sequential and nested calls, 6-level
+recursion (`fact`), a 5-argument function, 32-bit `long` arguments and
+return values, and multi-argument `printf`/varargs. All match established
+baselines exactly. The soft-float runtime — `test_float_mul.c`,
+`test_float_cmp.c`, `test_float_conv.c`, `test_float_div.c`,
+`test_print_float.c` — now also matches established baselines exactly
+with a clean halt, where it previously trapped or hung on every one of
+them. `test_fps_add.c`/`test_fps_md.c`/`fps_dma_test.c` still hang, but
+confirmed benignly: the hardware stack pointer (`040`) is stable across
+a 2.5-million-step range and PC loops within a ~20-word band, consistent
+with the already-documented wait on the unimplemented FPU device
+(`RESOLVED` section below), not corruption.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented
