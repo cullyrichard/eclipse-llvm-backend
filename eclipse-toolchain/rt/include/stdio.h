@@ -12,10 +12,27 @@ int putchar(int c);
 int getchar(void);
 int puts(const char *s);
 
-/* Supports %d, %c, %s, %% only — no field widths, precision, or length
- * modifiers. Every other type is promoted to int/pointer per the usual
- * C varargs default-argument-promotion rules, which this target's
- * uniformly-16-bit int/pointer sizes satisfy trivially.
+/* Supports %d, %c, %s, %x, %u, %ld, %lu, %% — no field widths or
+ * precision. %x/%u read a plain (16-bit) int/unsigned int; %ld/%lu
+ * read a 32-bit long/unsigned long (this target's own "l" length
+ * modifier, not promoted/truncated the way the others are). Every
+ * other type is promoted to int/pointer per the usual C varargs
+ * default-argument-promotion rules, which this target's uniformly-
+ * 16-bit int/pointer sizes satisfy trivially — pass a genuinely
+ * 16-bit-sized value to %u/%x (not a bare out-of-int-range literal
+ * like 65535, which C promotes to long) or the va_arg reads
+ * downstream desync.
+ *
+ * %x/%u/%l* each cost a few words of printf's own reachable-call-graph
+ * weight (print_hex/print_long/print_uint32/u32_and_nz, all pulled in
+ * unconditionally the moment any program calls printf at all, whether
+ * it uses these specifiers or not) — same shared 256-word page-zero
+ * budget %f was kept out of printf for (see this file's next comment).
+ * Confirmed empirically: a program combining atof() with even a bare
+ * printf("%d", n) can tip over that budget where it fit before this
+ * printf was extended, even though atof() and printf() individually
+ * still fit fine — if that happens, replace the printf call with
+ * putchar()/puts() (no extra weight) to get back under budget.
  */
 int printf(const char *fmt, ...);
 

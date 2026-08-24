@@ -1909,10 +1909,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..df19e99c3
+index 000000000..a19cea4a0
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1276 @@
+@@ -0,0 +1,1309 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -1931,8 +1931,10 @@ index 000000000..df19e99c3
 +#include "llvm/CodeGen/MachineInstrBuilder.h"
 +#include "llvm/CodeGen/MachineRegisterInfo.h"
 +#include "llvm/CodeGen/SelectionDAG.h"
++#include "llvm/IR/Constants.h"
 +#include "llvm/IR/DiagnosticInfo.h"
 +#include "llvm/IR/Function.h"
++#include "llvm/IR/GlobalVariable.h"
 +
 +using namespace llvm;
 +
@@ -2422,6 +2424,37 @@ index 000000000..df19e99c3
 +      Offset.getOperand(0) == Offset.getOperand(1)) {
 +    SDValue Halved = Offset.getOperand(0);
 +    return DAG.getNode(EclipseISD::WORD_ADD, dl, MVT::i16, Base, Halved);
++  }
++
++  // A string-literal-backed global is the one Base shape that must NOT
++  // be halved here, matching EclipseAsmPrinter.cpp's own LEAGA-offset
++  // case (see its isString() check): dgasm emits a string initializer
++  // one full word per character ("var name = ...", no packed suffix),
++  // never two-bytes-to-a-word the way a numeric array is packed, so a
++  // runtime index into one is already word-granular. Only reachable
++  // when Base is the WRAPPER'd-global case above -- BaseIsFrameIndex is
++  // true for both the real-FrameIndex and loaded-pointer cases, neither
++  // of which has an underlying GlobalVariable to inspect (and both
++  // always need the halving regardless: this target's frame allocator
++  // packs every local, char arrays included, two bytes to a word). A
++  // real, confirmed-the-hard-way bug: a plain hex-digit lookup table
++  // ("0123456789abcdef"[val & 15]) silently read back element (val&15)/2
++  // instead of element val&15 -- val=255 printed "77" instead of "ff",
++  // both recursive calls' "val and 15 == 15" landing on element 7 (='7')
++  // instead of element 15 (='f').
++  if (!BaseIsFrameIndex) {
++    if (auto *GA = dyn_cast<GlobalAddressSDNode>(Base.getOperand(0))) {
++      if (const auto *GV = dyn_cast<GlobalVariable>(GA->getGlobal())) {
++        if (GV->hasInitializer()) {
++          if (const auto *CDA =
++                  dyn_cast<ConstantDataArray>(GV->getInitializer())) {
++            if (CDA->isString())
++              return DAG.getNode(EclipseISD::WORD_ADD, dl, MVT::i16, Base,
++                                  Offset);
++          }
++        }
++      }
++    }
 +  }
 +
 +  SDValue TwoCP = DAG.getConstantPool(

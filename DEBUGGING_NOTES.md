@@ -657,6 +657,90 @@ a 2.5-million-step range and PC loops within a ~20-word band, consistent
 with the already-documented wait on the unimplemented FPU device
 (`RESOLVED` section below), not corruption.
 
+### 12. Runtime array index into a string-literal global also got halved (fixed) — plus a related, still-open gap
+
+Found while extending `printf`/`string.h`/`stdlib.h` with a batch of
+small, previously-missing library functions (`%x`/`%u`/`%ld`/`%lu`,
+`strchr`/`strrchr`/`strstr`/`strncpy`/`strncat`/`strdup`/`memcmp`,
+`abs`/`labs`/`rand`/`srand`/`exit`/`strtol`/`strtoul`/`atof`) — not a
+regression in anything that shipped before this.
+
+**The bug**: `printf`'s new `%x` case is a hex-digit lookup table,
+`"0123456789abcdef"[val & 15]`, exactly the array-indexed-by-a-runtime-
+value shape bugs #4/#5/#9 above already fixed for *numeric* arrays.
+`print_hex(255)` printed `"77"` instead of `"ff"` — both the outer and
+the recursive call's `val & 15 == 15` read back element 7 (`'7'`)
+instead of element 15 (`'f'`), exactly what dividing the index by 2
+first would produce.
+
+**Root cause**: `EclipseISelLowering.cpp`'s `PerformDAGCombine` HALVE
+fix-up (the byte-to-word correction bugs #4/#5/#9 added, for a runtime
+GEP offset added to a global/frame-index/loaded-pointer base)
+unconditionally divides the offset by 2 — correct for a *numeric*
+array, which dgasm packs two bytes to a word, but wrong for a
+string-literal global: dgasm's plain `var name = "..."` reserves one
+full word *per character*, no packing at all (already correctly
+special-cased in `EclipseAsmPrinter.cpp`'s `LEAGA` handling for
+*constant*-offset string indexing — see that code's own `isString()`
+check — just never carried over to this earlier, runtime-offset combine).
+
+**Fix**: when the `ADD`'s base is a `WRAPPER`'d global address (the one
+case here with an inspectable `GlobalVariable` — the `FrameIndex` and
+loaded-pointer cases don't have one, and correctly keep halving
+unconditionally either way, since this target's frame allocator packs
+every *local*, char arrays included, two bytes to a word regardless of
+content), check whether it's a `ConstantDataArray` with `isString()`
+true and skip the halving if so.
+
+**A second, related bug found alongside this one — not fixed, worked
+around instead**: `s[1]` (or the equivalent `*(s + 1)`) misread when
+`s` is a *local pointer variable* holding a string-literal address —
+confirmed with a minimal repro: `const char *s = "0x1a"; s[1]` read
+back `'0'` (`s[0]`'s own value) instead of `'x'`. The *identical*
+pointer, advanced with `s++` and then dereferenced bare (`*s`, no
+offset in the same expression), read correctly. This is why `strtol`/
+`strtoul`'s hex-prefix detection here uses a copied-and-incremented
+peek pointer rather than `s[1]`, and it's also almost certainly *why*
+this file's existing functions (`strlen`, `strcpy`, `strcmp`, ...) have
+never once used bracket-indexing on a pointer variable, going all the
+way back — apparently a lesson already learned, just never written
+down anywhere until now. Root cause not yet investigated (a different
+DAG shape than the one this bug entry's fix touches — likely
+`EclipseISelDAGToDAG.cpp`'s custom `LOAD`/`STORE` address-mode
+selection rather than `PerformDAGCombine`, since the FrameIndex/global
+cases the fix above handles don't have a "load the pointer value
+first" step at all). Anyone writing new code against this runtime
+should stick to the same convention every existing function already
+uses: advance a pointer with `++`, dereference it bare — never index
+or offset-then-dereference a pointer *variable* (as opposed to a
+`GlobalVariable` reached directly, which is a different, correctly-
+handled DAG shape).
+
+**Also found in the same pass, unrelated, not fixed**: 32-bit (`long`)
+multiplication silently computes the wrong answer rather than failing
+to compile — `1000L * 17` returned `104` (`17000` truncated mod 256,
+suggesting an 8-bit-wide step somewhere in whatever this legalizes to).
+Not yet root-caused. `rand()`/the new `strtol`/`strtoul` avoid it
+entirely (16-bit-native LCG state; `val * base` computed as `base`
+additions of `val` rather than a real multiply) rather than depending
+on it.
+
+**Verified**: full existing regression pass unchanged; `print_hex(255)`
+now correctly prints `"ff"`; every new library function
+(`string.h`/`stdlib.h`/`printf`'s new specifiers) checked individually
+against hand-computed expected output. One real, pre-existing
+constraint surfaced by this batch of additions, not a new bug: `printf`
+now costs a few more words of its own always-reachable call graph
+(`print_hex`/`print_long`/`print_uint32`/`u32_and_nz`, pulled in the
+moment *any* program calls `printf` at all, whether it uses `%x`/`%u`/
+`%l*` or not) against the same shared 256-word page-zero budget `%f`
+was kept out of `printf` for entirely (see `stdio.h`'s own comment) —
+confirmed a program combining `atof()` with even a bare `printf("%d",
+n)` can now tip over that budget where it fit before, though `atof()`
+and `printf()` individually still fit fine on their own. See
+`stdio.h`'s `printf` comment for the workaround (use `putchar`/`puts`
+instead of `printf` in a budget-tight program).
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented
