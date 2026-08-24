@@ -741,6 +741,74 @@ and `printf()` individually still fit fine on their own. See
 `stdio.h`'s `printf` comment for the workaround (use `putchar`/`puts`
 instead of `printf` in a budget-tight program).
 
+### 13. Two new backend gaps hit while adding math.h (worked around, neither fixed at the backend level)
+
+Found while adding `fabsf`/`floorf`/`ceilf`/`sqrtf` — this project's first
+`math.h`. Not regressions; both are things nothing before this needed.
+
+**Gap 1: a function literally named `sqrtf` crashes outright.** LLVM's
+own middle-end (inside `llc`, not clang's frontend — confirmed `-fno-
+builtin`/`-fno-math-builtin` at the `clang -cc1` level make no
+difference at all) recognizes any function named `sqrtf` matching
+libm's signature and rewrites a call to it into a raw `FSQRT` node
+before this project's own implementation is ever reached. This backend
+has no libcall registered for that node, so `llc` crashes outright
+("LLVM ERROR: unsupported library call operation"). `--disable-
+simplify-libcalls` on `llc` does fix this specific crash, but was
+**not** adopted — see Gap 2 below for why it had to be reverted.
+**Fix**: named the real implementation `sf_sqrt` instead, and `math.h`
+exposes the public name via `#define sqrtf(x) sf_sqrt(x)` — the
+literal name `sqrtf` never reaches the compiled IR at all, sidestepping
+the recognition entirely. Every future `math.h` function that happens
+to share a name with a real libm function (`sinf`, `cosf`, `expf`,
+`logf`, `powf`, ...) will likely need the same treatment; check for
+this specific crash signature early when adding one.
+
+**Gap 2: some float comparisons used as a branch condition crash ISel
+— but not in any pattern fully understood.** `sf_sqrt`'s own early-
+return guard, `if (a > 0.0f) { ...loop...; return x; } return 0.0f;`,
+hit a genuine "Cannot select" crash on the `brcond` it produced —
+`llc`'s own DAG dump shows why: it lowers into a *NaN-aware* Select
+tree (comparison libcall combined with an `unordsf2` check) rather
+than a plain compare-then-branch, and this backend has no ISel pattern
+for the resulting shape.
+
+The confusing part: `floorf`/`ceilf`, added in the very same batch,
+branch on `f < t`/`f > t` — a *plain* float comparison, no `<=`/`>=`/
+`==`/`!=` involved — and compile fine. A methodical attempt to isolate
+what actually distinguishes the two (operator direction, comparing
+against a literal `0.0f` vs. two named variables, a loop inside the
+branch vs. not, returning independent literals vs. values derived from
+a shared variable, single-file vs. cross-file compilation, inlining)
+found **no single explanatory factor** — every deliberately-simplified
+repro that changed only one of these dimensions from `floorf`'s own
+exact shape still crashed, except when the function was renamed to
+*some* (not all — `truncf` did, `cbrtf` didn't) other real libm names,
+and `__attribute__((const))` made no difference either. Not resolved;
+genuinely inconsistent by every factor tested so far.
+
+**Fix (worked around, not root-caused)**: rewrote `sf_sqrt`'s guard to
+avoid a float comparison operator as a branch condition entirely,
+using the same `u32_and_nz`-on-the-sign-bit idiom `sf_add_extract`
+already uses safely throughout the soft-float section — check
+`sf_bits(a)`'s sign bit and zero-ness directly instead of writing
+`a > 0.0f`. This sidesteps the question rather than answering it.
+**Anyone adding a new math.h function that needs to branch on a float
+comparison should default to this same bit-pattern-guard style**
+unless the comparison already matches `floorf`/`ceilf`'s exact proven
+shape (a strict `<`/`>` between two named float locals, not a literal).
+
+**Verified**: full existing regression pass unchanged. All four new
+functions checked against hand-computed expected output —
+`fabsf(-3.5)=3.5`, `floorf(3.7)=3`/`floorf(-3.7)=-4`, `ceilf(3.2)=4`/
+`ceilf(-3.2)=-3`, `sqrtf(4)=2`/`sqrtf(2)≈1.414213`/`sqrtf(100)=10`/
+`sqrtf(0.25)=0.5` — all exact. `sqrtf`'s 32-iteration Newton's-method
+loop, run four times across one program, needed roughly 10x more
+`eclipseemu` simulated steps to finish than any test in this project
+so far (20,000,000 rather than 2,000,000) — not a bug, just genuinely
+that much soft-float computation to step through; worth knowing before
+assuming a hang.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented

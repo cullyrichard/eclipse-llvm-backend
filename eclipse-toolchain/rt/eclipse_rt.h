@@ -15,6 +15,7 @@
 #include "string.h"
 #include "ctype.h"
 #include "stdlib.h"
+#include "math.h"
 #include "eclipse_io.h"
 
 #endif

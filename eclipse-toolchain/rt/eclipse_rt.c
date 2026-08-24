@@ -1526,3 +1526,106 @@ void print_float(float f) {
   print_float_extract(f);
   print_float_frac();
 }
+
+/* --- math.h ---
+ *
+ * Built entirely on the soft-float primitives above (arithmetic,
+ * comparison, int<->float conversion) rather than any new bit-level
+ * mantissa/exponent surgery, on purpose: everything here already has
+ * a proven-correct implementation to lean on, and this whole section
+ * stays free of yet another set of SF_*_MASK-wrangling functions to
+ * get right and verify from scratch.
+ */
+
+#define SF_ABS_MASK (SF_EXP_MASK | SF_MANT_MASK)
+
+float fabsf(float f) { return sf_from_bits(sf_bits(f) & SF_ABS_MASK); }
+
+/* (long)f truncates toward zero (see __fixsfsi above) -- floorf only
+ * needs to correct the one case that disagrees with truncation:
+ * negative and non-integral, where truncating rounds up (toward
+ * zero) rather than down. Limited to values representable in a long
+ * (see __fixsfsi's own comment on saturation for anything bigger),
+ * same as every other int<->float conversion in this file.
+ */
+float floorf(float f) {
+  long i = (long)f;
+  float t = (float)i;
+  if (f < t) {
+    return t - 1.0f;
+  }
+  return t;
+}
+
+/* Mirror image of floorf: truncation already rounds the wrong way
+ * (up, toward zero) for a *positive* non-integral value here.
+ */
+float ceilf(float f) {
+  long i = (long)f;
+  float t = (float)i;
+  if (f > t) {
+    return t + 1.0f;
+  }
+  return t;
+}
+
+/* Newton's method (x_{n+1} = (x_n + a/x_n) / 2), starting from x0 = a
+ * itself -- globally convergent for any a > 0 regardless of starting
+ * point, so correctness doesn't depend on a good initial guess, only
+ * on enough iterations. A fixed, generous iteration count rather than
+ * a convergence check: this target has no way to bail out of the loop
+ * cheaply (every comparison here is itself a real function call --
+ * see sf_cmp), and 32 iterations is comfortably enough for float's
+ * 24-bit mantissa to converge from any *reasonable*-magnitude input
+ * (this was not verified against extreme inputs, e.g. very large or
+ * very small a, where x0 = a is a poor enough starting guess that
+ * more warm-up iterations could be needed first).
+ */
+/* Named sf_sqrt, not sqrtf, and exposed as sqrtf only via a macro in
+ * math.h -- calling this "sqrtf" directly hits a real, separate
+ * backend bug: LLVM's TargetLibraryInfo recognizes any function
+ * literally named sqrtf (matching libm's own signature) as *the*
+ * standard sqrtf, regardless of clang-level -fno-builtin/-fno-math-
+ * builtin (those are frontend flags; this recognition happens later,
+ * inside llc's own middle-end, working off the compiled name alone)
+ * -- and rewrites a call to it into a raw FSQRT node before this
+ * function's own body is ever reached. This backend has no libcall
+ * registered for FSQRT, so llc crashes outright ("LLVM ERROR:
+ * unsupported library call operation"). Renaming so the literal name
+ * "sqrtf" never appears in the compiled IR sidesteps the whole
+ * problem with zero blast radius (unlike -disable-simplify-libcalls,
+ * tried first and reverted: it does fix this, but it also disables
+ * the *unrelated* comparison-lowering simplification floorf/ceilf's
+ * own float comparisons depend on to avoid a similar ISel crash of
+ * their own -- confirmed the hard way, by watching floorf break).
+ * The same trick will likely be needed for every math.h function
+ * added after this one that shares a name with a real libm function.
+ */
+float sf_sqrt(float a) {
+  /* Guard via raw bits (u32_and_nz/u32_eq on sf_bits(a)), not a
+   * direct "a > 0.0f" float comparison used as a branch condition --
+   * confirmed the hard way that hits a real ISel crash here ("Cannot
+   * select" on the brcond this function's own early-return produced).
+   * Oddly inconsistent by name: floorf/ceilf's own "f < t"/"f > t"
+   * branches compile fine, and standalone repros under some function
+   * names crash while others (e.g. truncf) don't with the exact same
+   * body -- never fully root-caused, and not worth blocking this on.
+   * Sidestepping float-comparison-as-branch-condition entirely, via
+   * the same u32_and_nz-on-the-sign-bit idiom sf_add_extract already
+   * uses, avoids the whole question and is already proven safe
+   * throughout this file's soft-float section.
+   */
+  u32 abits = sf_bits(a);
+  if (u32_and_nz(abits, SF_SIGN_MASK)) {
+    return 0.0f;
+  }
+  if (u32_eq(abits, 0UL)) {
+    return 0.0f;
+  }
+  float x = a;
+  int i;
+  for (i = 0; i < 32; i++) {
+    x = (x + a / x) * 0.5f;
+  }
+  return x;
+}
