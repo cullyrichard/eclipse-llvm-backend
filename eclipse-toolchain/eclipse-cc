@@ -89,7 +89,16 @@ merged="$work/merged.ll"
 # globaldce's point of view they're unreferenced and get stripped, even
 # on programs that genuinely need them. Confirmed empirically
 # ("Undefined symbol: __fixsfsi" at the dgasm step on any program using
-# `float`).
+# `float`). The same thing happens for memcpy/memmove/memset/memcmp
+# once those are wired up as RTLIB::MEMCPY/etc. implementations
+# (EclipseISelLowering.cpp): an initialized local aggregate (e.g. `int
+# Array[10] = {...};`) can make llc's own lowering insert a call to
+# memcpy that likewise doesn't exist as a visible IR call before this
+# opt pass runs. The retry regex below originally only matched `__`-
+# prefixed names (every soft-float symbol happens to be one), so
+# "Undefined symbol: memcpy" silently fell through as a hard failure
+# with no retry at all — broadened to match any C identifier so this
+# same protect-and-retry loop covers both symbol families.
 #
 # Protecting all of them unconditionally, always, was tried first and
 # rejected: it costs real page-zero budget even for a program using
@@ -154,7 +163,7 @@ while :; do
   # second, independent way dgasm's real errors were going invisible even
   # after the $out-existence fix above. Without the guard, that abort skips
   # the error reporting below entirely.
-  missing="$(echo "$output" | grep -oE 'Undefined symbol: __[A-Za-z0-9_]+' \
+  missing="$(echo "$output" | grep -oE 'Undefined symbol: [A-Za-z_][A-Za-z0-9_]*' \
              | sed 's/Undefined symbol: //' | sort -u)" || true
   new="$(comm -23 <(echo "$missing") <(echo "$protected" | tr ',' '\n' | sort -u))" || true
   if [ -z "$new" ] || [ "$pass" -ge 15 ]; then

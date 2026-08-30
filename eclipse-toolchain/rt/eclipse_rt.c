@@ -192,6 +192,93 @@ int printf(const char *fmt, ...) {
   return n;
 }
 
+/* sprintf: like printf but writes into a caller-supplied buffer and
+ * NUL-terminates it, instead of writing to the console. Deliberately
+ * NOT layered on printf()'s existing helpers (print_int/print_uint/...):
+ * every one of those calls putchar() directly with no output-sink
+ * indirection, so retrofitting a buffer target into all of them would
+ * touch printf's own hot path for no benefit here -- an independent,
+ * small formatter is simpler and lower-risk. Supports %d (with an
+ * optional "0"-flag + decimal width, e.g. %02d, for zero-padding -- the
+ * one field-width feature anything on this target has needed so far),
+ * %c, %s, %% -- no %o/%x/%u/%l* yet; add them the same way (mirroring
+ * printf's own cases) if a future caller needs them.
+ */
+static char *sprintf_put(char *out, int c) {
+  *out = (char)c;
+  return out + 1;
+}
+
+static char *sprintf_uint(char *out, unsigned int val) {
+  if (val >= 10) {
+    out = sprintf_uint(out, val / 10);
+  }
+  return sprintf_put(out, '0' + (val % 10));
+}
+
+static int sprintf_udigits10(unsigned int val) {
+  int n = 1;
+  while (val >= 10) {
+    val /= 10;
+    n++;
+  }
+  return n;
+}
+
+int sprintf(char *buf, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  char *out = buf;
+  while (*fmt) {
+    if (*fmt == '%') {
+      fmt++;
+      int zero_pad = 0;
+      int width = 0;
+      if (*fmt == '0') {
+        zero_pad = 1;
+        fmt++;
+      }
+      while (*fmt >= '0' && *fmt <= '9') {
+        width = width * 10 + (*fmt - '0');
+        fmt++;
+      }
+      if (*fmt == 'd') {
+        int val = va_arg(ap, int);
+        int neg = (val < 0);
+        unsigned int uval = neg ? (unsigned int)(-val) : (unsigned int)val;
+        int total = sprintf_udigits10(uval) + (neg ? 1 : 0);
+        if (neg) {
+          out = sprintf_put(out, '-');
+        }
+        while (total < width) {
+          out = sprintf_put(out, zero_pad ? '0' : ' ');
+          total++;
+        }
+        out = sprintf_uint(out, uval);
+      } else if (*fmt == 'c') {
+        out = sprintf_put(out, va_arg(ap, int));
+      } else if (*fmt == 's') {
+        const char *s = va_arg(ap, const char *);
+        while (*s) {
+          out = sprintf_put(out, *s);
+          s++;
+        }
+      } else if (*fmt == '%') {
+        out = sprintf_put(out, '%');
+      }
+      if (*fmt) {
+        fmt++;
+      }
+    } else {
+      out = sprintf_put(out, *fmt);
+      fmt++;
+    }
+  }
+  *out = 0;
+  va_end(ap);
+  return (int)(out - buf);
+}
+
 static int is_space(int c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
@@ -494,6 +581,25 @@ void *malloc(unsigned int size) {
 }
 
 void free(void *ptr) { (void)ptr; }
+
+/* nmemb/size are both unsigned int (16-bit) per the standard signature
+ * -- a plain 16-bit multiply, proven safe elsewhere (rand()'s LCG step
+ * uses one too). Do NOT widen this to long: 32-bit multiply is known
+ * broken on this target (see DEBUGGING_NOTES.md, "1000L * 17"). The
+ * zero-fill reuses memset rather than a hand-rolled loop, both because
+ * memset is already correct/tested and because a fresh loop here would
+ * be indexing/dereferencing straight off a pointer parameter the same
+ * way memset's own loop does (advance-then-dereference-bare) rather
+ * than the broken bracket-index-a-pointer-variable shape.
+ */
+void *calloc(unsigned int nmemb, unsigned int size) {
+  unsigned int total = nmemb * size;
+  void *p = malloc(total);
+  if (p) {
+    memset(p, 0, total);
+  }
+  return p;
+}
 
 int abs(int n) { return n < 0 ? -n : n; }
 long labs(long n) { return n < 0 ? -n : n; }

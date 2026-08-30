@@ -881,6 +881,250 @@ existing `math.h`/libc battery all still pass unchanged after this
 fix — it only changes behavior for the specific constant-condition-
 branch DAG shape described above.
 
+### 15. c-testsuite triage batch: calloc/NULL/sprintf added (fixed), two silent-crash libcall gaps found and fixed, one jump-table ISel gap found and fixed, two new address-computation/register-allocation defects found (not fixed)
+
+Found while triaging the public c-testsuite (`~/dev/c-testsuite`) against
+this backend for the first time — 180/220 passing going in. This entry
+covers everything from that pass that was either fixed outright or was
+significant enough to write up; purely-inapplicable tests (no
+filesystem, no `double`, 16-bit `int` where the suite assumes >=32-bit,
+etc.) were skip-listed instead — see
+`c-testsuite/runners/single-exec/eclipse.skip`.
+
+**Fixed, small, straightforward (rt/eclipse_rt.c and headers):**
+
+- `calloc(nmemb, size)`: didn't exist at all. Added as `malloc` +
+  `memset` (reusing the existing, already-correct `memset` rather than a
+  new hand-rolled zero loop). `nmemb`/`size` are kept as a plain 16-bit
+  `unsigned int` multiply (matching the standard signature) — *not*
+  widened to `long` anywhere, per the existing "1000L * 17" 32-bit-
+  multiply warning above.
+- `NULL`: wasn't defined anywhere (no `stddef.h` on this target).
+  `#define NULL ((void *)0)`, guarded with `#ifndef NULL`, added
+  redundantly to `stdio.h`/`stdlib.h`/`string.h` — matching how a real
+  libc's `stddef.h` ends up pulled in transitively by all three.
+- `sprintf(buf, fmt, ...)`: didn't exist. printf's own helpers
+  (`print_int`/`print_uint`/...) all call `putchar()` directly with no
+  output-sink indirection, so rather than retrofit all of them,
+  `sprintf` is an independent, small formatter with its own buffer-
+  writing helpers. Supports `%d` (plus one thing printf itself doesn't
+  have: an optional `0`-flag + decimal width, e.g. `%02d`, for zero-
+  padding), `%c`, `%s`, `%%` — no `%o`/`%x`/`%u`/`%l*` yet.
+
+**Fixed, backend, `EclipseISelLowering.cpp`:**
+
+- **Jump-table ISel crash** (`LLVM ERROR: Cannot select: t4: ch = br_jt
+  ...`): a dense/large `switch` (the c-testsuite test is a textbook
+  Duff's device) can make `SelectionDAGBuilder` lower it as a jump table
+  (`ISD::BR_JT`) instead of a compare chain — this backend has no ISel
+  pattern for that opcode at all (only ordinary conditional branches).
+  Fixed the same way AVR/MSP430 (other small, in-tree 16-bit-ish
+  backends) do it: `setOperationAction(ISD::BR_JT, MVT::Other, Expand)`
+  plus `setMinimumJumpTableEntries(UINT_MAX)` in the constructor — the
+  latter is what actually stops `SelectionDAGBuilder`'s
+  `areJTsAllowed()`/density heuristic from choosing a jump table in the
+  first place. Low-risk, proven pattern copied from two other in-tree
+  targets, not a novel mechanism. The one c-testsuite test that
+  triggered this (00143) still fails to *assemble* after this fix, but
+  for an unrelated, pre-existing reason: it's a function with two
+  39-element local arrays, well into the same dgasm ±127-word frame-
+  displacement limit already documented elsewhere in this file
+  (`sf_add`/`print_float`) — see `eclipse.skip`.
+
+- **Silent SIGSEGV (no LLVM ERROR, no assert) inside `LowerCall`,
+  reached via `SelectionDAG::getMemcpy`**: an initialized local
+  aggregate (e.g. `int Array[10] = {1,2,...};`) can get lowered by
+  `SelectionDAGBuilder` as an `llvm.memcpy` intrinsic from a synthesized
+  constant global into the stack slot, instead of a store per element,
+  once it's past the generic legalizer's inline-expansion threshold.
+  `SelectionDAG::getMemcpy()` then falls back to an actual call to the
+  `RTLIB::MEMCPY` libcall — which, like every `RTLIB::Libcall` on this
+  target (see bug #13's setup comment and the `setLibcallImpl` block in
+  `EclipseISelLowering.cpp`'s constructor), defaults to
+  `RTLIB::Unsupported` until explicitly wired up. Unlike the float
+  libcalls, which fail loudly (`"unsupported library call operation"`),
+  this one failed silently: the resulting `ExternalSymbolSDNode` carries
+  an *empty* symbol name rather than a null one, so `LowerCall`'s
+  `dyn_cast<ExternalSymbolSDNode>` succeeds and the existing
+  `report_fatal_error("...indirect...not supported")` guard never fires
+  — it SIGSEGVs much later once codegen actually tries to use that empty
+  name. Root-caused by temporarily instrumenting `LowerCall` with
+  `errs()` prints of the callee's opcode and symbol name right at entry
+  — confirmed the crash happens strictly *after* an empty symbol name is
+  printed, not before. **Fix**: `eclipse_rt.c` already implements
+  `memcpy`/`memmove`/`memset`/`memcmp` directly (`string.h`), so wired
+  all four up via `setLibcallImpl(RTLIB::MEMCPY, RTLIB::impl_memcpy)`
+  (and MEMMOVE/MEMSET/MEMCMP the same way) in *both* places the float
+  libcalls are wired (`EclipseISelLowering.cpp`'s constructor and
+  `EclipseSubtarget::initLibcallLoweringInfo` — both are needed, per
+  that method's own existing comment, since each reaches a different
+  `LibcallLoweringInfo` copy).
+
+  This surfaced a second, independent bug once the four were wired up:
+  `eclipse-cc`'s own retry loop (the one that iteratively `-internalize`-
+  protects soft-float runtime symbols dgasm reports as
+  `"Undefined symbol: __foo"`, since `llc`'s codegen inserts those calls
+  *after* the `opt -internalize,globaldce` pass already ran and stripped
+  anything it can't see an explicit IR call to) only ever matched names
+  starting with `__` — every soft-float libcall happens to be one, so
+  this was never noticed. `memcpy` doesn't start with `__`, so
+  `"Undefined symbol: memcpy"` fell straight through as a hard failure
+  with zero retries. Fixed by broadening the regex from `Undefined
+  symbol: __[A-Za-z0-9_]+` to `Undefined symbol: [A-Za-z_][A-Za-z0-9_]*`
+  in `eclipse-cc` — covers both symbol families with the exact same
+  protect-and-retry mechanism.
+
+**Found, NOT fixed — a real, previously-undiscovered address-computation
+defect, live in the same `PerformDAGCombine` HALVE machinery bugs
+#4/#5/#9/#12 all already live in:**
+
+Two related but distinct symptoms, both confirmed via minimal repros and
+direct assembly tracing (not guessed):
+
+1. **`&local_char_array[N]` for a compile-time-constant odd `N`
+   resolves to the same address as `N-1` (or generally `2*(N/2)`)**,
+   rather than `N`. Repro: `char a[10]; strcpy(a, "abcdef");
+   printf("%s", &a[1]);` prints `"abcdef"` (i.e. `&a[0]`) instead of
+   `"bcdef"`. Traced in the generated assembly: computing `&a[1]`
+   produces `ADD(FrameIndex, 1)`, which reaches `PerformDAGCombine`'s
+   `BaseIsFrameIndex` branch and gets unconditionally halved (`1 / 2 =
+   0`, integer division) before being used as the address — exactly the
+   same halving this combine deliberately applies to a runtime GEP
+   offset into a *numeric* array (where it's correct: 2 bytes pack
+   exactly 1 word per element, no information lost). For a local `char`
+   array, `EclipseFrameLowering.cpp` (`(MFI.getObjectSize(i) + 1) / 2`)
+   *does* reserve only `ceil(size/2)` words of frame space, matching
+   that same "2 bytes per word" assumption — but nothing in the actual
+   load/store path (`LDFI`/`STFI`/`LDIND`/`STIND`, all confirmed to
+   compile straight to plain word-wide `LDA`/`STA` — see
+   `EclipseISelLowering.cpp`'s `emitIndirectMem` and
+   `EclipseInstrInfo.td`'s `LDABSI`/`STABSI` definitions) ever does the
+   corresponding byte-select (shift/mask, or a real read-modify-write
+   for stores) to actually split that packed word back into its two
+   bytes. So halving computes the right *word* but loses which half of
+   it is meant, and a plain word store/load through that address
+   clobbers/misreads the other byte outright. (`memset(&a[1], 'r', 4)`
+   — c-testsuite 00179 — hits the identical thing, just via `memset`'s
+   small-constant-size inline expansion instead of a bare `&a[N]`
+   expression; 00180 is the bare-expression repro above almost
+   verbatim.)
+
+2. **A struct field reached through a pointer *variable* holding a
+   global's address computes a *different* physical word for a STORE
+   than for the corresponding LOAD of the exact same field**, when the
+   field is neither the struct's first nor last. Repro: `struct ziggy {
+   int a, b, c; } bolshevic; ... struct ziggy *tsar = &bolshevic;
+   tsar->a = 12; tsar->b = 34; tsar->c = 56; printf("%d %d %d\n",
+   tsar->a, tsar->b, tsar->c);` prints `12 0 56` — `.a` and `.c` (the
+   first and last fields) round-trip correctly, `.b` (the middle field)
+   reads back 0. Traced in the generated assembly instruction-by-
+   instruction: the *write* `tsar->b = 34` computes its target address
+   as a **plain, unhalved** `ADD` of the byte offset (2) onto the base
+   pointer (landing on word offset 2 — actually `bolshevic`'s *third*
+   field's slot, since this target's struct globals are laid out as
+   separate whole-word symbols with no packing at all — see bug #10).
+   The *read* of the same `tsar->b` expression, a few instructions
+   later in the same function, computes its address through the full
+   `SUB 0,0; DIV`-based HALVE sequence (byte offset 2 → word offset 1),
+   correctly landing on the field's real slot — which was never written,
+   hence reads back its zero-initialized value. Same DAG shape
+   (`ADD(loaded-global-derived-pointer, constant-byte-offset)`) reached
+   twice in one function, halved on one path and not the other — a
+   genuine internal inconsistency, not a case of "the wrong constant" or
+   "the wrong direction." c-testsuite 00205 (a global array of a larger,
+   multi-field struct, indexed with a runtime loop variable) produces
+   wildly wrong output consistent with the same defect at a scale too
+   large to hand-verify field-by-field; not independently traced, just
+   attributed to the same mechanism.
+
+**A third, distinct, and more precisely root-caused defect, also NOT
+fixed — `MULrr`'s post-RA expansion silently destroys a source operand
+that's still live afterward, when the register allocator (reasonably)
+believed only its `$dst` was clobbered:**
+
+Repro: `int Array[10]; for (Count=1; Count<=10; Count++) Array[Count-1]
+= Count * Count;` then read the array back — prints `1 0 0 4 0 0 0 0 9
+0` instead of `1 4 9 16 25 36 49 64 81 100` (c-testsuite 00157). The
+*values* that did land somewhere (1, 4, 9) ended up at indices 0, 3, 8
+— i.e. exactly `value - 1` (`Count*Count - 1`), not `Count - 1` as
+intended. Isolated with a minimal repro that removes the multiply
+entirely (`Array[Count-1] = Count;`, no `* Count`) — that version is
+byte-for-byte correct, 1 through 10 in order, immediately implicating
+`MULrr` specifically rather than the array-indexing machinery bugs
+#4/#5/#9/#12 already document.
+
+**Root cause**, read directly from `EclipseInstrInfo.cpp`'s
+`expandPostRAPseudo` (the `MULrr`/`UDIVrr`/`UREMrr` post-register-
+allocation expansion) and its own `EclipseInstrInfo.td` comment: this
+target has exactly two allocatable GPRs (`AC0`, `AC1`) — `AC2` is the
+reserved frame pointer. `MULrr`'s *declared* interface to the register
+allocator is a plain `$dst = mul $lhs, $rhs` (plus an explicit `Defs =
+[AC2]`, save/restored internally) — deliberately **not** also declaring
+`AC0`/`AC1` as implicit defs, because (per that `.td` comment) an
+earlier attempt at exactly that "made the allocator double-count
+register demand for this instruction and made it impossible to
+allocate at all" — a previously-hit, previously-fixed problem in this
+exact spot. But the real expansion's hardware sequence
+(`MOVrr AC2,RHS; MOVrr AC1,LHS; SUBrr AC0,AC0,AC0; MUL; MOVrr Dst,AC1`)
+unconditionally overwrites **both** `AC0` and `AC1` — the
+`SUBrr AC0,AC0,AC0` zeroing step and the real `MUL` hardware
+instruction both touch `AC0` regardless of which physical register
+ended up being `$dst`. For `Array[Count-1] = Count * Count`, `Count`
+(self-multiplied, so `$lhs == $rhs`) is register-allocated into `AC0`,
+with `$dst` assigned `AC1` — a completely reasonable choice from the
+allocator's point of view, since only `$dst` (`AC1`) is declared
+written, so `AC0` (`Count`) *should* survive. It doesn't: the `SUBrr
+AC0,AC0,AC0`/`MUL` steps zero it and then overwrite it with the
+product's high word, and the very next use of `Count` (computing
+`Count - 1` for the store's index) reads that clobbered `AC0` instead
+— which is exactly consistent with the observed values landing at
+`Count*Count - 1` instead of `Count - 1`.
+
+This is the same fundamental tension already hit and partially solved
+twice in this exact code path (per that `.td` comment): the pseudo
+can't correctly declare everything it clobbers (breaks allocation
+entirely, verified before) but also can't get away with declaring too
+little (silently corrupts a live-through value, verified again now).
+A real fix likely needs something structurally different — e.g. forcing
+any value live across a `MULrr`/`UDIVrr`/`UREMrr` to be spilled to a
+frame slot rather than kept in either GPR, or modeling the true clobber
+set some other way the allocator can act on without over-counting
+register pressure — not attempted here given how much dedicated
+back-and-forth this same instruction's clobber modeling has already
+needed (two rounds, per its own comment, before this one). c-testsuite
+00157 is skip-listed pending that work.
+
+Neither of the first two was fixed this pass. Both live in exactly the DAG
+combine that bugs #4, #5, #9, and #12 above already needed multiple
+rounds each to get right, and previous entries in this file are explicit
+about how deep that rabbit hole has gone before (see #12's "still-open
+gap" and #13's Gap 2, which was never root-caused either). A confident,
+low-risk fix wasn't found in the time available — most likely candidates
+are (a) making the `BaseIsFrameIndex` halving branch gate on whether the
+consuming access is genuinely byte-granular the way the global-string
+exception already does for `WRAPPER`'d bases, or (b) making the two
+loaded-pointer-derived-from-global write/read paths share one combine
+rule instead of apparently diverging partway through legalization — but
+either needs the same kind of exhaustive, DAG-dump-driven verification
+this file's other HALVE-related entries required, which wasn't
+attempted here. c-testsuite tests 00163, 00179, 00180, and 00205 are
+skip-listed (not force-"fixed") pending that work.
+
+**Verified**: `bash regress_hwstack.sh`-equivalent full existing
+regression pass (every package example, both struct-global tests,
+`clobber.c`) still passes unchanged after every fix in this entry.
+c-testsuite: 00040 (calloc — also needs recursion and array indexing,
+a good integration check; confirmed correct given enough `eclipseemu`
+simulated steps, see below), 00171/00179-NULL-only, 00186 (sprintf),
+00143 (jump-table ISel crash only — the test still fails to assemble
+for the separate frame-overflow reason above), 00185/00208 (memcpy
+libcall crash) all individually re-verified against their `.expected`
+output. `00040` specifically: correct output confirmed with a 2-billion-
+step `eclipseemu` budget (~30s wall time) — it's a genuine full 8-queens
+backtracking search, not a hang, but the c-testsuite harness's fixed
+5,000,000-step budget isn't enough for it, so it still shows as a
+harness-level TIMEOUT rather than PASS under the standard runner.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented
@@ -992,6 +1236,6 @@ clang -cc1 -triple eclipse-dg-none -S -I eclipse-toolchain/rt/include \
 # Run on eclipseemu -- will hang in the waitstop poll since eclipseemu
 # doesn't simulate device 054, but everything up to that point (the
 # entire load sequence) runs to completion and can be inspected:
-{ cat test.simh; echo 'dep PC 100'; echo 'step 100000'; echo 'e PC'; \
+{ cat test.simh; echo 'dep PC 50'; echo 'step 100000'; echo 'e PC'; \
   echo 'quit'; } | eclipseemu
 ```

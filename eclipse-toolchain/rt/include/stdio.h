@@ -1,6 +1,11 @@
 #ifndef _ECLIPSE_STDIO_H
 #define _ECLIPSE_STDIO_H
 
+/* No stddef.h on this target -- see stdlib.h's identical NULL comment. */
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
 /* Console-only stdio: there is no filesystem on this target, so no
  * FILE*, fopen/fclose, or freopen — only the console (TTI/TTO) exists as
  * an I/O device. See eclipse-toolchain/rt/eclipse_rt.c and
@@ -35,6 +40,17 @@ int puts(const char *s);
  * putchar()/puts() (no extra weight) to get back under budget.
  */
 int printf(const char *fmt, ...);
+
+/* Same feature set as printf() above, minus %o/%x/%u/%l* (add them the
+ * same way printf's own cases do it, if a future caller needs them),
+ * plus one thing printf() doesn't have: an optional "0" flag + decimal
+ * width on %d only (e.g. "%02d") for zero-padding to a minimum digit
+ * count. Writes into `buf` (caller must size it -- no bound checking,
+ * same as the standard) and NUL-terminates it, instead of writing to
+ * the console. Returns the number of characters written, excluding the
+ * terminating NUL, same as the standard.
+ */
+int sprintf(char *buf, const char *fmt, ...);
 
 /* Supports %d, %c, %s only. Like eccc's own scanf (docs/LIMITATIONS.md,
  * sibling eccc project), literal characters in the format string other

@@ -1909,10 +1909,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..a0ff1f44a
+index 000000000..a4f6d5323
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1365 @@
+@@ -0,0 +1,1410 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -1994,6 +1994,22 @@ index 000000000..a0ff1f44a
 +  setOperationAction(ISD::GlobalAddress, MVT::i16, Custom);
 +  setOperationAction(ISD::ExternalSymbol, MVT::i16, Custom);
 +  setOperationAction(ISD::ConstantPool, MVT::i16, Custom);
++
++  // Dense/large `switch` statements (Duff's device is the textbook case)
++  // can make SelectionDAGBuilder lower a switch as a jump table
++  // (ISD::BR_JT) instead of a compare chain -- this backend has no
++  // pattern for that opcode at all (only ordinary conditional branches),
++  // which crashed ISel outright ("Cannot select: ... br_jt ...").
++  // Disabled the same way AVR/MSP430 (other small, address-space-
++  // constrained backends) do it: BR_JT -> Expand (so a target that ever
++  // did reach here with one legalizes it back down to a branch instead
++  // of erroring), plus setMinimumJumpTableEntries(UINT_MAX) as the real
++  // belt-and-suspenders fix -- that's what actually stops
++  // SelectionDAGBuilder's areJTsAllowed()/density heuristic from
++  // choosing a jump table in the first place, since BR_JT's default
++  // legality alone wasn't what triggered the crash to begin with.
++  setOperationAction(ISD::BR_JT, MVT::Other, Expand);
++  setMinimumJumpTableEntries(UINT_MAX);
 +
 +  setOperationAction(ISD::BR_CC, MVT::i16, Custom);
 +  // Was `Expand` — relying on the generic legalizer to always eliminate
@@ -2128,6 +2144,35 @@ index 000000000..a0ff1f44a
 +  setLibcallImpl(RTLIB::UINTTOFP_I32_F32, RTLIB::impl___floatunsisf);
 +  setLibcallImpl(RTLIB::FPTOSINT_F32_I32, RTLIB::impl___fixsfsi);
 +  setLibcallImpl(RTLIB::FPTOUINT_F32_I32, RTLIB::impl___fixunssfsi);
++
++  // Same "Unsupported means empty symbol name, not a graceful error"
++  // trap as the float libcalls above, hit via a completely different
++  // path: a local aggregate with a full constant initializer (e.g.
++  // `int Array[10] = {...};`) gets lowered by SelectionDAGBuilder as an
++  // llvm.memcpy intrinsic from a synthesized constant global into the
++  // stack slot, rather than a store per element, once it's larger than
++  // the generic legalizer's inline-expansion threshold. SelectionDAG::
++  // getMemcpy() then falls back to an actual call to the RTLIB::MEMCPY
++  // libcall -- which, like every other libcall on this target, defaults
++  // to RTLIB::Unsupported until wired up here. Unlike the float
++  // libcalls (which fail loudly: "unsupported library call operation"),
++  // this one fails silently and crashes much later: the resulting
++  // ExternalSymbolSDNode carries an *empty* symbol name rather than
++  // null, so LowerCall's dyn_cast<ExternalSymbolSDNode> succeeds and
++  // no report_fatal_error ever fires -- it instead SEGFAULTs with no
++  // diagnostic at all once codegen tries to actually use that empty
++  // name. Confirmed via direct instrumentation of LowerCall (temporary
++  // errs() prints of Callee's opcode/symbol before the crash): the
++  // ExternalSymbol was reached and printed as an empty string just
++  // before the SIGSEGV. eclipse_rt.c already implements memcpy/memmove/
++  // memset/memcmp directly (see string.h) -- wiring the four of them up
++  // the same way the float ops are here fixes it, and lets the
++  // generated call resolve to this target's own real implementations
++  // exactly like any other direct-symbol call.
++  setLibcallImpl(RTLIB::MEMCPY, RTLIB::impl_memcpy);
++  setLibcallImpl(RTLIB::MEMMOVE, RTLIB::impl_memmove);
++  setLibcallImpl(RTLIB::MEMSET, RTLIB::impl_memset);
++  setLibcallImpl(RTLIB::MEMCMP, RTLIB::impl_memcmp);
 +}
 +
 +std::pair<unsigned, const TargetRegisterClass *>
@@ -4827,10 +4872,10 @@ index 000000000..fb7731dbb
 +def GPR : RegisterClass<"Eclipse", [i16], 16, (add AC0, AC1, AC2, AC3)>;
 diff --git a/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp b/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp
 new file mode 100644
-index 000000000..ff1d39d6f
+index 000000000..8ff824f75
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,67 @@
 +//===-- EclipseSubtarget.cpp - Eclipse Subtarget Information -------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4886,6 +4931,17 @@ index 000000000..ff1d39d6f
 +  Info.setLibcallImpl(RTLIB::UINTTOFP_I32_F32, RTLIB::impl___floatunsisf);
 +  Info.setLibcallImpl(RTLIB::FPTOSINT_F32_I32, RTLIB::impl___fixsfsi);
 +  Info.setLibcallImpl(RTLIB::FPTOUINT_F32_I32, RTLIB::impl___fixunssfsi);
++
++  // See the matching setLibcallImpl block in EclipseISelLowering.cpp's
++  // constructor for the full story: an initialized local aggregate
++  // (e.g. `int Array[10] = {...};`) can lower to an llvm.memcpy
++  // intrinsic needing the RTLIB::MEMCPY libcall, which otherwise
++  // defaults to Unsupported and SEGFAULTs (not a graceful error) deep
++  // in LowerCall. eclipse_rt.c already implements all four directly.
++  Info.setLibcallImpl(RTLIB::MEMCPY, RTLIB::impl_memcpy);
++  Info.setLibcallImpl(RTLIB::MEMMOVE, RTLIB::impl_memmove);
++  Info.setLibcallImpl(RTLIB::MEMSET, RTLIB::impl_memset);
++  Info.setLibcallImpl(RTLIB::MEMCMP, RTLIB::impl_memcmp);
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseSubtarget.h b/llvm/lib/Target/Eclipse/EclipseSubtarget.h
 new file mode 100644

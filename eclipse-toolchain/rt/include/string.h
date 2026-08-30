@@ -1,6 +1,11 @@
 #ifndef _ECLIPSE_STRING_H
 #define _ECLIPSE_STRING_H
 
+/* No stddef.h on this target -- see stdlib.h's identical NULL comment. */
+#ifndef NULL
+#define NULL ((void *)0)
+#endif
+
 unsigned int strlen(const char *s);
 char *strcpy(char *dst, const char *src);
 char *strcat(char *dst, const char *src);
