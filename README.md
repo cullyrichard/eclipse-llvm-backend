@@ -195,8 +195,15 @@ cd eclipse-package
 Then run it:
 
 ```bash
-{ cat /tmp/test.simh; echo 'dep PC 100'; echo 'step 5000'; echo 'e PC'; echo 'quit'; } | eclipseemu
+{ cat /tmp/test.simh; echo 'dep PC 50'; echo 'step 5000'; echo 'e PC'; echo 'quit'; } | eclipseemu
 ```
+
+Every program this toolchain builds starts execution at address 050
+octal (40 decimal) -- `dep PC 50`, not `dep PC 100`, is the entry
+point to deposit for *any* .simh file it produces, not just this one.
+(050 is the first word of memory that isn't hardware-reserved for
+something else -- see DEBUGGING_NOTES.md's entry on this for the full
+reasoning and the authoritative source.)
 
 You should see a series of numbers printed (1, 2, 2, 4, 2, 4, 10, 14 —
 various `sizeof()` results) followed by `HALT instruction`. If you see
@@ -213,7 +220,7 @@ automatically.
 
 ```bash
 ./eclipse-toolchain/eclipse-cc -o /tmp/test_float_mul.simh examples/test_float_mul.c
-{ cat /tmp/test_float_mul.simh; echo 'dep PC 100'; echo 'run 100'; echo 'quit'; } | eclipseemu
+{ cat /tmp/test_float_mul.simh; echo 'dep PC 50'; echo 'run 50'; echo 'quit'; } | eclipseemu
 ```
 
 You should see one `eclipse-cc: retrying with ... protected` message on
@@ -233,7 +240,7 @@ in `SOFT_FLOAT_NOTES.md` for why it isn't `printf("%f", ...)`):
 
 ```bash
 ./eclipse-toolchain/eclipse-cc -o /tmp/test_print_float.simh examples/test_print_float.c
-{ cat /tmp/test_print_float.simh; echo 'dep PC 100'; echo 'run 100'; echo 'quit'; } | eclipseemu
+{ cat /tmp/test_print_float.simh; echo 'dep PC 50'; echo 'run 50'; echo 'quit'; } | eclipseemu
 ```
 
 Expect `3.000000`, `0.500000`, `-2.250000`, `100000.000000` — no retry

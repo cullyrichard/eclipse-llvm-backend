@@ -685,10 +685,10 @@ index 000000000..11a9b3268
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
 new file mode 100644
-index 000000000..cc617d694
+index 000000000..ba2eeb825
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
-@@ -0,0 +1,675 @@
+@@ -0,0 +1,700 @@
 +//===-- EclipseAsmPrinter.cpp - Eclipse LLVM assembly writer ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -803,7 +803,32 @@ index 000000000..cc617d694
 +        ("var VECTOR = " + Twine(InterruptHandlerName)).str());
 +    OutStreamer->emitRawText("");
 +  }
-+  OutStreamer->emitRawText("org 0100"); // just a default; see README.md
++  // org 050 (40 decimal), not the dgasm-default org 0100 (64
++  // decimal): addresses 0 through 047 octal (0-39 decimal) are
++  // *entirely* hardware-reserved on real Eclipse hardware -- not
++  // just the handful this backend itself uses (0/1 for the
++  // interrupt return-address/vector, 040-042 for the hardware
++  // SAVE/RTN stack pointer/frame pointer/stack limit). Confirmed
++  // against the authoritative source, the eclipseemu simulator's
++  // own eclipse_cpu.c header comment ("certain low-memory
++  // locations are reserved for special purposes"), which lists a
++  // real purpose for literally every word from 0 through 047
++  // octal -- including several this backend never touches
++  // (system-call/protection-fault/VCT vectors at 2-7, the
++  // auto-increment/auto-decrement *indirect-addressing* locations
++  // at 020-037 -- genuinely dangerous to repurpose for ordinary
++  // data, since indirectly *referencing* one of these auto-
++  // increments or -decrements it as a side effect regardless of
++  // what the programmer intended it to hold -- and the XOP/FP-
++  // fault/commercial-fault vectors at 044-046, plus 047 itself,
++  // documented there in so many words as "Reserved, do not use").
++  // 050 is the first word after all of that. Moving the origin
++  // down from 0100 reclaims 24 more decimal words (050-077 octal)
++  // of this target's shared 256-word (0-377 octal) page-zero
++  // budget for constant-pool/call-slot/address-slot data -- real,
++  // useful headroom given how often a program has come in just a
++  // few words over that budget in practice (see DEBUGGING_NOTES.md).
++  OutStreamer->emitRawText("org 050"); // see the comment above -- not just a default anymore
 +  OutStreamer->emitRawText("dev TTI = 010");
 +  OutStreamer->emitRawText("dev TTO = 011");
 +  OutStreamer->emitRawText("");

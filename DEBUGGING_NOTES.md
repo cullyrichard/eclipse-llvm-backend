@@ -1138,6 +1138,75 @@ with the already-documented "32-bit multiply is only partially
 reliable" limitation (bug #12's "1000L * 17") rather than a new,
 independent gap.
 
+### 16. Program origin moved from org 0100 to org 050 — reclaims 24 words of page-zero budget (changed convention, documented here)
+
+Not a bug fix — a deliberate change to where every program built by
+this toolchain starts, made after noticing several c-testsuite
+failures were programs landing just a handful of words over the
+shared 256-word page-zero budget (see entries #13's `atof`+`printf`
+note and #15's frame-overflow skip-list entries for examples of that
+class of failure).
+
+**The observation**: `EclipseAsmPrinter.cpp` emitted a fixed `org
+0100` (64 decimal) at the start of every generated program, and
+`_start` — along with its hardware-stack-register init code — sits
+immediately after that `org` line as part of the fixed preamble
+`reorder_asm.py` never reorders (see that file's own header comment),
+so `_start`'s address always exactly equals whatever the `org` value
+is. `0100` was never derived from anything specific to this backend;
+it's simply `dgasm`'s own built-in default address when a source file
+has no explicit `org` at all (see `reorder_asm.py`'s `compute_addresses`,
+which deliberately keeps its *own* `0o100` default to correctly mirror
+that dgasm behavior for the general case — that one is unrelated to
+this change and was not touched).
+
+**Checked against the authoritative source** before touching anything,
+given how easy it would be to accidentally clobber something hardware-
+critical: `eclipseemu`'s own `simh` source, `eclipse_cpu.c`'s header
+comment, documents a real, specific purpose for *every* word of memory
+from address 0 through 047 octal (0–39 decimal) — not just the ones
+this backend itself already uses (0/1 for the interrupt return-
+address/vector, 040–042 for the hardware SAVE/RTN stack pointer/frame
+pointer/stack limit — see entry on the SAVE/RTN calling convention).
+The full table: 0 (I/O return address), 1 (interrupt handler address),
+2 (system-call handler), 3 (protection-fault handler), 4/6/7 (VECTOR-
+instruction stack pointer/limit/fault address), 5 (interrupt priority
+mask), 10 (block pointer, later models), 11 (emulation trap handler,
+microEclipse only), 20–27 and 30–37 (auto-increment/auto-decrement
+*indirect-addressing* locations — genuinely dangerous to repurpose for
+ordinary data, since indirectly referencing one of these auto-
+increments or -decrements it as a hardware side effect regardless of
+what the program intended it to hold), 40–43 (the stack registers this
+backend already uses), 44 (XOP origin), 45 (floating-point fault), 46
+(commercial-instruction-set fault), and 47 itself documented in so
+many words as "Reserved, do not use." `050` is the first word after
+all of that.
+
+**Change**: `EclipseAsmPrinter.cpp` now emits `org 050` instead of `org
+0100`. This moves every program's `_start` (and therefore every
+subsequent address) down by 24 decimal words, which is also 24 more
+words of page-zero budget reclaimed for constant-pool/call-slot/
+address-slot data, at zero risk beyond what's already covered by the
+table above.
+
+**This changes the toolchain's entry-point convention project-wide**:
+every existing `dep PC 100` in this README, in `DEBUGGING_NOTES.md`'s
+own reproduction commands, and in any external scripts/notes/muscle
+memory needs to become `dep PC 50`. Updated everywhere in this
+package; if you have your own scripts or notes referencing `dep PC
+100` from before this change, they need the same update. This applies
+identically to the sibling `nova-llvm-backend` package, which shares
+this exact file (`EclipseAsmPrinter.cpp`) and picked up the same
+change in its own sync from this session's work.
+
+**Verified**: full existing regression pass (every package example)
+matches established baselines exactly under the new entry point,
+including `isr_c_test`'s and the `fps_*` tests' already-documented
+non-fatal outcomes. All previously-passing c-testsuite results
+unchanged; a program that previously failed to compile exactly 1 word
+over the page-zero budget (an `atof()` + `printf()` combination — see
+entry #13's own note on this) now compiles and runs correctly.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented
