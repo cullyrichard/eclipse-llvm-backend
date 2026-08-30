@@ -1124,6 +1124,19 @@ step `eclipseemu` budget (~30s wall time) — it's a genuine full 8-queens
 backtracking search, not a hang, but the c-testsuite harness's fixed
 5,000,000-step budget isn't enough for it, so it still shows as a
 harness-level TIMEOUT rather than PASS under the standard runner.
+`00041` (a prime-counting sieve up to 5000) is the same story —
+confirmed correct (`AC0 == 0` at `HALT`, matching its own internal
+`c == 669` self-check) with a 500-million-step budget, just genuinely
+too much simulated computation for the standard 5,000,000-step runner.
+
+Also found, skip-listed, not fixed: `00182` crashes outright ("LLVM
+ERROR: unsupported library call operation") on `x % 10L` / `x / 10L`
+against an `unsigned long` — this target has no 32-bit integer divide/
+remainder libcall implemented or wired at all (only the float ops and,
+as of this entry, `memcpy`/`memmove`/`memset`/`memcmp` are). Consistent
+with the already-documented "32-bit multiply is only partially
+reliable" limitation (bug #12's "1000L * 17") rather than a new,
+independent gap.
 
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
