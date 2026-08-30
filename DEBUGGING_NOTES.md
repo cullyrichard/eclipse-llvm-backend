@@ -809,6 +809,78 @@ so far (20,000,000 rather than 2,000,000) — not a bug, just genuinely
 that much soft-float computation to step through; worth knowing before
 assuming a hang.
 
+### 14. Constant-condition branches ("Cannot select: ... brcond ...") crashed llc (fixed)
+
+Found running the public
+[c-testsuite](https://github.com/c-testsuite/c-testsuite) against this
+compiler for the first time — 7 of the suite's 220 tests hit the exact
+same crash signature, `LLVM ERROR: Cannot select: ... brcond ...`, on
+code shapes as simple as `while (1) { ... break; ... }`. This is
+almost certainly the same underlying mechanism (not confirmed the
+same fix would have helped, but the crash text matches exactly) as an
+earlier, unresolved mystery in this file's entry #13 — a `sqrtf`
+comparison-as-branch-condition crash that got worked around rather
+than root-caused. This entry's fix predates and did not require
+revisiting that workaround.
+
+**Root cause**: this target routes *every* compile-time constant,
+even small ones like `0` or `1`, through a constant-pool `WRAPPER`
+node rather than a plain `ConstantSDNode` — there's no immediate-
+operand encoding for arbitrary 16-bit values on this ISA, so even a
+literal `1` needs a real memory word to hold it, loaded via `LDA`.
+DAGCombiner has a standard, target-independent fold that recognizes a
+`brcond` whose condition is provably a compile-time constant (from a
+literal `while (1)`, or any comparison the optimizer can resolve at
+compile time) and simplifies it — but that generic fold only
+recognizes a *plain* `ConstantSDNode` as "a constant," not this
+target's `WRAPPER`'d constant-pool form. So the fold only gets half
+done: the condition genuinely does collapse down to a bare constant,
+but the surrounding `brcond` node itself is never further simplified
+into an unconditional branch (or removed entirely) the way it would be
+on almost any other target. Worse, this fold runs as part of a later
+DAGCombine pass, *after* the legalization pass where this target's own
+`Custom` `ISD::BRCOND` lowering (`LowerBRCOND`, which reduces to the
+already-correct `LowerBR_CC` path) normally runs — so the newly-
+created constant-condition `brcond` never gets a chance to go through
+that lowering either. It reaches instruction selection as a raw,
+un-lowered `ISD::BRCOND` with a `WRAPPER(ConstantPool<N>)` condition, a
+shape this backend has no ISel pattern for at all.
+
+**Fix** (`EclipseISelLowering.cpp`): registered `ISD::BRCOND` for
+`setTargetDAGCombine` and added `combineConstantBrcond`, which
+recognizes exactly this shape (`brcond`'s condition is a `WRAPPER`
+wrapping a `TargetConstantPool` entry holding a `ConstantInt`) and
+rewrites it directly — a nonzero constant becomes a plain
+unconditional `ISD::BR` to the same destination; a zero constant
+becomes just the chain (the branch never fires, so drop it, same as
+how a dead conditional branch would ordinarily be removed).
+
+**Verified**: 4 of the 7 originally-crashing tests now pass outright.
+The other 3 now hit *different*, pre-existing, unrelated limitations
+once past this crash — confirming the fix itself is complete and
+correct, these tests just need more than this one fix:
+- One needs a variable-length array (`dynamic_stackalloc` — this
+  backend has no support for non-compile-time-constant stack
+  allocation at all; a real gap, not attempted here).
+- One is a single function complex enough to exceed the existing,
+  already-documented ±127-word frame-relative displacement limit (the
+  same class of constraint `sf_add`/`print_float` needed manual
+  splitting to work around — see this file's own comments on that).
+- One needs genuine 64-bit `long long` arithmetic, which this target
+  does not have (only up to 32-bit `long`) — comparing a `long long`
+  against `INT32_MIN`/`INT32_MAX` boundary literals evaluated
+  incorrectly, consistent with the 64-bit value silently losing
+  precision somewhere rather than a real i64 comparison ever
+  happening. Not investigated further; implementing real 64-bit
+  arithmetic support is a project on the scale of this session's
+  earlier hardware-calling-convention or `math.h` work, not a quick
+  fix, and is being tracked as a known gap rather than attempted here.
+
+Full existing regression pass (every package example) and the
+existing `math.h`/libc battery all still pass unchanged after this
+fix — it only changes behavior for the specific constant-condition-
+branch DAG shape described above.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented

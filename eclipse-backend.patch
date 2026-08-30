@@ -1909,10 +1909,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..a19cea4a0
+index 000000000..a0ff1f44a
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1309 @@
+@@ -0,0 +1,1365 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2057,6 +2057,26 @@ index 000000000..a19cea4a0
 +  // operand needs a word/byte-unit fixup this backend can't express any
 +  // other way.
 +  setTargetDAGCombine(ISD::ADD);
++  // See PerformDAGCombine: DAGCombiner's own generic "fold a branch
++  // whose condition is a compile-time constant" simplification (a
++  // "while (1)" loop, for instance, or any comparison it can prove
++  // always-true/-false) produces a plain ISD::BRCOND node holding
++  // that constant directly as its condition -- *after* the
++  // legalization pass where this target's BRCOND Custom-lowering
++  // (LowerBRCOND, above) normally runs, so it never gets a chance to
++  // run on this particular node. A real, confirmed-the-hard-way bug
++  // (found via the public c-testsuite, not this project's own
++  // examples): every constant this target materializes, even 0/1, is
++  // routed through a constant-pool WRAPPER rather than a raw
++  // ConstantSDNode (see the ADD combine's own comment above on why),
++  // and DAGCombiner's generic fold does not recognize that shape as
++  // "a constant" the way it would a plain ConstantSDNode on almost
++  // every other target -- so the fold only gets half done: the
++  // condition is simplified down to a bare constant, but the BRCOND
++  // itself is never simplified further into an unconditional branch
++  // (or removed entirely), leaving a shape this target's ISel has no
++  // pattern for ("Cannot select: ... brcond ...").
++  setTargetDAGCombine(ISD::BRCOND);
 +
 +  // f32 has no register class here (see this file's header — no
 +  // addRegisterClass(MVT::f32, ...) above), so LLVM's type legalizer
@@ -2270,8 +2290,44 @@ index 000000000..a19cea4a0
 +// every generated SRL re-enters LowerShift and the two folds ping-pong
 +// forever. HALVE selects straight to UDIVrr (see EclipseInstrInfo.td)
 +// and is structurally invisible to both of those generic combine rules.
++// See the ISD::BRCOND setTargetDAGCombine registration (above, in the
++// constructor) for the full story on why this exists: DAGCombiner's own
++// generic constant-condition-branch fold produces a BRCOND whose
++// condition is a WRAPPER'd constant-pool reference, a shape this
++// target's Custom lowering never gets a chance to run on and ISel has
++// no pattern for. Rewritten directly here instead: a nonzero constant
++// condition always branches, so replace with a plain unconditional
++// ISD::BR; a zero constant condition never branches, so replace with
++// just the chain (drop the branch, and the whole node along with it,
++// exactly like an ordinary dead conditional branch would be removed).
++static SDValue combineConstantBrcond(SDNode *N, SelectionDAG &DAG) {
++  SDValue Chain = N->getOperand(0);
++  SDValue Cond = N->getOperand(1);
++  SDValue Dest = N->getOperand(2);
++
++  if (Cond.getOpcode() != EclipseISD::WRAPPER)
++    return SDValue();
++  SDValue Inner = Cond.getOperand(0);
++  if (Inner.getOpcode() != ISD::TargetConstantPool)
++    return SDValue();
++  auto *CP = cast<ConstantPoolSDNode>(Inner);
++  if (CP->isMachineConstantPoolEntry())
++    return SDValue();
++  auto *CI = dyn_cast<ConstantInt>(CP->getConstVal());
++  if (!CI)
++    return SDValue();
++
++  SDLoc dl(N);
++  if (CI->isZero())
++    return Chain;
++  return DAG.getNode(ISD::BR, dl, MVT::Other, Chain, Dest);
++}
++
 +SDValue EclipseTargetLowering::PerformDAGCombine(SDNode *N,
 +                                                  DAGCombinerInfo &DCI) const {
++  if (N->getOpcode() == ISD::BRCOND)
++    return combineConstantBrcond(N, DCI.DAG);
++
 +  if (N->getOpcode() != ISD::ADD || N->getValueType(0) != MVT::i16)
 +    return SDValue();
 +
