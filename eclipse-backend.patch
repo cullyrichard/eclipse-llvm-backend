@@ -1591,10 +1591,10 @@ index 000000000..2c2b2c809
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEASMPRINTER_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseFrameLowering.cpp b/llvm/lib/Target/Eclipse/EclipseFrameLowering.cpp
 new file mode 100644
-index 000000000..6146f8afd
+index 000000000..8d9f53ac1
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseFrameLowering.cpp
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,211 @@
 +//===-- EclipseFrameLowering.cpp - Eclipse Frame Information -------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -1744,11 +1744,30 @@ index 000000000..6146f8afd
 +  // any function with enough register pressure to actually need a
 +  // mid-function scavenge (a local array plus a loop plus call-heavy code
 +  // was enough to trigger it) crashed with "Cannot scavenge register
-+  // without an emergency spill slot!" during PEI. One word-sized GPR slot
-+  // is enough: nothing on this target ever needs to scavenge more than one
-+  // register at a time.
++  // without an emergency spill slot!" during PEI.
++  //
++  // Originally reserved just one word-sized slot ("nothing on this target
++  // ever needs to scavenge more than one register at a time") — no longer
++  // true since EclipseRegisterInfo::eliminateFrameIndex's out-of-range
++  // LDFI/STFI fallback (large stack-frame offsets that don't fit real
++  // hardware's 8-bit indexed-addressing displacement) can need *two*
++  // scratch registers live at once (a running address total plus the bit
++  // it's currently folding in) out of only two allocatable GPRs
++  // (AC0/AC1) total. Confirmed empirically: a large enough frame (58
++  // separately out-of-range locals, c-testsuite 00128/00200) drove the
++  // backward scavenger into needing both AC0 and AC1 spilled
++  // simultaneously at some point deep in a block, which one slot can't
++  // represent — "Error while trying to spill AC0 ... Cannot scavenge
++  // register without an emergency spill slot!" even though a slot *did*
++  // exist, just not a second one. RegScavenger natively supports more
++  // than one scavenging slot (its own `Scavenged` list, queried via
++  // isScavengingFrameIndex/getScavengingFrameIndices) — reserving two
++  // instead of one covers this target's actual worst case (its whole
++  // allocatable register file).
 +  int EmergencyFI = MFI.CreateStackObject(2, Align(2), /*isSpillSlot=*/true);
 +  RS->addScavengingFrameIndex(EmergencyFI);
++  int EmergencyFI2 = MFI.CreateStackObject(2, Align(2), /*isSpillSlot=*/true);
++  RS->addScavengingFrameIndex(EmergencyFI2);
 +
 +  int64_t Offset = 0;
 +  // Locals, temps, and register-allocator spill slots are all just more
@@ -5214,10 +5233,10 @@ index 000000000..9ffc1c1fc
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEMACHINEFUNCTIONINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseRegisterInfo.cpp b/llvm/lib/Target/Eclipse/EclipseRegisterInfo.cpp
 new file mode 100644
-index 000000000..17e9403cb
+index 000000000..badfee11c
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseRegisterInfo.cpp
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,240 @@
 +//===-- EclipseRegisterInfo.cpp - Eclipse Register Information ----------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -5341,47 +5360,107 @@ index 000000000..17e9403cb
 +    const auto &TII = *MF.getSubtarget().getInstrInfo();
 +    MachineRegisterInfo &MRI = MF.getRegInfo();
 +    DebugLoc DL = MI.getDebugLoc();
++    LLVMContext &Ctx = MF.getFunction().getContext();
++    Type *I16Ty = Type::getInt16Ty(Ctx);
 +
-+    unsigned CPI = MF.getConstantPool()->getConstantPoolIndex(
-+        ConstantInt::get(
-+            Type::getInt16Ty(MF.getFunction().getContext()), Offset, true),
-+        Align(2));
-+    Register OffReg = MRI.createVirtualRegister(&Eclipse::GPRRegClass);
-+    BuildMI(MBB, MI, DL, TII.get(Eclipse::LDABS), OffReg)
-+        .addConstantPoolIndex(CPI);
++    // Materializing Offset as a single full-width constant (one
++    // MF.getConstantPool() entry per *distinct* offset value) is the
++    // obvious approach, and was tried first — but page-zero data
++    // (constant pool entries included) is a hard, shared 256-word budget
++    // across the *whole program* (see eclipse-cc's own comment), and a
++    // single function can have many separately out-of-range locals with
++    // all-different offsets (confirmed: c-testsuite 00200 has 58 of
++    // them, from one big block of small temporaries) — 58 one-off
++    // constants was enough to overflow that budget on its own, even
++    // though nothing else about the program is unusually large. Instead,
++    // decompose |Offset| into its power-of-two components and accumulate
++    // them: every out-of-range site in a function only ever needs a
++    // constant for a bit *value* (1, 2, 4, ... at most 16 of them for an
++    // i16), never for the full offset, and MachineConstantPool already
++    // dedups identical constants — so 58 different offsets sharing the
++    // same handful of set bits collectively costs at most ~16 words
++    // instead of 58.
++    bool Negative = Offset < 0;
++    uint64_t Mag = Negative ? static_cast<uint64_t>(-Offset)
++                             : static_cast<uint64_t>(Offset);
 +
 +    bool IsLoad = MI.getOpcode() == Eclipse::LDFI;
-+    if (IsLoad) {
-+      // Reuse the destination register itself to hold the address while
-+      // it's being built (same trick LEAFI uses above) — one fewer
-+      // register needed, and its pre-load value is about to be
-+      // overwritten by the real result anyway.
-+      Register Dst = MI.getOperand(0).getReg();
-+      BuildMI(MBB, MI, DL, TII.get(Eclipse::MOVrr), Dst).addReg(Eclipse::AC2);
-+      BuildMI(MBB, MI, DL, TII.get(Eclipse::ADDrr), Dst)
-+          .addReg(OffReg)
-+          .addReg(Dst);
++    Register Src;
++    if (!IsLoad) {
++      // A store's operand 0 is the value being stored, which needs to
++      // stay live all the way to the final indirect store below — but
++      // the address-decomposition loop just below can need two scratch
++      // registers live at once (the running total plus the bit it's
++      // currently folding in), and this target's allocatable GPR class
++      // has only two members (AC0/AC1; AC2/AC3 are reserved — see
++      // getReservedRegs above) to begin with. Protecting Src through
++      // that whole loop as a *third* concurrently-live value is exactly
++      // the register pressure that overwhelmed the scavenger's single
++      // emergency spill slot the first time this was tried (confirmed
++      // empirically: "Cannot scavenge register without an emergency
++      // spill slot!" on c-testsuite 00128, before this stash was added).
++      // Stashing Src's value into the shared page-zero `_scratch` word
++      // up front frees its physical register for the loop to use, same
++      // as any other now-dead value; it gets reloaded, by value, right
++      // before the final indirect store overwrites `_scratch` with the
++      // address instead.
++      Src = MI.getOperand(0).getReg();
 +      BuildMI(MBB, MI, DL, TII.get(Eclipse::STABS))
-+          .addReg(Dst)
++          .addReg(Src)
 +          .addExternalSymbol("_scratch");
-+      BuildMI(MBB, MI, DL, TII.get(Eclipse::LDABSI), Dst)
++    }
++
++    // Loads have a spare register the way stores don't (operand 0, the
++    // destination, is otherwise unused until the final result lands in
++    // it) — reuse it as the running total, same trick LEAFI uses above,
++    // instead of allocating yet another fresh one.
++    Register AddrReg = IsLoad ? MI.getOperand(0).getReg()
++                               : MRI.createVirtualRegister(&Eclipse::GPRRegClass);
++    bool First = true;
++    for (unsigned Bit = 0; Bit < 16; ++Bit) {
++      uint64_t BitVal = 1ULL << Bit;
++      if (!(Mag & BitVal))
++        continue;
++      int64_t Signed = Negative ? -static_cast<int64_t>(BitVal)
++                                 : static_cast<int64_t>(BitVal);
++      unsigned CPI = MF.getConstantPool()->getConstantPoolIndex(
++          ConstantInt::get(I16Ty, Signed, true), Align(2));
++      if (First) {
++        BuildMI(MBB, MI, DL, TII.get(Eclipse::LDABS), AddrReg)
++            .addConstantPoolIndex(CPI);
++        First = false;
++      } else {
++        Register BitReg = MRI.createVirtualRegister(&Eclipse::GPRRegClass);
++        BuildMI(MBB, MI, DL, TII.get(Eclipse::LDABS), BitReg)
++            .addConstantPoolIndex(CPI);
++        BuildMI(MBB, MI, DL, TII.get(Eclipse::ADDrr), AddrReg)
++            .addReg(BitReg)
++            .addReg(AddrReg);
++      }
++    }
++    // Mag is never 0 here (Offset would already have taken the in-range
++    // path above), so the loop above always runs at least once and
++    // AddrReg always ends up defined before this next instruction reads
++    // it.
++    BuildMI(MBB, MI, DL, TII.get(Eclipse::ADDrr), AddrReg)
++        .addReg(Eclipse::AC2)
++        .addReg(AddrReg);
++
++    if (IsLoad) {
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::STABS))
++          .addReg(AddrReg)
++          .addExternalSymbol("_scratch");
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::LDABSI), AddrReg)
 +          .addExternalSymbol("_scratch");
 +    } else {
-+      // A store has no spare register the way a load's destination is
-+      // (operand 0 is the value being stored, still needed at the very
-+      // end) — but rather than allocate a *second* fresh register for
-+      // the address, accumulate FP into OffReg itself in place; only one
-+      // new physical register is ever needed live at a time this way,
-+      // same register pressure as the load case above and as LEAFI.
-+      Register Src = MI.getOperand(0).getReg();
-+      BuildMI(MBB, MI, DL, TII.get(Eclipse::ADDrr), OffReg)
-+          .addReg(Eclipse::AC2)
-+          .addReg(OffReg);
++      Register ValReg = MRI.createVirtualRegister(&Eclipse::GPRRegClass);
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::LDABS), ValReg)
++          .addExternalSymbol("_scratch");
 +      BuildMI(MBB, MI, DL, TII.get(Eclipse::STABS))
-+          .addReg(OffReg)
++          .addReg(AddrReg)
 +          .addExternalSymbol("_scratch");
 +      BuildMI(MBB, MI, DL, TII.get(Eclipse::STABSI))
-+          .addReg(Src)
++          .addReg(ValReg)
 +          .addExternalSymbol("_scratch");
 +    }
 +    MI.eraseFromParent();

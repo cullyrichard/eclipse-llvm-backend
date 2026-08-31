@@ -1644,6 +1644,102 @@ confirm this fix is correct and non-regressing. The remaining 24
 failures (`COMPILE_FAIL`/`MISMATCH`/`TIMEOUT`) are unrelated,
 pre-existing limitations, not investigated further here.
 
+### 21. Large stack frames overflowed indexed addressing's 8-bit displacement (fixed), plus a page-zero-budget and register-scavenger fallout each fix along the way
+
+Found via three failing c-testsuite tests: `00128`, `00143`, `00200` all
+failed at the `dgasm` assembly step, not `llc` — `Address out of range.
+Got 274, should be -128 - 127` on lines like `STA 0,274,2` / `LDA
+1,270,2`. All three have large local-variable frames.
+
+**Root cause**: `EclipseRegisterInfo::eliminateFrameIndex` resolves
+`LDFI`/`STFI` (AC2/FP-relative loads and stores) by substituting the
+stack object's computed FP-relative displacement straight into the
+indexed-addressing instruction's immediate operand, unconditionally —
+no check against real hardware's actual encoding limit: indexed
+addressing (index=2, i.e. AC2-relative) only has an 8-bit *signed*
+displacement field, -128..127. A large enough frame (enough locals, or
+big-enough arrays) pushes some variable's offset past that trivially,
+and `dgasm` correctly rejects the resulting instruction — this is a
+genuine hardware constraint, not an assembler bug. (The sibling `LEAFI`
+pseudo, right above this code — `&local`'s address-of — already had to
+solve exactly this problem for a different reason: there are no
+immediate-operand instructions on this ISA at all, so *any* frame
+offset needs materializing through a constant-pool load, not just
+out-of-range ones.)
+
+**Fix, part 1 (the addressing fallback)**: when the offset doesn't fit
+-128..127, `eliminateFrameIndex` now falls back to the same
+address-materialize-then-indirect-through-page-zero mechanism
+`LDIND`/`STIND`'s `emitIndirectMem` (`EclipseISelLowering.cpp`) already
+uses for a runtime pointer value, and `LEAFI` already uses for
+`&local`: build the real address (FP + Offset) into a register, stash
+it in the shared page-zero `_scratch` word, and access memory through
+`@_scratch` indirection. Works for both `LDFI` (read) and `STFI`
+(write).
+
+**Fix, part 2 (page-zero budget)**: the obvious way to materialize
+Offset — one `MF.getConstantPool()` entry holding the literal value —
+worked for `00128`/`00143` but not `00200`, which has 58 *separately*
+out-of-range locals (one big block of small temporaries) with 58
+different offsets. Page-zero data, constant pool entries included, is a
+hard, shared 256-word budget across the *whole program* (see
+`eclipse-cc`'s own comment on this) — 58 one-off constants alone
+overflowed it (confirmed: after fixing part 1, `00128`/`00143` passed
+outright but `00200` failed with a *new*, different error, `JMP
+@LBBx_SLOT,0` indirect jump-table slots landing past address 255 —
+i.e., the fix was correct but too page-zero-expensive). Switched to
+decomposing `|Offset|` into its power-of-two components and
+accumulating them instead of materializing the full value at once:
+every out-of-range site in a function now only ever needs a constant
+for a bit *value* (1, 2, 4, ... at most 16 of them for an `i16`), and
+`MachineConstantPool` already dedups identical constants within a
+function — so 58 different offsets sharing the same handful of set
+bits collectively costs at most ~16 words instead of 58.
+
+**Fix, part 3 (register-scavenger fallout, twice)**: the
+address-decomposition loop needs two scratch registers live at once
+(the running total, plus the bit currently being folded in) — and this
+target's allocatable `GPR` class has only two members to begin with
+(AC0/AC1; AC2/AC3 are reserved as FP/return-address). First fallout: a
+store's operand 0 (the value being stored) needs to stay live through
+that whole loop too, and protecting it as a *third* concurrently-live
+value crashed the register allocator outright — `Error while trying to
+spill AC0 from class GPR: Cannot scavenge register without an emergency
+spill slot!` — even on `00128`, a comparatively modest frame. Fixed by
+stashing the store's value into `_scratch` up front (reloaded by value
+right before the final indirect store overwrites `_scratch` with the
+address instead), freeing its register for the decomposition loop
+instead of pinning it. Second fallout: even with that fix, `00128`
+still crashed the same way once the *bit-decomposition* version of the
+fix was in place (it hadn't, with the simpler single-constant version
+from part 2's "obvious" first attempt) — `-debug-only=reg-scavenging`
+showed the backward scavenger successfully spilling/reloading AC0 and
+AC1 dozens of times over the course of the function, then finally
+failing to spill AC0 specifically: with a large enough frame, some
+point deep in a block genuinely needs *both* AC0 and AC1 spilled
+simultaneously (nested), which entry #6's original single emergency
+spill slot (`EclipseFrameLowering::processFunctionBeforeFrameFinalized`)
+can't represent no matter how many times it's reused serially.
+`RegScavenger` natively supports more than one scavenging slot (its own
+`Scavenged` list); reserving a second one-word slot fixed it.
+
+**Verified**: `00128`/`00143`/`00200` all now assemble and run to the
+correct `HALT`/output on `eclipseemu` (previously all three failed to
+assemble). Full c-testsuite: 197/220 passing, up from a freshly
+re-measured 194/220 baseline (this session's own `git stash` of just
+these two files, rebuilt, re-run — not the 193/220 figure quoted
+elsewhere in this log, which predates entry #20's division-libcall
+fix); diffing the two runs' `PASS` sets directly confirms the
+newly-passing set is *exactly* `{00128, 00143, 00200}`, with no
+previously-passing test regressing. `regress_hwstack.sh`'s existing
+examples produce byte-identical program output before and after this
+change (`char_test`, `isr_c_test`, `printf_octal_check`, `sizeof_check`,
+the float tests, the FPU tests, `clobber`, `struct_global`,
+`struct_zero`) — the only diffs are in the trailing
+disassembly-of-incidental-memory shown at each `HALT`/timeout PC, which
+shifts along with this fix's code-layout changes and was never
+meaningful program state.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented
