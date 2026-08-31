@@ -1207,6 +1207,197 @@ unchanged; a program that previously failed to compile exactly 1 word
 over the page-zero budget (an `atof()` + `printf()` combination — see
 entry #13's own note on this) now compiles and runs correctly.
 
+### 17. Indirect (function-pointer) call support added (fixed) — plus an unrelated printf `%i` gap and a global function-pointer-initializer gap found and fixed alongside it
+
+Not a bug fix on its own to start — this backend previously had no support
+at all for calling through a function-pointer *value* computed at runtime
+(as opposed to a direct call to a compile-time-known symbol, which every
+call before this went through). `EclipseISelLowering.cpp`'s `LowerCall`
+`report_fatal_error`'d unconditionally on any callee that wasn't a
+`GlobalAddressSDNode`/`ExternalSymbolSDNode`. Four c-testsuite tests
+(00087, 00089, 00124, 00210) depended on this, plus 00216 (skip-listed
+specifically for hitting this same error).
+
+**ISA research first, before writing any code**: every existing call
+(direct or not) already goes through one level of indirection — `JSR
+@<callee>_SLOT,0`, where `<callee>_SLOT` is a *compile-time* page-zero
+`var` line holding the real target address, because `JSR`'s addressing
+modes need a page-zero-resident operand the same way `LDA`/`STA` do (see
+`CALL`'s own comment in `EclipseInstrInfo.td`). The question this entry
+had to answer empirically: does real Nova/Eclipse `JSR` have any mode that
+jumps to an address held in a *register* directly, sidestepping the need
+for a page-zero word at all? Checked against the same authoritative source
+this project already trusts for ISA facts (the DG Nova/Eclipse instruction
+set `JSR` shares its addressing-mode field with `LDA`/`STA`/`JMP`) — the
+answer is no: `JSR`'s addressing modes are direct, AC1/AC2/AC3-indexed,
+and indirect-through-*memory*, exactly the same set every other
+memory-referencing instruction on this ISA has, never "jump to whatever's
+in a register." So a function-pointer *value* sitting in AC0/AC1 still
+needs to land in an addressable memory word before `JSR` can reach it —
+there's no way around at least one extra store.
+
+**The mechanism chosen**: reuse the existing shared page-zero `_scratch`
+word — the same fixed word `LDIND`/`STIND`'s `emitIndirectMem` already
+uses for general pointer dereference (`STA` the address into `_scratch`,
+then `LDA`/`STA ac,@_scratch`). For an indirect call: `STA` the
+function-pointer value into `_scratch`, then `JSR @_scratch,0`. Safe for
+the same reason `emitIndirectMem`'s reuse of `_scratch` already is: the
+store and the following indirect operation are always emitted back-to-back
+by the same custom inserter with nothing else scheduled in between, so two
+different indirect operations can never see each other's half-written
+state. `_scratch` is unconditionally declared (`var _scratch = 0`) in
+every generated program regardless of whether anything uses it, so no new
+page-zero declaration bookkeeping was needed.
+
+**Implementation** (`EclipseISelLowering.h`/`.cpp`, `EclipseInstrInfo.td`
+— `EclipseAsmPrinter.cpp` needed no changes at all, which is itself worth
+noting: see below):
+
+- A new target node, `EclipseISD::CALL_INDIRECT`, structurally distinct
+  from `EclipseISD::CALL` — same variadic-operand type profile, but the
+  one real operand is a plain i16 GPR value instead of a `texternalsym`.
+  `LowerCall` now branches on the callee: `GlobalAddressSDNode`/
+  `ExternalSymbolSDNode` still build the `<callee>_SLOT` name and emit
+  `EclipseISD::CALL` exactly as before (the `else` branch that used to be
+  `report_fatal_error` is simply gone — direct calls are completely
+  unchanged); anything else emits `EclipseISD::CALL_INDIRECT` with the
+  already-materialized-into-a-register callee `SDValue` as its operand
+  (it arrives as an ordinary i16 SSA value with no special handling
+  needed — a function pointer is "just a value" everywhere else in this
+  backend already, including through struct fields, parameters, and
+  return values, none of which needed any change).
+- `EclipseInstrInfo.td`: `CALLIND`, a `usesCustomInserter` pseudo taking
+  one `GPR` operand, matching `(EclipseCallIndirect GPR:$func)` — mirrors
+  `LDIND`/`STIND`/`PUSH`/`POP`'s existing pattern exactly. It expands (in
+  `EclipseISelLowering.cpp`'s new `emitCallIndirect`, dispatched from
+  `EmitInstrWithCustomInserter` next to the other custom-inserted
+  pseudos) into two real `MachineInstr`s: `STABS $func, "_scratch"`
+  (the exact same instruction `emitIndirectMem` already builds this way —
+  no new instruction needed for the store half) followed by a new fixed,
+  operand-less real instruction, `CALLIND_JSR`, whose `AsmString` is
+  literally `"JSR @_scratch,0"`. `CALLIND_JSR` carries the identical
+  `isCall = 1, Defs = [AC0, AC1, AC3], Uses = [AC2]` flags `CALL` itself
+  has, deliberately on the *real* post-expansion instruction rather than
+  the pseudo (which is erased before register allocation ever runs, same
+  as every other custom-inserted pseudo here) — this is what tells the
+  register allocator an indirect call clobbers exactly the same registers
+  a direct one does.
+- Why `EclipseAsmPrinter.cpp` needed no changes: `case Eclipse::CALL:` in
+  `emitInstruction` special-cases `CALL` specifically to read its symbol
+  operand and register a `<callee>_SLOT` `var` line for it. `CALLIND_JSR`
+  deliberately avoids that path entirely by being a distinct opcode with a
+  fixed, operand-less `AsmString` — it needs no symbol lookup, no `_SLOT`
+  registration, nothing beyond what the default `EclipseMCInstLower`-based
+  instruction printer already does for every ordinary instruction. An
+  earlier design considered reusing `CALL` itself with `_scratch` as its
+  symbol operand (since `CALL`'s `calltarget` operand already accepts any
+  external symbol) — rejected once traced through: it would have
+  registered `_scratch` as a `CallSlots` entry too, emitting a bogus
+  second `var _scratch = _scratch` line alongside the real `var _scratch =
+  0` line already emitted unconditionally at the top of every file,
+  since `stripSlotSuffix` only strips a literal `_SLOT` suffix and leaves
+  `_scratch` unchanged.
+
+**Verified empirically at every step, not just assumed** (per this
+project's own established methodology): confirmed via `clang -cc1 -S` on
+c-testsuite 00087 (`struct S { int (*fptr)(); }; v.fptr = foo; return
+v.fptr();`) that the generated assembly is exactly `LDA 0,foo_PTR` /
+`STA 0,6,2` (store into the struct field) / `LDA 0,6,2` (reload) /
+`STA 0,_scratch` / `JSR @_scratch,0` — no `_SLOT` reference anywhere for
+`foo`, confirming the whole point of this feature (no compile-time-known
+callee symbol needed). Ran on `eclipseemu` (`dep PC 50`, per entry #16):
+00087, 00089, 00124, and 00210 all PASS against their `.expected` output.
+
+**00089 needed a second, unrelated, pre-existing fix to actually pass**:
+initially hung (`Step expired, PC: 00000 (JMP 0)` — the same "corrupted
+SAVE/RTN linkage" trap signature documented in entry #11) even with the
+indirect-call mechanism itself working correctly (confirmed via a battery
+of isolated repros: two sequential indirect calls in one function, a
+function returning a function pointer that's immediately called
+(`go()()`), and calling through a struct pointer's function-pointer field
+— the first two passed cleanly in isolation). The minimal repro that
+finally reproduced it was a **global** (not local) struct initialized with
+a function pointer: `struct S { int (*zerofunc)(); } s = { &zero };`.
+Root-caused by inspecting the generated assembly directly: `var s = 0`
+instead of `var s = zero` — `EclipseAsmPrinter.cpp`'s `flattenConstant`
+(added in entry #10 for struct-global support) has a documented, explicit
+fallback for "a field type genuinely unsupported here (a pointer, a
+float)" that degrades to a literal zero word. That fallback was correct
+for a float (this target has no way to materialize one at compile time)
+but not for a pointer to another global — `dgasm` already resolves a bare
+symbol reference in a `var NAME = OTHERSYMBOL` line to `OTHERSYMBOL`'s own
+assigned address, exactly the mechanism this backend already relies on
+for every `_SLOT`/`_PTR` slot it emits elsewhere. **Fix**: `flattenConstant`
+now recognizes a `GlobalValue` (a `Function*` or `GlobalVariable*` used
+directly as a constant — what `&function`/a data global's address actually
+look like at the IR level) as a leaf and emits `getSymbol(GV)->getName()`
+instead of `"0"`; changed `flattenConstant`'s output type from
+`SmallVector<int64_t>` to `SmallVector<std::string>` to carry a symbol
+reference alongside ordinary numeric words. The same fix was added as a
+new top-level case in `emitGlobalVariable` itself, ahead of the
+`ConstantInt` scalar case, for the simpler (non-struct) shape — a
+top-level global directly initialized with another global's address (e.g.
+`int (*fp)() = foo;`), not exercised by any of the four target tests but
+the same gap by the same root cause, cheap to close alongside it.
+Verified: 00089 now passes; re-checked entry #10's own two struct-global
+regression tests (`struct_global`/`struct_zero` in
+`regress_hwstack.sh`) still produce byte-identical output.
+
+**00210 needed a third, also unrelated, pre-existing fix**: compiled and
+ran to a clean `HALT`, but produced no visible digits for either of its
+two `printf("%i\n", ...)` calls — traced to `eclipse_rt.c`'s `printf`
+implementation never having supported the `%i` conversion specifier at
+all (only `%d`/`%o`/`%c`/`%s`/`%x`/`%u`/`%l[du]`/`%%`), so the `if`-chain
+fell through untaken for `'i'` and no digits were ever emitted (the
+format string's own literal `\n` right after still printed normally,
+which combined with this project's own test harness stripping exactly one
+blank-line/banner pair made the missing output look like "nothing
+printed at all" rather than "one bare newline" — confirmed the real
+shape via `cat -A` on the raw `eclipseemu` output, finding a literal
+`^M$` / `$` pair where the digits should have been). **Fix**: `%i` treated
+as a synonym for `%d` (standard C `printf` behavior — they differ only in
+`scanf`), a one-line addition to the same `if (*fmt == 'd')` check. Synced
+into `eclipse-package/eclipse-toolchain/rt/eclipse_rt.c` alongside the
+`llvm-project` changes, per this package's usual convention for runtime
+changes.
+
+**00216** (skip-listed specifically for hitting the old indirect-call
+error) now compiles past that error, confirming the fix generalizes to
+its function-pointer-table shape (`table[i]()`, `p = global_wrap[0].func;
+p();`) too — but still doesn't pass, for two separate, unrelated,
+already-documented reasons: several frame-relative accesses exceed
+dgasm's ±127-word displacement limit (the same class of constraint
+`sf_add`/`print_float` needed manual splitting to work around), and the
+program's total call/branch-target count overflows the shared 256-word
+page-zero budget outright (dgasm reports addresses up to 261, "should be
+0 - 255"). Neither is remotely related to indirect calls — this one
+program is simply large enough to hit two separate, pre-existing scaling
+limits. Left in `eclipse.skip`, comment updated to describe the current
+(different) failure reason rather than the old, now-fixed one.
+
+**Full regression verified**: `regress_hwstack.sh` produces output
+byte-identical to a freshly-captured pre-change baseline (via `git stash`
+on the `llvm-project` changes and a saved copy of the pre-fix
+`eclipse_rt.c`, rebuilding `llc` for each side) for every one of its 15
+examples — same printed output on every line, same 11 `HALT` / 4
+`Step expired` (benign-hang) classification, both before and after. The
+only differences in the raw before/after logs at all are the disassembly
+text shown for the final halted/trapped instruction's own address on a
+handful of examples (a few words of address drift from `printf` gaining
+the one-line `%i` check, present in every example that links it in) —
+expected and harmless, not a behavior change. Also ran the full
+c-testsuite (`bash run_full_suite.sh`, a new small harness script wrapping
+`run_one_test.sh` over every non-skip-listed test): 192 PASS, 1 MISMATCH,
+2 COMPILE_FAIL, 2 TIMEOUT out of 197 run. The 2 TIMEOUTs (00040, 00041)
+are the already-documented "genuinely correct, just too slow for the
+harness's fixed step budget" cases from entry #15. The other 3
+(00200/00203: `long long` shift-type and comparison tests; 00207: a
+variable-length-array test) were independently re-confirmed to fail
+*identically* — same COMPILE_FAIL/MISMATCH classification — against the
+unmodified pre-change baseline, i.e. pre-existing gaps (no 64-bit integer
+support; no VLA support, both already documented elsewhere in this file)
+this pass simply never touched, not regressions.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented

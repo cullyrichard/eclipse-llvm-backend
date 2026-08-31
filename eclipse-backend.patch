@@ -685,10 +685,10 @@ index 000000000..11a9b3268
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
 new file mode 100644
-index 000000000..ba2eeb825
+index 000000000..1e53e2068
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
-@@ -0,0 +1,700 @@
+@@ -0,0 +1,740 @@
 +//===-- EclipseAsmPrinter.cpp - Eclipse LLVM assembly writer ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -912,6 +912,26 @@ index 000000000..ba2eeb825
 +    }
 +  }
 +
++  // A scalar pointer initializer that's the address of another global (a
++  // function or a data global) -- e.g. `int (*fp)() = foo;` or `int *p =
++  // &g;` -- rather than materializing it at runtime the way LEAGA does for
++  // an ordinary *value* use, this can go directly into the `var` line as a
++  // symbol reference: dgasm resolves `var NAME = OTHERSYMBOL` to
++  // OTHERSYMBOL's own assigned address at assemble time, exactly the same
++  // mechanism already relied on for every `_SLOT`/`_PTR` slot this backend
++  // emits elsewhere (see CALL's "<callee>_SLOT" and LEAGA's "<target>_PTR").
++  // No offset/GEP/bitcast unwrapping attempted here -- only a bare
++  // GlobalValue used directly as the initializer, which is what `&foo`/`foo`
++  // (a function decaying to its own pointer) actually look like at the IR
++  // level; anything more complex still falls through to the "unsupported"
++  // case at the end of this function, same as before this existed.
++  if (const auto *GVInit = dyn_cast<GlobalValue>(Init)) {
++    OutStreamer->emitRawText(("var " + Twine(Sym->getName()) + " = " +
++                               Twine(getSymbol(GVInit)->getName()))
++                                  .str());
++    return;
++  }
++
 +  if (const auto *CI = dyn_cast<ConstantInt>(Init)) {
 +    // A scalar initializer wider than one Eclipse word (e.g. a 32-bit
 +    // `long`/`unsigned long`, this target's only scalar type besides i16)
@@ -1040,13 +1060,28 @@ index 000000000..ba2eeb825
 +  // that's itself an array or struct, or vice versa) rather than only
 +  // handling one level, since dgasm's sequential `var` layout needs the
 +  // *fully* flattened word sequence regardless of how deep the C-level
-+  // nesting is. A field type genuinely unsupported here (a pointer, a
-+  // float — this target has no register class for either as a directly
-+  // materializable constant) degrades to a single zero word for just
-+  // that field rather than losing the fields around it.
-+  std::function<void(const Constant *, Type *, SmallVectorImpl<int64_t> &)>
++  // nesting is. Each flattened word is the literal RHS text for its own
++  // `var` line -- almost always a decimal number, but a struct field that's
++  // itself a pointer to another global (a function pointer field, e.g.
++  // `struct S { int (*fptr)(); } s = { &zero };`) instead becomes a symbol
++  // reference to that global's own assembler name, exactly like the
++  // top-level scalar-pointer-initializer case just above this lambda (same
++  // dgasm `var NAME = OTHERSYMBOL` mechanism `_SLOT`/`_PTR` slots already
++  // rely on elsewhere in this file) -- this was a real, confirmed gap, not
++  // a hypothetical: `struct S s = { &zero };` previously fell through to
++  // the final "unsupported leaf constant" case below and silently stored a
++  // literal 0 instead of zero's real address (found via c-testsuite 00089,
++  // "calling through a function pointer reached via nested struct/typedef
++  // indirection" -- traced directly to this exact fallback). A field type
++  // genuinely unsupported here (a float; a pointer expression more complex
++  // than a bare GlobalValue, e.g. an offset/bitcast -- this target has no
++  // register class for a directly materializable float constant, and no
++  // attempt is made here to compute a compile-time symbol-plus-offset
++  // expression dgasm might not accept anyway) still degrades to a single
++  // zero word for just that field rather than losing the fields around it.
++  std::function<void(const Constant *, Type *, SmallVectorImpl<std::string> &)>
 +      flattenConstant = [&](const Constant *C, Type *Ty,
-+                             SmallVectorImpl<int64_t> &Out) {
++                             SmallVectorImpl<std::string> &Out) {
 +        if (!C || isa<ConstantAggregateZero>(C) || isa<UndefValue>(C)) {
 +          if (auto *ST = dyn_cast<StructType>(Ty)) {
 +            for (unsigned i = 0, e = ST->getNumElements(); i != e; ++i)
@@ -1057,24 +1092,29 @@ index 000000000..ba2eeb825
 +          } else if (auto *IT = dyn_cast<IntegerType>(Ty)) {
 +            unsigned NumWords = (IT->getBitWidth() + 15) / 16;
 +            for (unsigned i = 0; i != NumWords; ++i)
-+              Out.push_back(0);
++              Out.push_back("0");
 +          } else {
-+            Out.push_back(0); // unsupported leaf type
++            Out.push_back("0"); // unsupported leaf type
 +          }
++          return;
++        }
++        if (const auto *GVLeaf = dyn_cast_or_null<GlobalValue>(C)) {
++          Out.push_back(getSymbol(GVLeaf)->getName().str());
 +          return;
 +        }
 +        if (const auto *CI = dyn_cast_or_null<ConstantInt>(C)) {
 +          unsigned BitWidth = CI->getBitWidth();
 +          if (BitWidth <= 16) {
-+            Out.push_back(CI->getSExtValue());
++            Out.push_back(Twine(CI->getSExtValue()).str());
 +            return;
 +          }
 +          APInt Val = CI->getValue();
 +          unsigned NumWords = (BitWidth + 15) / 16;
 +          for (unsigned i = 0; i != NumWords; ++i) {
 +            unsigned ShiftAmt = (NumWords - 1 - i) * 16;
-+            Out.push_back(static_cast<int16_t>(
-+                Val.lshr(ShiftAmt).trunc(16).getZExtValue()));
++            Out.push_back(Twine(static_cast<int16_t>(
++                                     Val.lshr(ShiftAmt).trunc(16).getZExtValue()))
++                              .str());
 +          }
 +          return;
 +        }
@@ -1092,15 +1132,15 @@ index 000000000..ba2eeb825
 +        }
 +        if (const auto *CDA = dyn_cast_or_null<ConstantDataArray>(C)) {
 +          for (unsigned i = 0, e = CDA->getNumElements(); i != e; ++i)
-+            Out.push_back(CDA->getElementAsAPInt(i).getSExtValue());
++            Out.push_back(Twine(CDA->getElementAsAPInt(i).getSExtValue()).str());
 +          return;
 +        }
-+        Out.push_back(0); // unsupported leaf constant (e.g. a pointer)
++        Out.push_back("0"); // unsupported leaf constant (e.g. a float)
 +      };
 +
 +  if (isa<StructType>(GV->getValueType()) &&
 +      (isa<ConstantStruct>(Init) || isa<ConstantAggregateZero>(Init))) {
-+    SmallVector<int64_t, 8> Words;
++    SmallVector<std::string, 8> Words;
 +    flattenConstant(Init, GV->getValueType(), Words);
 +    for (unsigned i = 0, e = Words.size(); i != e; ++i) {
 +      std::string Name = i == 0 ? Sym->getName().str()
@@ -1934,10 +1974,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..a4f6d5323
+index 000000000..61a5d8b7e
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1410 @@
+@@ -0,0 +1,1454 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2224,6 +2264,8 @@ index 000000000..a4f6d5323
 +    return "EclipseISD::HALVE";
 +  case EclipseISD::CALL:
 +    return "EclipseISD::CALL";
++  case EclipseISD::CALL_INDIRECT:
++    return "EclipseISD::CALL_INDIRECT";
 +  case EclipseISD::RET_FLAG:
 +    return "EclipseISD::RET_FLAG";
 +  case EclipseISD::RETI_FLAG:
@@ -3043,26 +3085,44 @@ index 000000000..a4f6d5323
 +    Chain = SDValue(DAG.getMachineNode(Eclipse::PUSH, dl, MVT::Other, Ops), 0);
 +  }
 +
-+  // Indirect through a page-zero jump-table slot named "<callee>_SLOT" —
-+  // see EclipseInstrInfo.td's CALL def and docs/CALLING_CONVENTION.md.
-+  // Always an ExternalSymbol operand (even for a real GlobalValue callee):
-+  // "<name>_SLOT" isn't itself a GlobalValue, just a compiler-synthesized
-+  // data symbol EclipseAsmPrinter emits alongside it.
-+  std::string SlotName;
-+  if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee))
-+    SlotName = (G->getGlobal()->getName() + "_SLOT").str();
-+  else if (auto *E = dyn_cast<ExternalSymbolSDNode>(Callee))
-+    SlotName = (Twine(E->getSymbol()) + "_SLOT").str();
-+  else
-+    report_fatal_error("Eclipse indirect (non-direct-symbol) calls are not "
-+                        "supported");
-+  const char *PersistentName =
-+      DAG.getMachineFunction().createExternalSymbolName(SlotName);
-+  Callee = DAG.getTargetExternalSymbol(PersistentName, MVT::i16);
-+
++  // Direct call (a real GlobalValue or an external/libcall symbol): indirect
++  // through a page-zero jump-table slot named "<callee>_SLOT" — see
++  // EclipseInstrInfo.td's CALL def and docs/CALLING_CONVENTION.md. Always an
++  // ExternalSymbol operand (even for a real GlobalValue callee): "<name>_SLOT"
++  // isn't itself a GlobalValue, just a compiler-synthesized data symbol
++  // EclipseAsmPrinter emits alongside it.
++  //
++  // Indirect call (calling through a function-pointer *value* computed at
++  // runtime -- Callee is neither of the two SDNode kinds above, just an
++  // ordinary i16 SSA value already materialized into a register by the time
++  // it reaches here, e.g. loaded from a struct field or a local variable):
++  // there's no compile-time-known callee to hang a "_SLOT" symbol off of at
++  // all. Real Nova/Eclipse JSR has no "jump to whatever's in a register"
++  // addressing mode -- only direct, AC1/AC2/AC3-indexed, and
++  // memory-indirect, the same set LDA/STA support (confirmed against the
++  // DG ISA and re-confirmed empirically on eclipseemu) -- so this goes
++  // through a distinct EclipseISD::CALL_INDIRECT node instead, which
++  // EclipseInstrInfo.td's CALLIND pseudo expands (via emitCallIndirect) into
++  // storing the pointer value into the shared page-zero `_scratch` word
++  // (the same one LDIND/STIND already use for general pointer dereference)
++  // followed by "JSR @_scratch,0".
 +  SDVTList NodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
 +  SmallVector<SDValue, 4> CallOps{Chain, Callee};
-+  Chain = DAG.getNode(EclipseISD::CALL, dl, NodeTys, CallOps);
++  if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
++    std::string SlotName = (G->getGlobal()->getName() + "_SLOT").str();
++    const char *PersistentName =
++        DAG.getMachineFunction().createExternalSymbolName(SlotName);
++    CallOps[1] = DAG.getTargetExternalSymbol(PersistentName, MVT::i16);
++    Chain = DAG.getNode(EclipseISD::CALL, dl, NodeTys, CallOps);
++  } else if (auto *E = dyn_cast<ExternalSymbolSDNode>(Callee)) {
++    std::string SlotName = (Twine(E->getSymbol()) + "_SLOT").str();
++    const char *PersistentName =
++        DAG.getMachineFunction().createExternalSymbolName(SlotName);
++    CallOps[1] = DAG.getTargetExternalSymbol(PersistentName, MVT::i16);
++    Chain = DAG.getNode(EclipseISD::CALL, dl, NodeTys, CallOps);
++  } else {
++    Chain = DAG.getNode(EclipseISD::CALL_INDIRECT, dl, NodeTys, CallOps);
++  }
 +  InGlue = Chain.getValue(1);
 +
 +  Chain = DAG.getCALLSEQ_END(Chain, NumWords, 0, InGlue, dl);
@@ -3167,6 +3227,8 @@ index 000000000..a4f6d5323
 +    return emitIndirectMem(MI, MBB, /*IsLoad*/ true);
 +  case Eclipse::STIND:
 +    return emitIndirectMem(MI, MBB, /*IsLoad*/ false);
++  case Eclipse::CALLIND:
++    return emitCallIndirect(MI, MBB);
 +  default:
 +    llvm_unreachable("unexpected custom-inserted Eclipse pseudo");
 +  }
@@ -3348,12 +3410,34 @@ index 000000000..a4f6d5323
 +  MI.eraseFromParent();
 +  return MBB;
 +}
++
++// Indirect call through a runtime function-pointer value -- see
++// EclipseInstrInfo.td's CALLIND/CALLIND_JSR comments for the full ISA
++// research (JSR has no register-target addressing mode on real Nova/
++// Eclipse hardware, only direct/indexed/memory-indirect, confirmed against
++// eclipseemu below). Same store-into-`_scratch`-then-indirect shape as
++// emitIndirectMem above, just for control flow (JSR) instead of data
++// (LDA/STA): $func's value gets stashed in the shared page-zero `_scratch`
++// word, then CALLIND_JSR ("JSR @_scratch,0") reads it back as the jump
++// target. CALLIND_JSR itself (not this pseudo) carries the real
++// isCall/Defs/Uses flags the register allocator needs to see.
++MachineBasicBlock *
++EclipseTargetLowering::emitCallIndirect(MachineInstr &MI,
++                                         MachineBasicBlock *MBB) const {
++  const auto &TII = *MBB->getParent()->getSubtarget<EclipseSubtarget>().getInstrInfo();
++  DebugLoc DL = MI.getDebugLoc();
++  Register Func = MI.getOperand(0).getReg();
++  BuildMI(*MBB, MI, DL, TII.get(Eclipse::STABS)).addReg(Func).addExternalSymbol("_scratch");
++  BuildMI(*MBB, MI, DL, TII.get(Eclipse::CALLIND_JSR));
++  MI.eraseFromParent();
++  return MBB;
++}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.h b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
 new file mode 100644
-index 000000000..87023efbb
+index 000000000..8593e9c57
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,269 @@
 +//===-- EclipseISelLowering.h - Eclipse DAG Lowering Interface -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -3414,6 +3498,11 @@ index 000000000..87023efbb
 +            // HALVE selects straight to UDIVrr (see EclipseInstrInfo.td)
 +            // and is invisible to both of those generic rules.
 +  CALL,
++  CALL_INDIRECT, // Same shape as CALL, but the operand is a plain i16 GPR
++                 // value (a runtime-computed function pointer) rather than
++                 // a texternalsym -- see EclipseInstrInfo.td's CALLIND for
++                 // why this needs to be a distinct node/opcode rather than
++                 // just feeding a register operand into EclipseCall.
 +  RET_FLAG,
 +  RETI_FLAG,
 +  BRZ,
@@ -3611,6 +3700,8 @@ index 000000000..87023efbb
 +                                       bool IsDown) const;
 +  MachineBasicBlock *emitIndirectMem(MachineInstr &MI, MachineBasicBlock *MBB,
 +                                      bool IsLoad) const;
++  MachineBasicBlock *emitCallIndirect(MachineInstr &MI,
++                                       MachineBasicBlock *MBB) const;
 +};
 +
 +} // namespace llvm
@@ -4014,10 +4105,10 @@ index 000000000..4caee1b13
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEINSTRINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.td b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
 new file mode 100644
-index 000000000..98fb20322
+index 000000000..81806b758
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,562 @@
 +//===- EclipseInstrInfo.td - Eclipse Instruction defs ------*- tablegen -*-=//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4076,6 +4167,18 @@ index 000000000..98fb20322
 +def EclipseCall : SDNode<"EclipseISD::CALL", SDT_EclipseCall,
 +                          [SDNPHasChain, SDNPOutGlue, SDNPOptInGlue,
 +                           SDNPVariadic]>;
++
++// Indirect call through a runtime function-pointer *value* (a register),
++// as opposed to EclipseCall's compile-time-known symbol — see CALLIND
++// below and EclipseISelLowering.cpp's LowerCall for the full story. Same
++// type profile as EclipseCall (single variadic i16 operand plus implicit
++// chain/glue): deliberately a distinct SDNode, not a reuse of EclipseCall
++// with a register operand, so ISel pattern matching can tell the two
++// apart (CALL always wants a texternalsym operand, CALLIND always wants a
++// GPR).
++def EclipseCallIndirect : SDNode<"EclipseISD::CALL_INDIRECT", SDT_EclipseCall,
++                                  [SDNPHasChain, SDNPOutGlue, SDNPOptInGlue,
++                                   SDNPVariadic]>;
 +
 +def EclipseRet : SDNode<"EclipseISD::RET_FLAG", SDTNone,
 +                         [SDNPHasChain, SDNPOptInGlue, SDNPVariadic]>;
@@ -4354,6 +4457,50 @@ index 000000000..98fb20322
 +let isCall = 1, Defs = [AC0, AC1, AC3], Uses = [AC2] in
 +def CALL : EclipseInst<(outs), (ins calltarget:$func), "JSR @$func,0",
 +                        [(EclipseCall texternalsym:$func)]>;
++
++// Indirect call through a runtime-computed function-pointer value: unlike
++// CALL, there's no compile-time-known callee symbol to hang a "<callee>_SLOT"
++// page-zero slot off of (EclipseAsmPrinter.cpp emits one such `var` line per
++// distinct *direct* call target — see CALL's comment above — but a value
++// computed at runtime, held in a register, has no name at all). JSR itself
++// only has the same "@<page-zero addr>,0" indirect addressing mode CALL
++// already uses; there's no separate "jump to whatever's in a register"
++// hardware mode on this ISA (confirmed against the DG Nova/Eclipse
++// instruction set: JSR's addressing modes are exactly LDA/STA's -- direct,
++// indexed-by-AC1/AC2/AC3, and indirect-through-*memory*, never a bare
++// register target -- and empirically re-confirmed on eclipseemu below).
++//
++// So the function-pointer value (already an ordinary i16 SSA value by the
++// time it reaches here, wherever it came from -- a load, a parameter, a
++// PHI) first gets stored into the shared page-zero `_scratch` word (the
++// same fixed word LDIND/STIND's emitIndirectMem already uses for general
++// pointer dereference -- see EclipseInstrInfo.td's LDIND/STIND comment and
++// EclipseAsmPrinter.cpp's "var _scratch = 0", always emitted unconditionally
++// so it's guaranteed to exist regardless of whether this feature is used),
++// then JSR indirects through *that* fixed, always-known page-zero address.
++// This costs one extra STA over a direct call's JSR, and reuses the same
++// `_scratch` word LDIND/STIND already use -- safe because this custom
++// inserter emits the store and the JSR back-to-back with nothing else
++// scheduled in between, exactly like emitIndirectMem's own store-then-load-
++// through-`_scratch` pair.
++//
++// Expands (EclipseISelLowering.cpp's custom inserter, emitCallIndirect) to
++// a real STABS "$func -> _scratch" followed by CALLIND_JSR, rather than
++// matching a single real instruction directly here -- CALLIND_JSR's own
++// isCall/Defs/Uses flags (identical to CALL's, deliberately) are what
++// actually inform the register allocator this clobbers AC0/AC1/AC3, not
++// this pseudo (which is erased before regalloc ever runs, exactly like
++// LDIND/STIND/PUSH/POP above).
++let usesCustomInserter = 1 in
++def CALLIND : EclipsePseudo<(outs), (ins GPR:$func), "# CALLIND",
++                             [(EclipseCallIndirect GPR:$func)]>;
++
++// The real "JSR @_scratch,0" CALLIND expands to. A fixed, operand-less
++// instruction (unlike CALL, whose target symbol varies per call site) --
++// every indirect call site reads the same freshly-stored `_scratch` word
++// right before this runs, so there's nothing to parameterize.
++let isCall = 1, Defs = [AC0, AC1, AC3], Uses = [AC2] in
++def CALLIND_JSR : EclipseInst<(outs), (ins), "JSR @_scratch,0", []>;
 +
 +// AC0 is *not* statically declared here: it's only actually read when the
 +// function returns a value, which EclipseISelLowering.cpp's LowerReturn

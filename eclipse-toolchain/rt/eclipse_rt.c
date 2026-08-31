@@ -150,7 +150,17 @@ int printf(const char *fmt, ...) {
   while (*fmt) {
     if (*fmt == '%') {
       fmt++;
-      if (*fmt == 'd') {
+      if (*fmt == 'd' || *fmt == 'i') {
+        // %i is a synonym for %d in printf (unlike scanf, where they
+        // differ) -- added after c-testsuite 00210 silently printed a
+        // bare newline (no digits) for "%i\n": the missing case fell
+        // through this if-chain untaken, so *fmt never advanced past
+        // 'i' via a matched branch and no digits were ever emitted,
+        // but the format string's own literal '\n' right after still
+        // printed normally -- easy to misread as "no output at all"
+        // since eclipse-toolchain's own test harness strips exactly one
+        // blank-line/banner pair and can't tell that blank line apart
+        // from a real one-character printf output.
         n += print_int(va_arg(ap, int));
       } else if (*fmt == 'o') {
         n += print_octal((unsigned int)va_arg(ap, int));
