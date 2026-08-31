@@ -1464,6 +1464,98 @@ output on every package example). A new direct-global-struct-field
 repro (`bolshevic.a/.b/.c = 12/34/56;` with no pointer variable
 involved) reads back correctly (`12 34 56`) with this fix in place.
 
+### 19. Variable-length array support added (DYNAMIC_STACKALLOC / STACKSAVE / STACKRESTORE)
+
+C variable-length arrays (`int n = ...; int buf[n];`) previously hit
+"Cannot select" crashes in llc -- `ISD::DYNAMIC_STACKALLOC` had no
+lowering at all on this target.
+
+**Design**: `DYNAMIC_STACKALLOC` lowers to a new `VLAALLOC` pseudo,
+custom-inserted as three real instructions: `LDABS` the current
+hardware stack pointer (mem[040], the same SAVE/RTN stack-pointer word
+entry #11 introduced) as the base, `ADDrr` it with the requested word
+count, `STABS` the sum back as the new stack pointer. A single `ADD` is
+used rather than an unrolled loop (the pattern `emitAdjCallStack` uses
+for fixed-size stack adjustment) because the word count here is a
+genuine runtime value, not a compile-time constant, so there's nothing
+to unroll.
+
+Byte count to word count uses the existing `EclipseISD::HALVE` node
+((size + 1) / 2, rounding up), not a fresh `ISD::SRL`-by-1 -- see the
+first bug below for why.
+
+While bringing up a minimal repro, clang turned out to emit
+`llvm.stacksave`/`llvm.stackrestore` unconditionally around *any*
+lexical block containing a VLA, even a top-level block with no loop or
+early exit -- not something the minimal design above originally
+accounted for. Both are handled as trivial single-instruction custom
+pseudos: `STACKSAVE_PSEUDO` is a direct `LDABS` of mem[040], and
+`STACKRESTORE_PSEUDO` is a direct `STABS` back to mem[040], discarding
+everything allocated since (including VLA words), exactly the same
+unconditional reset `RTN`'s own epilogue already does at function
+return (see `EclipseFrameLowering.cpp`'s `emitEpilogue`).
+
+**Bugs found and fixed along the way, all real, all caught before or
+during bring-up rather than left latent**:
+
+1. **A shift built fresh during Custom-lowering tripped `LowerShift`'s
+   strict constant check.** The word-count computation originally used
+   `ISD::SRL` by a freshly-built `DAG.getConstant(1, ...)`, but
+   `LowerShift`'s `dyn_cast<ConstantSDNode>` on the shift amount failed
+   even though the operand genuinely was a constant -- an ordering
+   quirk specific to nodes built *during* Custom-lowering itself: the
+   constant hasn't yet been independently routed through `ISD::Constant`'s
+   own Custom-lowering (constant-pool placement) by the time
+   `LowerShift` inspects it. Fixed by using `EclipseISD::HALVE` instead,
+   which selects straight to `UDIVrr` and bypasses `LowerShift`/
+   `ISD::SRL` entirely -- the same node `PerformDAGCombine`'s existing
+   halving code already relies on, built the same way (via
+   `DAG.getConstantPool` + `LowerConstantPool` for the "1" and "2"
+   constants).
+
+2. **`LDABSI` (indirect) used where `LDABS` (direct) was needed.**
+   `LDABSI` means "LDA $dst,@$addr" = `mem[mem[$addr]]` -- correct for
+   `emitPushPop`'s `POP`, which dereferences through the pointer to
+   retrieve a previously-pushed *value*. VLA alloc instead needs the
+   raw pointer value stored *at* mem[040] itself: `LDABS`, no
+   indirection. Caught via code review (re-reading `emitPushPop`'s
+   actual semantics) before it could manifest as corrupted data --
+   an earlier, unrelated gap (bug 3 below) crashed first.
+
+3. **`ISD::STACKSAVE`/`ISD::STACKRESTORE` unhandled.** Not scoped for
+   originally; discovered via `"Cannot select: t56: ch = stackrestore
+   ..."` once VLA alloc itself worked. Fixed as described above.
+
+4. **`DAG.getMachineNode` operand order backwards**, twice
+   (`VLAALLOC`'s `{Chain, WordCount}` and `STACKRESTORE_PSEUDO`'s
+   `{Chain, SavedPtr}`). The established convention -- documented
+   directly on `PUSH`'s own construction in `LowerCall`: "value
+   operand(s) first, chain last" -- is the opposite order. Both hit
+   `InstrEmitter::EmitMachineNode`'s "#operands for dag node doesn't
+   match .td file!" assertion until reordered to match `PUSH`'s
+   pattern.
+
+5. **A virtual register reused as its own tied output, violating the
+   pre-RA single-definition invariant.** `emitVLAAlloc`'s `ADDrr` step
+   initially wrote its result back into the same `WordCount` virtual
+   register already used as the pseudo's input. The tied "$dst=$dstin"
+   constraint is a hint for the *register allocator* to later coalesce
+   physical registers -- it doesn't license reusing a virtual register
+   number as a second definition at this stage. Hit
+   `MachineRegisterInfo::getVRegDef`'s "at most one definition"
+   assertion; fixed by allocating a fresh virtual register
+   (`MRI.createVirtualRegister(&Eclipse::GPRRegClass)`) for `ADDrr`'s
+   result, matching the only other place in this codebase that calls
+   `createVirtualRegister` (`EclipseRegisterInfo.cpp`'s
+   `eliminateFrameIndex`).
+
+**Verified**: a minimal repro (`int n = 4; int buf[n];` filled and
+read back via `printf`) prints the correct values on `eclipseemu`.
+c-testsuite `00207` passes. Full existing regression suite
+(`regress_hwstack.sh`) re-run clean, byte-identical to baseline --
+no regressions in float, struct, or hardware-stack (SAVE/RTN)
+handling from this change.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented

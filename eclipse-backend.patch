@@ -1974,10 +1974,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..61a5d8b7e
+index 000000000..99d0587e5
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1454 @@
+@@ -0,0 +1,1677 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2131,6 +2131,17 @@ index 000000000..61a5d8b7e
 +  setOperationAction(ISD::VAARG, MVT::Other, Custom);
 +  // va_end is a no-op on this stack-based ABI (no resources to release).
 +  setOperationAction(ISD::VAEND, MVT::Other, Expand);
++
++  // Variable-length arrays: reserves a runtime-computed word count on
++  // the same hardware stack pointer SAVE/RTN and the argument push/pop
++  // machinery already share -- see LowerDYNAMIC_STACKALLOC and
++  // emitVLAAlloc for the full mechanism.
++  setOperationAction(ISD::DYNAMIC_STACKALLOC, MVT::i16, Custom);
++  // clang emits these unconditionally around any lexical block
++  // containing a VLA -- see STACKSAVE_PSEUDO/STACKRESTORE_PSEUDO's own
++  // comment in EclipseInstrInfo.td.
++  setOperationAction(ISD::STACKSAVE, MVT::Other, Custom);
++  setOperationAction(ISD::STACKRESTORE, MVT::Other, Custom);
 +
 +  // See PerformDAGCombine: a runtime array index into an indirectly-
 +  // addressed ("large") global gets added, as a plain ADD, to the
@@ -2330,6 +2341,12 @@ index 000000000..61a5d8b7e
 +    return LowerVASTART(Op, DAG);
 +  case ISD::VAARG:
 +    return LowerVAARG(Op, DAG);
++  case ISD::DYNAMIC_STACKALLOC:
++    return LowerDYNAMIC_STACKALLOC(Op, DAG);
++  case ISD::STACKSAVE:
++    return LowerSTACKSAVE(Op, DAG);
++  case ISD::STACKRESTORE:
++    return LowerSTACKRESTORE(Op, DAG);
 +  default:
 +    report_fatal_error("unimplemented Eclipse LowerOperation for " +
 +                        Twine(Op.getOpcode()));
@@ -3043,6 +3060,109 @@ index 000000000..61a5d8b7e
 +  return DAG.getMergeValues(Ops, dl);
 +}
 +
++// Variable-length arrays: EclipseInstrInfo.td's VLAALLOC pseudo (expanded
++// by emitVLAAlloc, above -- see its own comment for the full mechanism
++// and why no explicit deallocation is ever needed) does the actual
++// hardware-stack-pointer reservation and returns the *old* top-of-stack
++// value. That's not yet a safe base pointer on its own -- real SAVE and
++// the software push/pop machinery both grow this stack by incrementing
++// *before* using a location, so the old value is still "in use" by
++// whatever's immediately below the newly reserved range. The +1 to turn
++// it into a real base pointer happens here, as a plain ordinary ADD
++// reaching normal ISel/register allocation, rather than inside
++// emitVLAAlloc's own hand-built expansion -- see that function's
++// comment for why: only two registers (AC0/AC1) are available there,
++// both already spoken for by the reservation logic itself.
++SDValue EclipseTargetLowering::LowerDYNAMIC_STACKALLOC(SDValue Op,
++                                                        SelectionDAG &DAG) const {
++  SDLoc dl(Op);
++  SDValue Chain = Op.getOperand(0);
++  SDValue Size = Op.getOperand(1); // byte count, a runtime i16 value.
++
++  // WordCount = ceil(Size / 2) = (Size + 1) / 2. Deliberately
++  // EclipseISD::HALVE (which selects straight to a real UDIVrr via a
++  // TableGen Pat), not a plain ISD::SRL/UDIV: this function builds its
++  // whole DAG fresh, during Custom-lowering itself, and a freshly-built
++  // SRL's shift-amount operand hasn't necessarily gone through
++  // ISD::Constant's own Custom-lowering (the constant-pool routing
++  // every constant on this target needs -- see the ADD combine's own
++  // comment elsewhere in this file) by the time LowerShift's strict
++  // "is this a plain ConstantSDNode" check runs on it -- confirmed the
++  // hard way: this exact SRL construction hit LowerShift's "only
++  // supports shifts by a compile-time constant amount" report_fatal_error,
++  // even though the amount genuinely was DAG.getConstant(1, ...).
++  // EclipseISD::HALVE has no such check (it isn't ISD::SRL/ISD::UDIV at
++  // all, so LowerShift never sees it), and PerformDAGCombine's own
++  // WORD_ADD offset computation already builds its "2" constant this
++  // same way (DAG.getConstantPool + LowerConstantPool, not
++  // DAG.getConstant) for the identical reason.
++  SDValue One = LowerConstantPool(
++      DAG.getConstantPool(ConstantInt::get(*DAG.getContext(), APInt(16, 1)),
++                           MVT::i16),
++      DAG);
++  SDValue SizePlus1 = DAG.getNode(ISD::ADD, dl, MVT::i16, Size, One);
++  SDValue Two = LowerConstantPool(
++      DAG.getConstantPool(ConstantInt::get(*DAG.getContext(), APInt(16, 2)),
++                           MVT::i16),
++      DAG);
++  SDValue WordCount =
++      DAG.getNode(EclipseISD::HALVE, dl, MVT::i16, SizePlus1, Two);
++
++  SDVTList VTs = DAG.getVTList(MVT::i16, MVT::Other);
++  // Value operand(s) first, chain last -- see LowerCall's PUSH
++  // construction comment for the established convention; got this
++  // backwards on the first attempt (Chain, WordCount), which tripped
++  // InstrEmitter's "#operands for dag node doesn't match .td file!"
++  // assertion.
++  SDValue AllocOps[] = {WordCount, Chain};
++  SDNode *Alloc =
++      DAG.getMachineNode(Eclipse::VLAALLOC, dl, VTs, AllocOps);
++  SDValue OldTop = SDValue(Alloc, 0);
++  SDValue NewChain = SDValue(Alloc, 1);
++
++  // Base = OldTop + 1: the first genuinely-free reserved word (see this
++  // function's own header comment above for why +1 is needed at all).
++  // Reuses the same already-lowered One constant from above rather than
++  // building a second DAG.getConstant(1, ...) -- see this function's
++  // other comment on why a freshly-built plain ISD::Constant isn't
++  // safe to feed into certain custom-lowered nodes here.
++  SDValue Base = DAG.getNode(ISD::ADD, dl, MVT::i16, OldTop, One);
++
++  SDValue Ops[2] = {Base, NewChain};
++  return DAG.getMergeValues(Ops, dl);
++}
++
++// llvm.stacksave: capture the current hardware stack pointer (memory
++// location 040) so a later llvm.stackrestore can discard anything
++// allocated since -- see STACKSAVE_PSEUDO's own comment in
++// EclipseInstrInfo.td for why clang emits this at all.
++SDValue EclipseTargetLowering::LowerSTACKSAVE(SDValue Op,
++                                              SelectionDAG &DAG) const {
++  SDLoc dl(Op);
++  SDValue Chain = Op.getOperand(0);
++  SDVTList VTs = DAG.getVTList(MVT::i16, MVT::Other);
++  SDValue Ops[] = {Chain};
++  SDNode *Save = DAG.getMachineNode(Eclipse::STACKSAVE_PSEUDO, dl, VTs, Ops);
++  SDValue Result[2] = {SDValue(Save, 0), SDValue(Save, 1)};
++  return DAG.getMergeValues(Result, dl);
++}
++
++// llvm.stackrestore: the inverse -- overwrite the hardware stack
++// pointer with a previously-saved value.
++SDValue EclipseTargetLowering::LowerSTACKRESTORE(SDValue Op,
++                                                 SelectionDAG &DAG) const {
++  SDLoc dl(Op);
++  SDValue Chain = Op.getOperand(0);
++  SDValue SavedPtr = Op.getOperand(1);
++  // Value operand(s) first, chain last -- see LowerCall's own PUSH
++  // construction comment ("value operand(s) first, chain last") for the
++  // established convention this matches.
++  SDValue Ops[] = {SavedPtr, Chain};
++  return SDValue(
++      DAG.getMachineNode(Eclipse::STACKRESTORE_PSEUDO, dl, MVT::Other, Ops),
++      0);
++}
++
 +SDValue
 +EclipseTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
 +                                  SmallVectorImpl<SDValue> &InVals) const {
@@ -3220,6 +3340,12 @@ index 000000000..61a5d8b7e
 +    return emitAdjCallStack(MI, MBB, /*IsDown*/ true);
 +  case Eclipse::ADJCALLSTACKUP:
 +    return emitAdjCallStack(MI, MBB, /*IsDown*/ false);
++  case Eclipse::VLAALLOC:
++    return emitVLAAlloc(MI, MBB);
++  case Eclipse::STACKSAVE_PSEUDO:
++    return emitStackSave(MI, MBB);
++  case Eclipse::STACKRESTORE_PSEUDO:
++    return emitStackRestore(MI, MBB);
 +  // MULrr/UDIVrr/UREMrr are handled by EclipseInstrInfo::expandPostRAPseudo
 +  // instead, not here — see EclipseInstrInfo.td's comment on why they
 +  // need to expand *after* register allocation.
@@ -3432,12 +3558,109 @@ index 000000000..61a5d8b7e
 +  MI.eraseFromParent();
 +  return MBB;
 +}
++
++// Variable-length array support (EclipseInstrInfo.td's VLAALLOC pseudo).
++// Reserves $wordcount more words on the same hardware stack pointer
++// (memory location 040) SAVE/RTN and the push/pop machinery above all
++// share -- no explicit deallocation is ever needed at scope exit or
++// function return, for the same reason ordinary locals need none: real
++// RTN resets 040 straight from the frame pointer (memory location 041)
++// unconditionally, discarding *everything* above it -- the VLA's words
++// included -- in the same single step that already discards ordinary
++// locals and temps (see EclipseFrameLowering.cpp's emitEpilogue).
++//
++// $dst comes back holding mem[040]'s value from *before* this
++// reservation (the old top-of-stack) -- not yet a safe pointer into the
++// newly reserved range on its own, since real SAVE/the push mechanism
++// above both grow this stack by incrementing *before* using a location,
++// meaning the old value is still "in use" by whatever's immediately
++// below it. LowerDYNAMIC_STACKALLOC (below) adds 1 to it afterward, as
++// a plain ordinary ADD reaching normal ISel and register allocation,
++// deliberately *outside* this hand-built expansion: doing the +1 in
++// here too would need a third scratch register/constant, and only
++// GPR:$dst/$wordcount (AC0/AC1, the only two allocatable registers) are
++// available -- both already spoken for by the reservation logic below.
++//
++// $wordcount is consumed, not preserved: ADDrr's "$dst = $dstin" tied-
++// operand constraint means this instruction destructively overwrites
++// whichever physical register $wordcount was allocated to.
++MachineBasicBlock *EclipseTargetLowering::emitVLAAlloc(MachineInstr &MI,
++                                                        MachineBasicBlock *MBB) const {
++  MachineFunction &MF = *MBB->getParent();
++  const auto &TII = *MF.getSubtarget<EclipseSubtarget>().getInstrInfo();
++  MachineRegisterInfo &MRI = MF.getRegInfo();
++  DebugLoc DL = MI.getDebugLoc();
++  Register Dst = MI.getOperand(0).getReg();
++  Register WordCount = MI.getOperand(1).getReg();
++
++  // Dst := mem[040]'s own value (the current stack-pointer address
++  // itself, to use as a base pointer) -- LDABS (direct: "LDA $dst,$addr"
++  // = mem[$addr]), *not* LDABSI (indirect: "LDA $dst,@$addr" =
++  // mem[mem[$addr]], the "dereference through the pointer to retrieve
++  // whatever data was pushed there" semantics emitPushPop's own POP
++  // path correctly wants, but wrong here -- caught via code review
++  // before this ever ran against real data (the first attempt at
++  // this function crashed earlier, on an unrelated STACKSAVE/
++  // STACKRESTORE gap, before reaching a point where the wrong
++  // address would have shown up as corrupted data).
++  BuildMI(*MBB, MI, DL, TII.get(Eclipse::LDABS), Dst).addImm(HWStackAddr);
++  // NewTop := WordCount + Dst (== old-top + word-count == the new
++  // top-of-stack value once this reservation is committed). A *fresh*
++  // virtual register, not WordCount itself reused as its own tied
++  // output: ADDrr's "$dst = $dstin" constraint only means the
++  // *register allocator* should try to coalesce them onto the same
++  // physical register later -- at this pre-RA stage every virtual
++  // register still needs exactly one definition, and WordCount already
++  // has one (whatever computed it before this pseudo). Reusing it here
++  // gave it a second, hitting MachineRegisterInfo::getVRegDef's "at
++  // most one definition" assertion -- confirmed the hard way, this
++  // exact mistake crashed here first.
++  Register NewTop = MRI.createVirtualRegister(&Eclipse::GPRRegClass);
++  BuildMI(*MBB, MI, DL, TII.get(Eclipse::ADDrr), NewTop)
++      .addReg(Dst)
++      .addReg(WordCount);
++  // Commit: mem[040] := NewTop (the new top-of-stack).
++  BuildMI(*MBB, MI, DL, TII.get(Eclipse::STABS))
++      .addReg(NewTop)
++      .addImm(HWStackAddr);
++
++  MI.eraseFromParent();
++  return MBB;
++}
++
++// llvm.stacksave: Dst := mem[040]'s own value (direct LDABS, matching
++// emitVLAAlloc's own comment on LDABS-vs-LDABSI just above -- this is
++// the address value itself, not something to dereference through).
++MachineBasicBlock *EclipseTargetLowering::emitStackSave(MachineInstr &MI,
++                                                         MachineBasicBlock *MBB) const {
++  const auto &TII = *MBB->getParent()->getSubtarget<EclipseSubtarget>().getInstrInfo();
++  DebugLoc DL = MI.getDebugLoc();
++  Register Dst = MI.getOperand(0).getReg();
++  BuildMI(*MBB, MI, DL, TII.get(Eclipse::LDABS), Dst).addImm(HWStackAddr);
++  MI.eraseFromParent();
++  return MBB;
++}
++
++// llvm.stackrestore: mem[040] := Src (direct STABS -- overwrite the
++// hardware stack pointer outright with a previously-saved value,
++// discarding everything allocated since, VLA words included, exactly
++// like RTN's own unconditional SP := FP reset does at function return
++// -- see EclipseFrameLowering.cpp's emitEpilogue).
++MachineBasicBlock *EclipseTargetLowering::emitStackRestore(MachineInstr &MI,
++                                                            MachineBasicBlock *MBB) const {
++  const auto &TII = *MBB->getParent()->getSubtarget<EclipseSubtarget>().getInstrInfo();
++  DebugLoc DL = MI.getDebugLoc();
++  Register Src = MI.getOperand(0).getReg();
++  BuildMI(*MBB, MI, DL, TII.get(Eclipse::STABS)).addReg(Src).addImm(HWStackAddr);
++  MI.eraseFromParent();
++  return MBB;
++}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.h b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
 new file mode 100644
-index 000000000..70a01e52e
+index 000000000..9202f4c0d
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
-@@ -0,0 +1,333 @@
+@@ -0,0 +1,342 @@
 +//===-- EclipseISelLowering.h - Eclipse DAG Lowering Interface -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -3714,6 +3937,9 @@ index 000000000..70a01e52e
 +  SDValue LowerSETCC(SDValue Op, SelectionDAG &DAG) const;
 +  SDValue LowerVASTART(SDValue Op, SelectionDAG &DAG) const;
 +  SDValue LowerVAARG(SDValue Op, SelectionDAG &DAG) const;
++  SDValue LowerDYNAMIC_STACKALLOC(SDValue Op, SelectionDAG &DAG) const;
++  SDValue LowerSTACKSAVE(SDValue Op, SelectionDAG &DAG) const;
++  SDValue LowerSTACKRESTORE(SDValue Op, SelectionDAG &DAG) const;
 +  SDValue LowerSIGN_EXTEND_INREG(SDValue Op, SelectionDAG &DAG) const;
 +
 +  // No shift/rotate-with-writeback hardware is exposed yet (see
@@ -3765,6 +3991,12 @@ index 000000000..70a01e52e
 +  MachineBasicBlock *emitIndirectMem(MachineInstr &MI, MachineBasicBlock *MBB,
 +                                      bool IsLoad) const;
 +  MachineBasicBlock *emitCallIndirect(MachineInstr &MI,
++                                       MachineBasicBlock *MBB) const;
++  MachineBasicBlock *emitVLAAlloc(MachineInstr &MI,
++                                   MachineBasicBlock *MBB) const;
++  MachineBasicBlock *emitStackSave(MachineInstr &MI,
++                                    MachineBasicBlock *MBB) const;
++  MachineBasicBlock *emitStackRestore(MachineInstr &MI,
 +                                       MachineBasicBlock *MBB) const;
 +};
 +
@@ -4169,10 +4401,10 @@ index 000000000..4caee1b13
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEINSTRINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.td b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
 new file mode 100644
-index 000000000..81806b758
+index 000000000..3383bb40d
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
-@@ -0,0 +1,562 @@
+@@ -0,0 +1,592 @@
 +//===- EclipseInstrInfo.td - Eclipse Instruction defs ------*- tablegen -*-=//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4453,6 +4685,36 @@ index 000000000..81806b758
 +let usesCustomInserter = 1 in {
 +def PUSH : EclipsePseudo<(outs), (ins GPR:$src), "# PUSH", []>;
 +def POP  : EclipsePseudo<(outs GPR:$dst), (ins), "# POP", []>;
++}
++
++// Variable-length array support: reserves a *runtime*-computed word count
++// on the same hardware stack pointer (memory location 040) SAVE/RTN and
++// the software push/pop machinery above all already share. $wordcount is
++// consumed (its register is read, not preserved) and $dst comes back
++// holding the *old* top-of-stack value, not yet a safe base pointer on
++// its own -- LowerDYNAMIC_STACKALLOC (EclipseISelLowering.cpp) adds 1 to
++// it afterward, as an ordinary ADD reaching normal ISel/regalloc, rather
++// than inside this pseudo's own hand-built expansion, specifically to
++// avoid needing a third scratch register here: only GPR:$dst/$wordcount
++// (i.e. AC0/AC1, the only two allocatable registers) are available, and
++// this expansion already uses both for the actual reservation logic.
++let usesCustomInserter = 1 in
++def VLAALLOC : EclipsePseudo<(outs GPR:$dst), (ins GPR:$wordcount),
++                              "# VLAALLOC", []>;
++
++// clang emits llvm.stacksave/llvm.stackrestore around any lexical block
++// containing a VLA (unconditionally, even when the block can only ever
++// run once and nothing about it strictly needs explicit save/restore) --
++// both are trivial direct reads/writes of the same hardware stack
++// pointer (memory location 040) everything above shares: stacksave
++// captures its current value, stackrestore later overwrites it with a
++// previously-captured one, discarding anything allocated (VLA words
++// included) since the save. No new scratch-register concerns here,
++// unlike VLAALLOC above -- each is a single real instruction once
++// expanded, not a short sequence.
++let usesCustomInserter = 1 in {
++def STACKSAVE_PSEUDO : EclipsePseudo<(outs GPR:$dst), (ins), "# STACKSAVE", []>;
++def STACKRESTORE_PSEUDO : EclipsePseudo<(outs), (ins GPR:$src), "# STACKRESTORE", []>;
 +}
 +
 +let usesCustomInserter = 1 in {
