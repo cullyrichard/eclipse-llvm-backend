@@ -1974,10 +1974,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..99d0587e5
+index 000000000..f0e51446b
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1677 @@
+@@ -0,0 +1,1738 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2249,6 +2249,33 @@ index 000000000..99d0587e5
 +  setLibcallImpl(RTLIB::MEMMOVE, RTLIB::impl_memmove);
 +  setLibcallImpl(RTLIB::MEMSET, RTLIB::impl_memset);
 +  setLibcallImpl(RTLIB::MEMCMP, RTLIB::impl_memcmp);
++
++  // Same "no register class for this width, so the type legalizer
++  // silently expands to an RTLIB::Libcall that then hard-crashes
++  // because nothing's wired up" trap as the float ops above, hit via a
++  // completely different IR pattern: a 32-bit (`long`/`unsigned long`)
++  // `/` or `%`. Only MVT::i16 SDIV/SREM get Custom lowering above (the
++  // native hardware DIV instruction, driven through UDIVrr/UREMrr, is
++  // 16-bit only -- see LowerSDIVREM); MVT::i32 has no register class at
++  // all, so the type legalizer's default int-widening path
++  // (DAGTypeLegalizer::ExpandIntRes_UDIV/SDIV/UREM/SREM) falls straight
++  // through to RTLIB::UDIV_I32/SDIV_I32/UREM_I32/SREM_I32 -- which,
++  // like every other libcall on this target, defaulted to
++  // RTLIB::Unsupported until wired up here. Confirmed empirically: any
++  // program dividing a `long` (e.g. c-testsuite's 00182.c, which
++  // extracts decimal digits from an `unsigned long` via repeated `/10`
++  // and `%10`) crashed llc outright ("LLVM ERROR: unsupported library
++  // call operation") in ExpandIntRes_UDIV -> makeLibCall. eclipse_rt.c
++  // now implements genuine 32-bit long division (__udivsi3/__umodsi3
++  // directly, a restoring shift-subtract bit loop; __divsi3/__modsi3
++  // derived from it with abs-value + conditional-negate sign handling,
++  // the same convention LowerSDIVREM uses for the 16-bit case) -- wiring
++  // the four of them up the same way MEMCPY/the float ops are above
++  // fixes it.
++  setLibcallImpl(RTLIB::UDIV_I32, RTLIB::impl___udivsi3);
++  setLibcallImpl(RTLIB::SDIV_I32, RTLIB::impl___divsi3);
++  setLibcallImpl(RTLIB::UREM_I32, RTLIB::impl___umodsi3);
++  setLibcallImpl(RTLIB::SREM_I32, RTLIB::impl___modsi3);
 +}
 +
 +std::pair<unsigned, const TargetRegisterClass *>
@@ -2454,8 +2481,42 @@ index 000000000..99d0587e5
 +
 +SDValue EclipseTargetLowering::PerformDAGCombine(SDNode *N,
 +                                                  DAGCombinerInfo &DCI) const {
-+  if (N->getOpcode() == ISD::BRCOND)
-+    return combineConstantBrcond(N, DCI.DAG);
++  if (N->getOpcode() == ISD::BRCOND) {
++    if (SDValue Folded = combineConstantBrcond(N, DCI.DAG))
++      return Folded;
++    // A second, distinct shape reaching this same post-Legalize gap
++    // (see the setTargetDAGCombine(ISD::BRCOND) registration comment
++    // in the constructor and combineConstantBrcond above for the first
++    // one): DAGCombiner's final combine pass can rebuild a BRCOND
++    // whose condition is directly a Select/SelectU *machine* node --
++    // LowerSELECT_CC's own already-custom-lowered output -- rather
++    // than a WRAPPER'd constant. Custom lowering's "gets re-invoked
++    // for any brcond node" guarantee (see that same comment) only
++    // actually holds for nodes created *during* the Legalize() pass
++    // itself; one materializing here, in the combine pass that runs
++    // strictly after Legalize() has already finished, never gets a
++    // second chance and reaches ISel unconverted -- confirmed
++    // empirically ("Cannot select: ... brcond ... Select ..."),
++    // first hit compiling c-testsuite's 00182.c (a 32-bit `unsigned
++    // long x` digit-extraction loop: `x == 0` materializes a
++    // Select/SelectU, and DAGCombiner folds it straight into the
++    // loop's own brcond). isMachineOpcode() is the shape check here
++    // for the same reason combineConstantBrcond checks for a
++    // WRAPPER(TargetConstantPool) Cond instead of gating on DCI's
++    // legalization-stage flags: a Select/SelectU machine node, like a
++    // WRAPPER'd constant, only ever exists *after* Custom lowering has
++    // already run once, so this can't misfire on an ordinary brcond
++    // fresh from SelectionDAGBuilder. Reduced exactly the way
++    // LowerBRCOND itself reduces any other Cond -- 'branch if Cond !=
++    // 0', handed to the already-robust LowerBR_CC -- since that's
++    // precisely the lowering this node missed out on.
++    SDValue Cond = N->getOperand(1);
++    if (Cond.isMachineOpcode() &&
++        (Cond.getMachineOpcode() == Eclipse::Select ||
++         Cond.getMachineOpcode() == Eclipse::SelectU))
++      return LowerBRCOND(SDValue(N, 0), DCI.DAG);
++    return SDValue();
++  }
 +
 +  if (N->getOpcode() != ISD::ADD || N->getValueType(0) != MVT::i16)
 +    return SDValue();
@@ -5153,10 +5214,10 @@ index 000000000..9ffc1c1fc
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEMACHINEFUNCTIONINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseRegisterInfo.cpp b/llvm/lib/Target/Eclipse/EclipseRegisterInfo.cpp
 new file mode 100644
-index 000000000..7db6d132a
+index 000000000..17e9403cb
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseRegisterInfo.cpp
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,180 @@
 +//===-- EclipseRegisterInfo.cpp - Eclipse Register Information ----------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -5256,7 +5317,78 @@ index 000000000..7db6d132a
 +    return true; // MI is gone; caller must not touch it further.
 +  }
 +
-+  // LDFI/STFI/STFI-family instructions bake index=2 (AC2/FP-relative)
++  // LDFI/STFI bake index=2 (AC2/FP-relative) into their AsmString, and
++  // real hardware only encodes an 8-bit *signed* displacement for
++  // AC2-relative indexed addressing (-128..127 — dgasm's own "Address
++  // out of range" diagnostic confirms the same bound). A large enough
++  // stack frame (big local arrays, or just many locals) can easily push
++  // a variable's FP-relative displacement past that; when it does,
++  // substituting the raw offset in place like the in-range path below
++  // does produces an instruction dgasm will reject outright (confirmed
++  // against c-testsuite 00128/00143/00200, all of which have large local
++  // frames). Fall back to the same address-materialize-then-indirect-
++  // through-page-zero mechanism the LEAFI case above already uses for
++  // &local, and that LDIND/STIND's emitIndirectMem
++  // (EclipseISelLowering.cpp) already uses for a runtime pointer value:
++  // build the real address (FP + Offset) into a register, stash it in
++  // the shared page-zero `_scratch` word, and access memory through
++  // `@_scratch` indirection — exactly like a runtime pointer, just with
++  // a compile-time-known value playing the role of the pointer.
++  constexpr int64_t MinDisp = -128, MaxDisp = 127;
++  if ((MI.getOpcode() == Eclipse::LDFI || MI.getOpcode() == Eclipse::STFI) &&
++      (Offset < MinDisp || Offset > MaxDisp)) {
++    MachineBasicBlock &MBB = *MI.getParent();
++    const auto &TII = *MF.getSubtarget().getInstrInfo();
++    MachineRegisterInfo &MRI = MF.getRegInfo();
++    DebugLoc DL = MI.getDebugLoc();
++
++    unsigned CPI = MF.getConstantPool()->getConstantPoolIndex(
++        ConstantInt::get(
++            Type::getInt16Ty(MF.getFunction().getContext()), Offset, true),
++        Align(2));
++    Register OffReg = MRI.createVirtualRegister(&Eclipse::GPRRegClass);
++    BuildMI(MBB, MI, DL, TII.get(Eclipse::LDABS), OffReg)
++        .addConstantPoolIndex(CPI);
++
++    bool IsLoad = MI.getOpcode() == Eclipse::LDFI;
++    if (IsLoad) {
++      // Reuse the destination register itself to hold the address while
++      // it's being built (same trick LEAFI uses above) — one fewer
++      // register needed, and its pre-load value is about to be
++      // overwritten by the real result anyway.
++      Register Dst = MI.getOperand(0).getReg();
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::MOVrr), Dst).addReg(Eclipse::AC2);
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::ADDrr), Dst)
++          .addReg(OffReg)
++          .addReg(Dst);
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::STABS))
++          .addReg(Dst)
++          .addExternalSymbol("_scratch");
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::LDABSI), Dst)
++          .addExternalSymbol("_scratch");
++    } else {
++      // A store has no spare register the way a load's destination is
++      // (operand 0 is the value being stored, still needed at the very
++      // end) — but rather than allocate a *second* fresh register for
++      // the address, accumulate FP into OffReg itself in place; only one
++      // new physical register is ever needed live at a time this way,
++      // same register pressure as the load case above and as LEAFI.
++      Register Src = MI.getOperand(0).getReg();
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::ADDrr), OffReg)
++          .addReg(Eclipse::AC2)
++          .addReg(OffReg);
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::STABS))
++          .addReg(OffReg)
++          .addExternalSymbol("_scratch");
++      BuildMI(MBB, MI, DL, TII.get(Eclipse::STABSI))
++          .addReg(Src)
++          .addExternalSymbol("_scratch");
++    }
++    MI.eraseFromParent();
++    return true; // MI is gone; caller must not touch it further.
++  }
++
++  // LDFI/STFI-family instructions bake index=2 (AC2/FP-relative)
 +  // into their AsmString, so eliminating the frame index here just means
 +  // substituting the resolved displacement in place of the operand.
 +  MI.getOperand(FIOperandNum).ChangeToImmediate(Offset);

@@ -1556,6 +1556,94 @@ c-testsuite `00207` passes. Full existing regression suite
 no regressions in float, struct, or hardware-stack (SAVE/RTN)
 handling from this change.
 
+### 20. 32-bit (`long`) division/remainder had no runtime at all -- `llc` hard-crashed (fixed), plus a second, previously-latent "Select feeding a brcond" ISel crash found and fixed alongside it
+
+`ISD::UDIV`/`SDIV`/`UREM`/`SREM` only had `Custom` lowering for
+`MVT::i16` in `EclipseISelLowering.cpp`'s constructor -- the hardware
+`DIV` instruction (driven through `UDIVrr`/`UREMrr`, see
+`LowerSDIVREM`) is 16-bit only. `MVT::i32` (this target's
+`long`/`unsigned long`) has no register class at all, so the type
+legalizer's default int-widening path
+(`DAGTypeLegalizer::ExpandIntRes_UDIV`/`SDIV`/`UREM`/`SREM`) fell
+straight through to `RTLIB::UDIV_I32`/`SDIV_I32`/`UREM_I32`/`SREM_I32`
+-- and like every other libcall on this target before it gets wired
+up, all four defaulted to `RTLIB::Unsupported`. Any program dividing a
+`long` crashed `llc` outright ("LLVM ERROR: unsupported library call
+operation"), reproduced with c-testsuite's `00182.c` (`print_led`,
+which extracts decimal digits from an `unsigned long` via repeated
+`/10` and `%10` in a `while` loop).
+
+**Fix, part 1 (the division libcalls themselves)**: `eclipse_rt.c`
+now implements `__udivsi3`/`__umodsi3` directly -- a restoring
+shift-subtract long-division bit loop, the same style as the existing
+`u32_div10`/`sf_divbits` helpers (every shift is by the compile-time
+constant 1, looped at runtime, since variable-*amount* shifts have no
+lowering on this backend -- confirmed `ISD::SRL_PARTS`/`SHL_PARTS`
+"Cannot select" if attempted directly; see those functions' own
+comments), generalized from `u32_div10`'s fixed divisor of 10 to an
+arbitrary runtime divisor. `__divsi3`/`__modsi3` are derived from the
+unsigned primitive with abs-value + conditional-negate sign handling,
+the same convention `LowerSDIVREM` already uses for the native 16-bit
+case. The remainder comes back through a file-scope static rather
+than an output parameter, for the same reason `u32_div10_rem` does
+(see that variable's comment): writing a 32-bit value through a
+pointer *parameter* is silently discarded on this backend. Wired up
+via `setLibcallImpl` in `EclipseISelLowering.cpp`'s constructor, the
+same way the float libcalls and the memcpy family already are (`RTLIB
+::UDIV_I32 -> RTLIB::impl___udivsi3`, etc. -- confirmed these exact
+`RTLIB::Libcall`/`RTLIB::LibcallImpl` enum names by grepping the
+generated `RuntimeLibcalls.inc` and cross-checking
+`RuntimeLibcalls.td`, not assumed).
+
+**Fix, part 2 (a second, previously-latent crash uncovered by part 1)**:
+wiring up division alone got `00182.c` past its original crash and
+straight into a *different* crash in the same function: "Cannot
+select: ... brcond ... Select ...". This turned out to be the exact
+failure mode entry #14 already diagnosed and partly fixed --
+`DAGCombiner`'s final combine pass (the one that runs *after*
+`Legalize()`, i.e. after this target's `BRCOND` `Custom` lowering
+already had its one chance to run) can rebuild a fresh `ISD::BRCOND`
+node that reaches ISel un-lowered. Entry #14's `combineConstantBrcond`
+only recognizes one specific shape of that problem (a `WRAPPER`'d
+constant-pool condition, from a compile-time-provable `while(1)`-style
+branch); this is a second, structurally different shape of the same
+underlying gap: `x == 0` (a 32-bit comparison, from `00182.c`'s
+`while(x)` digit-extraction loop) lowers through `LowerSELECT_CC` into
+an `Eclipse::Select`/`SelectU` *machine* node, and that combine pass
+folds the machine node straight into the loop's own `brcond` -- a
+shape `combineConstantBrcond`'s `WRAPPER(TargetConstantPool)` check
+doesn't match, so it fell through unconverted.
+
+Fixed the same way entry #14 fixed the first shape: recognize it in
+the existing `ISD::BRCOND` combine (`PerformDAGCombine`) and reduce it
+through the already-robust `LowerBR_CC` path (the same "branch if
+Cond != 0" reduction `LowerBRCOND` itself would have done, had it
+gotten the chance). The check is `Cond.isMachineOpcode() &&
+(Cond.getMachineOpcode() == Eclipse::Select || ... == Eclipse::SelectU)`
+-- an unconditional structural guard, not gated on `DAGCombinerInfo`'s
+legalization-stage flags, for the same reason `combineConstantBrcond`'s
+own `WRAPPER` check isn't either: a `Select`/`SelectU` machine node,
+like a `WRAPPER`'d constant, only ever exists *after* `Custom`
+lowering has already run once, so it structurally cannot misfire on an
+ordinary `brcond` fresh from `SelectionDAGBuilder`.
+
+**Verified**: `00182.c` now compiles, assembles, and runs correctly on
+`eclipseemu`, matching its `.expected` output exactly (via the
+project's standard compile-run-diff harness). Full existing
+`regress_hwstack.sh` regression suite produces byte-identical output
+to a baseline build (`EclipseISelLowering.cpp` reverted to its
+pre-this-change committed state via `git stash`, rebuilt, re-run) --
+including the pre-existing "Step expired" cases (`isr_c_test`,
+`test_fps_add`, `test_fps_md`, `fps_dma_test`), confirmed present in
+that same baseline run too, i.e. not a new regression from this
+change. Full c-testsuite pass count went from 193/220 to 196/220 --
+`00182` confirmed as one of the three; the other two newly-passing
+tests weren't individually root-caused beyond "some other program
+also happened to divide a `long`", since that wasn't required to
+confirm this fix is correct and non-regressing. The remaining 24
+failures (`COMPILE_FAIL`/`MISMATCH`/`TIMEOUT`) are unrelated,
+pre-existing limitations, not investigated further here.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented

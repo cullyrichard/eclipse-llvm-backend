@@ -810,14 +810,19 @@ float atof(const char *s) {
  * saturates to the Inf bit pattern; underflow flushes to zero.
  *
  * Also deliberately avoids native 32-bit `*`/`/` on `long`/`unsigned
- * long` throughout: this target has no i32 multiply/divide either (same
- * README limitation, `__mulsi3`/`__udivsi3` don't exist), so using them
- * here would just trade one missing runtime symbol for another. Multiply
- * and divide are both done as manual bit-loops using only shifts,
- * compares, and add/subtract, which *do* legalize natively (wide
- * integer comparison/add/sub decompose cleanly into 16-bit half
- * operations; multiply and divide don't, which is exactly why they need
- * a libcall in the first place).
+ * long` throughout: at the time this soft-float code was written, this
+ * target had no i32 multiply/divide runtime at all (`__mulsi3`/
+ * `__udivsi3` didn't exist), so using `*`/`/` here would just have
+ * traded one missing runtime symbol for another. `__udivsi3`/
+ * `__umodsi3`/`__divsi3`/`__modsi3` now exist below (see the "32-bit
+ * integer division/remainder" section past print_uint32) — `__mulsi3`
+ * still doesn't. This section's own multiply and divide stay as manual
+ * bit-loops using only shifts, compares, and add/subtract regardless
+ * (no need to churn already-working, already-verified code just to use
+ * the now-available `/`), which *do* legalize natively (wide integer
+ * comparison/add/sub decompose cleanly into 16-bit half operations;
+ * multiply and divide don't, which is exactly why they need a libcall
+ * in the first place).
  *
  * NB: this attached-FPU-device hardware (see fpu_out/fpu_in in
  * test_fps_add.c) uses its own, different floating-point format — none
@@ -1554,6 +1559,91 @@ static int print_uint32(u32 val) {
   }
   putchar('0' + (int)rem);
   return n + 1;
+}
+
+/* --- 32-bit integer division/remainder (RTLIB::UDIV_I32/SDIV_I32/
+ * UREM_I32/SREM_I32, i.e. __udivsi3/__divsi3/__umodsi3/__modsi3) ---
+ *
+ * MVT::i32 has no register class in EclipseISelLowering.cpp (only i16
+ * does), and only i16 SDIV/SREM get Custom lowering there (the
+ * hardware DIV instruction, UDIVrr/UREMrr, is native only for 16-bit
+ * operands — see that file's LowerSDIVREM). Any 32-bit `/` or `%`
+ * (this target's `long`/`unsigned long`) therefore falls through the
+ * type legalizer's default path straight to a libcall, exactly like
+ * every `float` op does — see this file's soft-float section header
+ * comment above for the general mechanism. These four functions are
+ * what was missing (previously: `llc` hard-crashed with "unsupported
+ * library call operation" the moment any program divided a `long`).
+ *
+ * Same restoring shift-subtract long division as u32_div10 above,
+ * generalized to a runtime-variable divisor instead of the
+ * compile-time constant 10 — see u32_div10's own comment for why it's
+ * built this way: each shift is by the compile-time-constant 1,
+ * looped at runtime, never a variable-amount shift (ISD::SRL_PARTS/
+ * SHL_PARTS have no pattern on this backend), and every 32-bit
+ * comparison is routed through a noinline helper (a raw 32-bit
+ * compare feeding a branch/select directly hits a separate "Cannot
+ * select" crash — see the u32_eq/u32_ge/... comment above). The
+ * remainder comes back through a static rather than an output
+ * parameter for the same reason u32_div10_rem does (see that
+ * variable's comment): a 32-bit value written through a pointer
+ * *parameter* is silently discarded on this backend.
+ *
+ * `den == 0` is undefined behavior in C, same as any other target's
+ * __udivsi3/__umodsi3 — not special-cased here.
+ */
+static u32 u32_divmod_rem;
+
+static u32 u32_divmod(u32 num, u32 den) {
+  u32 quotient = 0;
+  u32 rem = 0;
+  u32 mask = 0x80000000UL;
+  int i;
+  for (i = 31; i >= 0; i--) {
+    u32 bit = u32_and_nz(num, mask) ? 1UL : 0UL;
+    mask >>= 1;
+    rem = (rem << 1) | bit;
+    quotient <<= 1;
+    if (u32_ge(rem, den)) {
+      rem -= den;
+      quotient |= 1UL;
+    }
+  }
+  u32_divmod_rem = rem;
+  return quotient;
+}
+
+u32 __udivsi3(u32 num, u32 den) { return u32_divmod(num, den); }
+
+u32 __umodsi3(u32 num, u32 den) {
+  u32_divmod(num, den);
+  return u32_divmod_rem;
+}
+
+/* Signed division/remainder built on the unsigned primitive above,
+ * same sign-handling convention as LowerSDIVREM in
+ * EclipseISelLowering.cpp (this file's C-level equivalent, for the
+ * 32-bit case that backend function can't itself lower): divide/mod
+ * the absolute values, then reapply the sign — quotient is negative
+ * iff exactly one operand was negative, remainder takes the
+ * dividend's sign (C's truncating-division rule). `-(long)LONG_MIN`
+ * overflows a plain negate, so the magnitude is taken the same
+ * "negate without overflowing" way __floatsisf above does it.
+ */
+static u32 i32_mag(long x) {
+  return i32_lt(x, 0) ? (u32)(-(x + 1)) + 1UL : (u32)x;
+}
+
+long __divsi3(long a, long b) {
+  u32 uq = u32_divmod(i32_mag(a), i32_mag(b));
+  int neg = i32_lt(a, 0) != i32_lt(b, 0);
+  return neg ? -(long)uq : (long)uq;
+}
+
+long __modsi3(long a, long b) {
+  u32_divmod(i32_mag(a), i32_mag(b));
+  u32 ur = u32_divmod_rem;
+  return i32_lt(a, 0) ? -(long)ur : (long)ur;
 }
 
 /* print_float split into two functions, communicating through file-scope
