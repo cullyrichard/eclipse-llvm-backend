@@ -3434,10 +3434,10 @@ index 000000000..61a5d8b7e
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.h b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
 new file mode 100644
-index 000000000..8593e9c57
+index 000000000..70a01e52e
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,333 @@
 +//===-- EclipseISelLowering.h - Eclipse DAG Lowering Interface -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -3630,6 +3630,70 @@ index 000000000..8593e9c57
 +      return false;
 +    return TargetLowering::shouldReduceLoadWidth(Load, ExtTy, NewVT,
 +                                                  ByteOffset);
++  }
++
++  // A compile-time-constant `getelementptr(i8, @global, N)` (a struct
++  // field access on a global reached directly, not through a loaded
++  // pointer) is supposed to be constant-folded by generic SelectionDAG
++  // machinery straight into GlobalAddressSDNode's own Offset field
++  // (SelectionDAG::FoldSymbolOffset, called from SelectionDAG::getNode
++  // whenever an ADD has a GlobalAddressSDNode operand) — and
++  // EclipseAsmPrinter.cpp's LEAGA case already correctly turns that
++  // embedded offset into a word-granular address (dividing by 2, exactly
++  // like every other "byte offset -> word offset" fix elsewhere in this
++  // backend). But that fold is gated behind
++  // TargetLowering::isOffsetFoldingLegal's *default* implementation,
++  // which asks TargetMachine::shouldAssumeDSOLocal — and that, in turn,
++  // falls through to `return false` for any GlobalValue that isn't
++  // already marked `dso_local` in the IR *and* whose object format isn't
++  // one of ELF/COFF/MachO/Wasm/XCOFF/GOFF (asserted, but the assert is
++  // compiled out in a release build). This target's triple
++  // (`eclipse-dg-none`) has none of those object formats — dgasm has no
++  // linker, no relocations, no shared libraries, no position-independent
++  // anything — so every global here fell through that default to "not
++  // foldable," and clang -cc1 never emits `dso_local` on this triple
++  // either (confirmed: `@bolshevic = global %struct.ziggy
++  // zeroinitializer` in the generated IR, no `dso_local` keyword).
++  //
++  // The practical effect, confirmed via `llc -debug-only=isel`: a
++  // constant struct-field GEP into a global (`bolshevic.b = 34`) reached
++  // PerformDAGCombine as a genuine, un-folded `ADD(GlobalAddress(bolshevic,
++  // offset=0), Constant(2))` instead of a pre-folded
++  // `GlobalAddress(bolshevic, offset=2)`. PerformDAGCombine's own
++  // "constant offset into a global" guard (see the .cpp, just above the
++  // HALVE emission) *deliberately* leaves such an ADD un-halved — that
++  // guard exists for a different, already-fixed bug (the type legalizer's
++  // own already-word-granular "access word N of an oversized global"
++  // address computation, which must NOT be halved again) — so this ADD
++  // fell through ISel as a plain, unhalved runtime add: `bolshevic + 2`
++  // computed as a raw word-address sum instead of `bolshevic + (2/2)`.
++  // That's off by a factor of 2 in the offset, landing on the *next*
++  // field's word instead of the intended one. It went unnoticed by any
++  // write-then-read-back-the-same-way test (both the errant write and a
++  // subsequent direct-global read compute the identical wrong address,
++  // so they agree with each other) — it only surfaces as a mismatch
++  // against a *different*, correctly-halving access path to the same
++  // field (e.g. reading the same field back through a separate pointer
++  // variable, which reaches PerformDAGCombine's loaded-pointer HALVE case
++  // instead and computes the right address) — exactly the "write and
++  // read of the identical field compute different physical addresses"
++  // symptom this target's DEBUGGING_NOTES.md documents (c-testsuite
++  // 00163/00205).
++  //
++  // Fix: override this rather than touch shouldAssumeDSOLocal or the
++  // triple's object-format classification (both are much bigger-blast-
++  // radius, target-independent-code changes, and this target's own
++  // relocation model is already forced to Reloc::Static
++  // unconditionally — see EclipseTargetMachine.cpp's
++  // getEffectiveRelocModel). On this freestanding, single-binary,
++  // linker-less target every global's address really is known and fixed
++  // at assemble time, with no notion of shared libraries or preemption at
++  // all — the whole DSO-locality question this hook exists to answer
++  // doesn't apply here, so unconditionally reporting every global
++  // foldable is correct, not just expedient.
++  bool
++  isOffsetFoldingLegal(const GlobalAddressSDNode *GA) const override {
++    return true;
 +  }
 +
 +  // Inline asm: the escape hatch for device I/O instructions (SKPDN,

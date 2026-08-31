@@ -1398,6 +1398,72 @@ unmodified pre-change baseline, i.e. pre-existing gaps (no 64-bit integer
 support; no VLA support, both already documented elsewhere in this file)
 this pass simply never touched, not regressions.
 
+### 18. Constant struct-field offset into a *direct* global getting silently un-folded (fixed) — a real but narrower cousin of entry #15's still-open write/read asymmetry
+
+Found while investigating entry #15's HALVE-machinery bugs further.
+Distinct from all four tests still skip-listed for that entry — this
+one specifically covers a global struct field written or read
+*directly* (`bolshevic.b = 34;`), not through an intermediate pointer
+variable (`tsar->b = 34;` where `tsar = &bolshevic;`) — see the
+"scope, precisely" note below for why that distinction matters and
+why this does *not* close out entry #15's own test cases.
+
+**Root cause**: a compile-time-constant `getelementptr(i8, @global,
+N)` (an ordinary struct-field access on a global reached directly) is
+supposed to be constant-folded by generic SelectionDAG machinery
+straight into `GlobalAddressSDNode`'s own `Offset` field, before this
+backend ever sees it as a separate `ADD`. Confirmed via `llc
+-debug-only=isel` that this fold was silently never happening on this
+target at all: `TargetLowering::isOffsetFoldingLegal`'s default
+implementation falls through to `false` here, because this target's
+triple (`eclipse-dg-none`) has none of the object formats
+(ELF/COFF/MachO/Wasm/XCOFF/GOFF) that default check looks for, and
+`clang -cc1` never emits `dso_local` on this triple either.
+
+The practical effect: a constant struct-field GEP into a global
+reached `PerformDAGCombine` as a genuine, un-folded `ADD(GlobalAddress,
+Constant)` instead of a pre-folded `GlobalAddress`-with-offset.
+`PerformDAGCombine`'s own "constant offset into a global" guard
+*deliberately* leaves such an `ADD` un-halved (that guard exists for a
+different, already-fixed bug — the type legalizer's own
+already-word-granular "access word N of an oversized global" address
+computation, which must not be halved again — see entry #12's earlier
+work in this exact function) — so the struct-field byte offset fell
+through ISel as a plain, unhalved runtime add: off by a factor of 2,
+landing on the wrong field's word.
+
+**Fix**: override `isOffsetFoldingLegal` in `EclipseISelLowering.h` to
+unconditionally return `true`, rather than touch
+`shouldAssumeDSOLocal` or the triple's object-format classification
+(both much bigger-blast-radius, target-independent changes affecting
+things well outside this backend). This target's relocation model is
+already forced to `Reloc::Static` unconditionally
+(`EclipseTargetMachine.cpp`), and on this freestanding, linker-less,
+single-binary target every global's address really is known and fixed
+at assemble time — the whole DSO-locality question this hook exists to
+answer doesn't apply here, so reporting every global as foldable is
+correct, not merely expedient.
+
+**Scope, precisely — does NOT fix entry #15's open tests**: verified
+directly that `00163`, `00179`, `00180`, and `00205` (the tests
+skip-listed for entry #15) still fail identically with this fix in
+place. Those all reach the struct field through a *loaded pointer
+variable*, a structurally different DAG shape (the `ADD`'s base
+operand is a value reloaded from its own stack slot, not a direct
+`GlobalAddressSDNode`) that `isOffsetFoldingLegal` has no bearing on —
+entry #15's own writeup already anticipated these might be separate
+mechanisms needing separate fixes ("make the two loaded-pointer-
+derived-from-global write/read paths share one combine rule instead of
+apparently diverging partway through legalization"). This entry closes
+out the *direct*-global-access half of that picture; the
+loaded-pointer half remains open, still skip-listed, still not
+force-fixed given the same fragile history entry #15 documents.
+
+**Verified**: full existing regression pass unchanged (byte-identical
+output on every package example). A new direct-global-struct-field
+repro (`bolshevic.a/.b/.c = 12/34/56;` with no pointer variable
+involved) reads back correctly (`12 34 56`) with this fix in place.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented
