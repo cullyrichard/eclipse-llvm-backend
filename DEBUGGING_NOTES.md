@@ -1921,6 +1921,188 @@ program's real end address by the full margin for this test) — some
 other, pre-existing defect in that large/complex test, not investigated
 further (out of scope for this change).
 
+### 24. Hardware multi-bit shifts via `HXL`/`HXR`, replacing O(Amt) self-add/DIV sequences for the common cases
+
+Every `<<`/`>>` on this backend was O(Amt) (or worse): `LowerShift`
+(`EclipseISelLowering.cpp`) built `SHL` from a chain of up to `Amt`
+self-adds, and `SRL`/`SRA` from a single `UDIV`/`SDIV`-by-`2^Amt` — cheap
+*to write*, but `UDIVrr`'s post-RA expansion
+(`EclipseInstrInfo.cpp::expandPostRAPseudo`) is actually a ~9-real-
+instruction sequence (save AC2/the frame pointer to the hardware stack,
+prime AC0/AC1/AC2, the hardware `DIV` itself, move the result out,
+restore AC2) *regardless of the divisor's value*, since it's one
+hardware division either way — so every `SRL`/`SRA`, even `x >> 1`, paid
+that full cost. Real Eclipse S/140 hardware turns out to have genuine
+multi-bit shift instructions that sidestep both costs for the common
+case, confirmed directly on `eclipseemu` (not just the manual — see
+below), that this backend simply wasn't using yet.
+
+**Verification methodology**: hand-assembled `dgasm` probes (not
+compiler-generated — this backend had no way to emit these instructions
+before this change), loaded via `do <file>.simh` and single-stepped with
+`step 1`/`e AC0` etc., the same way entries #22/#23 verified `EJSR`/
+`ELEF`/`ELDA`/`ESTA`. `org 050` (octal), not `org 50` — see entry #22's
+own note on this exact gotcha, still worth repeating: without the
+leading zero `dgasm` parses it as *decimal*, landing code at a different
+address than `dep PC 50` (octal) expects, silently executing zero-filled
+memory that decodes as an infinite `JMP 0` self-loop.
+
+**What was verified**: only `N=1` of `HXL`/`HXR`/`DHXL`/`DHXR` had been
+checked before this change (in an earlier session, informally). This
+entry checked `N=2,3,4` (and `N=0`) for all four, directly:
+
+- `HXL ac,N` / `HXR ac,N` ("hex shift left/right"): shift accumulator
+  `ac` by `N` *hex digits* — i.e. `4*N` bits — left/right, logical
+  (zero-fill), in one instruction. Confirmed exactly: `AC0=1` then `HXL
+  0,2` → `AC0=0400` (octal) `=256=1<<8`; `HXL 0,3` → `AC0=010000
+  =4096=1<<12`; `HXL 0,4` → `AC0=0` (all 16 bits shifted out of a 16-bit
+  accumulator — expected, and matches the *old* self-add loop's own
+  `Amt>=16` behavior). `HXR` confirmed symmetrically on `AC0=0125715`
+  octal `=0xABCD`: `HXR 0,2` → `0253` octal `=0x00AB` (`0xABCD>>8`);
+  `HXR 0,3` → `012` octal `=0x000A` (`>>12`); `HXR 0,4` → `0` (`>>16`).
+- `DHXL ac,N` / `DHXR ac,N`: the same shift on the 32-bit pair
+  `AC(ac):AC(ac+1)` (`ac`=high word, `ac+1`=low word — matches the `N=1`
+  convention verified earlier). Confirmed the same 4-bit-per-`N` rule
+  *and* correct word-boundary crossing: `AC1=0,AC2=1` (representing
+  `0x00000001`) then `DHXL 1,4` → `AC1=1,AC2=0` (`0x00010000` — the bit
+  correctly moved from the low word into the high word, not lost or
+  duplicated). `DHXR` confirmed the mirror case: `AC0=1,AC1=0`
+  (`0x00010000`) then `DHXR 0,4` → `AC0=0,AC1=1`.
+- `N=0` is **rejected by `dgasm` outright** for all four: `"Immediate out
+  of range. Must be 1-4, got 0"` — a compile-time assembler error, not a
+  silent no-op or garbage result. `LowerShift` never emits `N=0` as a
+  result (skips the instruction entirely when there's no whole hex digit
+  to shift).
+
+All four are logical/zero-fill (no sign extension), matching the S/140
+Programmer's Reference and the earlier `N=1` verification.
+
+**Design** (`EclipseInstrInfo.td`): `HXL`/`HXR` defined exactly like the
+existing `ALCrr` family (`ADD`/`SUB`/etc.) — tied `$dst = $src`,
+accumulate-in-place, plain `AsmString` templates (`"HXL $dst,$n"`) that
+need no custom `AsmPrinter` case at all, since the immediate operand
+prints as a plain decimal integer (`EclipseAsmPrinter::printOperand`'s
+`MO_Immediate` case) and `dgasm` accepts a small decimal `N` directly
+(confirmed by the probes above — no octal needed for these small
+immediates, unlike `org`). `DHXL`/`DHXR` are defined the same shape
+(single `GPR` operand naming only the pair's high register, `ac`, with
+`ac+1` as real hardware's implicit second operand) but **deliberately
+not wired into any `Pat` or codegen path**: this backend has no
+register-pair class (no other paired/32-bit machine-level operation
+exists here — every `i32` op goes through a runtime libcall instead, see
+`eclipse_rt.c`), and with only `AC0`/`AC1` ever handed to the register
+allocator (`AC2`/`AC3` permanently reserved as frame pointer/return
+address), a real pair operation would need the allocator to guarantee
+`$dst`/`$src` land in two *specific, adjacent* physical registers, which
+an ordinary tied `GPR` operand doesn't express or enforce. Using them
+safely needs either a dedicated paired-register class or hand-emitted
+code against hardcoded physical registers outside the normal allocator —
+flagged as real follow-up work, not attempted here given this task's
+time budget and this project's own stated preference for a smaller,
+verified win over a larger, rushed one.
+
+**`LowerShift` rework** (`MVT::i16`, constant amounts only — unchanged):
+
+- `SHL`: `Amt` splits into a whole-hex-digit part (`Amt/4`, always ≤3
+  since this rework caps the effective amount at 16 exactly like the old
+  loop's `I<16` cap, and `HXL`'s own `N` maxes out at 4 anyway) — one
+  `HXL` call — plus the existing self-add chain for the `Amt%4`
+  remainder (0-3 bits, no cheaper option exists: this ISA has no
+  finer-than-4-bit hardware shift). `x << 15` drops from 15 chained
+  `ADDrr` to one `HXL` (12 of the 15 bits) + 3 `ADDrr`; any `Amt>=16`
+  (all bits shifted out) drops from up to 16 `ADDrr` to a single `HXL`.
+  `Amt<4` is untouched — no `HXL` emitted, byte-for-byte the old
+  self-add-only behavior, confirmed no regression there.
+- `SRL`: any `Amt` that's an exact multiple of 4 now uses a single `HXR`
+  instead of the full `UDIVrr` expansion — replacing ~9 real instructions
+  with 1 for the common `>>4`/`>>8`/`>>12` byte/nibble-extraction case.
+  A non-multiple-of-4 `Amt` still goes through `UDIV`: `HXR` for the
+  multiple-of-4 part plus a *separate* `UDIV` for the 1-3-bit remainder
+  would cost strictly *more* instructions than today's single
+  `UDIV`-by-`2^Amt`, since `UDIV`'s expensive save/restore/`DIV`
+  sequence has to run in full regardless of how small its divisor is —
+  confirmed by reading `expandPostRAPseudo` directly rather than assumed.
+- `SRA` deliberately **left unchanged**: `HXL`/`HXR`/`DHXL`/`DHXR` are
+  logical, wrong for a negative operand's sign-preserving shift. The
+  classic `(x<0) ? ~(~x >>u n) : (x >>u n)` trick could let `SRA` reuse
+  the `SRL` win above, but `LowerShift` has already had one real,
+  previously-fixed register-corruption bug from a chained-divisor `SRL`
+  optimization (see this function's own comment, and the "regmd always
+  reads 15" section below for the original bug this fixed) — judged not
+  worth stacking a second risky rework on the same fragile function in
+  one change; left as documented future work.
+- `MVT::i32` (`long`) shifts are untouched: still decomposed into `i16`-
+  pair operations by the generic type legalizer (no register class for
+  `i32` here at all). A direct `DHXL`/`DHXR`-based `i32` `Custom`
+  lowering was considered (this task's stated stretch goal) but hits the
+  same register-pair problem as `DHXL`/`DHXR`'s own TableGen design
+  above, with *zero* spare scratch register once the pair is committed
+  (this backend has exactly two allocatable registers, and the pair
+  would consume both) — not pursued.
+
+**`eclipse_rt.c` investigated, not changed**: `sf_shr`/`sf_shl` (used by
+`sf_add`'s exponent-difference mantissa alignment, and the float↔int
+conversion/`printf` fractional-digit-extraction paths) are runtime-
+*variable*-count 32-bit shifts, done one compile-time-constant-amount
+bit at a time in a C `while` loop — specifically because
+`ISD::SHL_PARTS`/`SRL_PARTS` (a true variable-amount 32-bit shift) has
+no lowering here (confirmed by that function's own existing comment:
+"Cannot select: ... srl_parts ..."). Each individual loop-body shift is
+already the cheap single-bit case this change's `SHL`/`SRL` rework
+doesn't touch (`Amt=1` never reaches the new `HXL`/`HXR` path — `Quads`
+is always 0), so the loop's real cost is per-iteration overhead
+(compare/branch/decrement), not the shift instruction itself — this
+change does not meaningfully speed up that hot loop. A real win would
+need an algorithmic change (count the shift amount up front, one
+`DHXL`/`DHXR` call for the bulk, single-bit correction for the
+remainder), which needs inline asm against hardcoded physical registers
+for the same reason `DHXL`/`DHXR` aren't wired into general codegen
+above — a real, separate, riskier change to a file this project has
+already had to split into multiple smaller functions once just to fit
+frame-offset limits (see `sf_add`'s own header comment). Not attempted;
+recorded here as a legitimate, specific, unpursued follow-up rather than
+silently left for someone to rediscover.
+
+**A pre-existing, unrelated bug found (not caused) while writing this
+change's test coverage**: a battery C probe exercising ~20 different
+shift expressions on locals in one `main()` printed a `long` local's low
+16-bit word as `0` (`123456789` read back as `123404288` — the high word
+correct, only the low word zeroed) — but *only* inside that specific
+larger function; an isolated 4-line reproduction of the exact same
+constant and shift compiled and ran correctly. Confirmed via `git
+stash`/rebuild that this reproduces byte-for-byte on the *unmodified*
+baseline too (same wrong output, same repro), so it predates and is
+unrelated to this change — most likely adjacent to the large-stack-frame
+class of bug entry #21 already fixed one instance of, but not confirmed
+as the same root cause and not investigated further here (out of this
+task's scope). Worked around in this change's own test coverage by
+splitting that one case into its own small function, which does not
+reproduce it.
+
+**Verified**:
+- `eclipseemu`, by hand: all 4 instructions × `N` in `{1,2,3,4}` (`N=1`
+  previously verified, `N=2,3,4` newly verified this change) plus `N=0`
+  rejection, per the "What was verified" section above.
+- Assembly inspection: generated code for constant shift amounts
+  0,1,3,4,5,7,8,12,15 confirms the exact expected instruction sequence
+  (`HXL`/`HXR` alone, `HXL`+remainder `ADDrr`, or the unchanged `UDIV`
+  sequence) for each case, by direct `.s` inspection against the
+  expected `Quads`/`Rem` split.
+- Two hand-written `eclipseemu`-run C probes: `i16`/`i32` `SHL`, `i16`
+  `SRL` (multiple-of-4 and non-multiple), `i16` `SRA` (positive and
+  negative), `i32` `SRL`, `i32` `SRA` (positive and negative) at amounts
+  0/1/3/4/5/7/8/12/15 (`i16`) and 0/1/3/4/8/15/16/20/31 (`i32`) — all
+  correct, byte-for-byte identical to independently (Python-)computed
+  expected output.
+- `regress_hwstack.sh`: identical to a freshly-rebuilt baseline (stashed
+  this change, rebuilt `llc`, re-ran) except for the same benign
+  PC/incidental-disassembly shifts at each `HALT` line seen in entries
+  #22/#23, and the same 4 known/expected `Step expired` cases
+  (`isr_c_test`, `test_fps_add`, `test_fps_md`, `fps_dma_test`).
+- Full c-testsuite: 197/220, `PASS` set diffed directly against the same
+  freshly-rebuilt baseline — identical, zero regressions, zero
+  incidental new passes.
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented

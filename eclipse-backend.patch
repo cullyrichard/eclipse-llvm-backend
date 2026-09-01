@@ -1920,10 +1920,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..87ade562d
+index 000000000..5c2bd5e75
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1744 @@
+@@ -0,0 +1,1809 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2656,12 +2656,14 @@ index 000000000..87ade562d
 +  return DAG.getNode(EclipseISD::WORD_ADD, dl, MVT::i16, Base, Halved);
 +}
 +
-+// No shift/rotate-with-writeback hardware is exposed yet (see README.md —
-+// the base ISA's single-bit rotate-through-carry could build one, but
-+// that's real, separate scope), so sign_extend_inreg from i8 — the ABI's
-+// "truncate a char return value to 8 bits, then sign-extend back" step —
-+// is done with the classic bit trick using only instructions this
-+// backend already has: ((x & 0xFF) ^ 0x80) - 0x80.
++// No *single-bit* shift/rotate-with-writeback hardware is exposed here
++// (see README.md — the base ISA's single-bit rotate-through-carry could
++// build one, but that's real, separate scope; this is a different gap
++// from HXL/HXR/DHXL/DHXR below, which are real but only shift by whole
++// 4-bit hex digits), so sign_extend_inreg from i8 — the ABI's "truncate a
++// char return value to 8 bits, then sign-extend back" step — is done
++// with the classic bit trick using only instructions this backend
++// already has: ((x & 0xFF) ^ 0x80) - 0x80.
 +SDValue EclipseTargetLowering::LowerSIGN_EXTEND_INREG(SDValue Op,
 +                                                       SelectionDAG &DAG) const {
 +  SDLoc dl(Op);
@@ -2688,11 +2690,37 @@ index 000000000..87ade562d
 +  uint64_t Amt = AmtNode->getZExtValue();
 +
 +  if (Op.getOpcode() == ISD::SHL) {
++    // Real Eclipse S/140 hardware has HXL ("hex shift left"), a genuine
++    // one-instruction shift by N *hex digits* (4*N bits, N in 1-4) — see
++    // EclipseInstrInfo.td's HXL/HXR/DHXL/DHXR comment for how this was
++    // verified against eclipseemu (every N in 1-4, not just N=1). Handle
++    // the amount's whole multiple-of-4 part with a single HXL call —
++    // capped at 16 bits, matching the old loop's `I < 16` cap: a 16-bit
++    // accumulator shifted left by 16 or more bits is always 0 regardless
++    // of the exact amount, and HXL's own N maxes out at 4 (=16 bits)
++    // anyway — then fall back to the cheap self-add chain (still the only
++    // way to shift by 1-3 bits: this ISA has no finer-grained hardware
++    // shift) for the remaining 0-3 bits. This changes `x << 15` from 15
++    // chained ADDrr instructions to one HXL (the 12-bit part) plus 3
++    // ADDrr (the 3-bit remainder); `x << 15..16`-equivalent amounts (a
++    // whole 16-bit clear) drop from up to 16 ADDrr to a single HXL. Amt <
++    // 4 (no whole hex digit to shift) skips HXL entirely and is
++    // byte-for-byte the old self-add-only behavior — no regression there.
++    //
 +    // Self-add, chained: each iteration's two operands are both just the
 +    // previous iteration's fresh result — no operand needs to survive
-+    // *across* iterations, so this doesn't hit the bug documented below.
++    // *across* iterations, so this doesn't hit the UDIVrr bug documented
++    // below.
++    uint64_t EffAmt = Amt < 16 ? Amt : 16;
++    uint64_t Quads = EffAmt / 4;
++    uint64_t Rem = EffAmt % 4;
 +    SDValue Result = X;
-+    for (uint64_t I = 0; I < Amt && I < 16; ++I)
++    if (Quads > 0) {
++      SDValue N = DAG.getTargetConstant(Quads, dl, MVT::i16);
++      Result =
++          SDValue(DAG.getMachineNode(Eclipse::HXL, dl, MVT::i16, Result, N), 0);
++    }
++    for (uint64_t I = 0; I < Rem; ++I)
 +      Result = DAG.getNode(ISD::ADD, dl, MVT::i16, Result, Result);
 +    return Result;
 +  }
@@ -2731,9 +2759,46 @@ index 000000000..87ade562d
 +  }
 +
 +  SDValue Divisor = DAG.getConstant(uint64_t(1) << Amt, dl, MVT::i16);
-+  if (Op.getOpcode() == ISD::SRL)
++  if (Op.getOpcode() == ISD::SRL) {
++    // UDIVrr's post-RA expansion (EclipseInstrInfo.cpp's
++    // expandPostRAPseudo) is a genuinely expensive ~9-real-instruction
++    // sequence -- save AC2 (the frame pointer) to the hardware stack,
++    // prime AC0/AC1/AC2, the hardware DIV itself, move the result out,
++    // restore AC2 -- and that cost is the *same* regardless of the
++    // divisor's value, since it's one hardware division either way. HXR
++    // ("hex shift right") is a single real instruction, so any Amt that's
++    // an exact multiple of 4 (a common case: `>>8`/`>>4` byte/nibble
++    // extraction) is a strict, large win to special-case -- one HXR in
++    // place of the entire UDIV expansion. A non-multiple-of-4 Amt still
++    // goes through UDIV: this ISA has no finer-than-4-bit hardware right
++    // shift, and splitting into an HXR for the multiple-of-4 part plus a
++    // *separate* UDIV for the 1-3-bit remainder would cost strictly MORE
++    // instructions than today's single UDIV-by-2^Amt, not fewer, since the
++    // expensive part of UDIV (the save/restore/DIV sequence) still has to
++    // run in full for that remainder regardless of how small its divisor
++    // is.
++    if (Amt > 0 && Amt % 4 == 0) {
++      SDValue N = DAG.getTargetConstant(Amt / 4, dl, MVT::i16);
++      return SDValue(DAG.getMachineNode(Eclipse::HXR, dl, MVT::i16, X, N), 0);
++    }
 +    return DAG.getNode(ISD::UDIV, dl, MVT::i16, X, Divisor);
++  }
 +
++  // SRA (arithmetic right shift) deliberately still goes through the
++  // SDIV/SREM-with-floor-correction path below, not HXR: HXR/DHXR are
++  // logical (zero-fill) shifts, wrong for a negative operand's sign-
++  // preserving shift, and while the classic bit trick
++  // `(x < 0) ? ~(~x >>u n) : (x >>u n)` could let SRA reuse the SRL win
++  // above, that's a materially bigger change to a code path this project
++  // has already found fragile once (the UDIVrr register-corruption bug
++  // documented just above -- a real, previously-fixed bug in this exact
++  // function) for comparatively little payback: SRA is already a single
++  // SELECT_CC-free SDIV+SREM+correction sequence, not obviously hotter in
++  // real programs than SRL, and this backend's own stated discipline is
++  // to verify every hardware-facing change thoroughly rather than stack a
++  // second risky rework on top of a freshly-verified one in the same
++  // change. Left as-is; a future change could revisit this with the same
++  // eclipseemu-verification rigor applied to HXL/HXR above.
 +  assert(Op.getOpcode() == ISD::SRA && "not a shift opcode");
 +  SDValue Zero = DAG.getConstant(0, dl, MVT::i16);
 +  SDValue Q = DAG.getNode(ISD::SDIV, dl, MVT::i16, X, Divisor);
@@ -4414,10 +4479,10 @@ index 000000000..4caee1b13
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEINSTRINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.td b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
 new file mode 100644
-index 000000000..11dde1489
+index 000000000..9cc78dd1e
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
-@@ -0,0 +1,649 @@
+@@ -0,0 +1,711 @@
 +//===- EclipseInstrInfo.td - Eclipse Instruction defs ------*- tablegen -*-=//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4570,6 +4635,68 @@ index 000000000..11dde1489
 +                         [(set GPR:$dst, (ineg GPR:$src))]>;
 +def COMrr : EclipseInst<(outs GPR:$dst), (ins GPR:$src), "COM $src,$dst",
 +                         [(set GPR:$dst, (not GPR:$src))]>;
++
++//===----------------------------------------------------------------------===//
++// Real Eclipse S/140 hardware multi-bit shifts: HXL/HXR ("hex shift left/
++// right") shift a single accumulator by N *hex digits* (i.e. 4*N bits, N in
++// 1-4) in one instruction; DHXL/DHXR do the same to the 32-bit pair
++// AC(ac):AC(ac+1) (ac = high word, ac+1 = low word). All four are logical
++// (zero-fill) — verified against the S/140 Programmer's Reference, and then
++// directly on eclipseemu (not just the manual — see DEBUGGING_NOTES.md):
++// hand-assembled probes for every N in 1-4 confirmed the exact bit count
++// (HXL/HXR: N=1 -> 4 bits ... N=4 -> 16 bits, i.e. shifts the entire
++// 16-bit accumulator out; DHXL/DHXR: same per N, crossing correctly between
++// the pair's two words at N=4 — e.g. DHXL with the pair holding 1 and N=4
++// moved the bit from the low word into the high word). N=0 is REJECTED by
++// dgasm outright ("Immediate out of range. Must be 1-4, got 0") — never
++// emit N=0; callers must instead skip the instruction entirely when there's
++// no multiple-of-4 amount to shift.
++//
++// These replace the O(Amt) self-add chain LowerShift previously used for
++// every `<<` with a single real instruction for the amount's whole
++// multiple-of-4 part (see LowerShift's SHL case) — e.g. `x << 15` used to
++// cost 15 ADDrr instructions; it now costs one HXL (12 of the 15 bits) plus
++// 3 ADDrr for the remainder.
++//
++// HXL/HXR are printed exactly like the ALCrr family above (accumulate/
++// overwrite in place: "OP ac,n" reads and writes the same accumulator) —
++// $dst and $src are tied to the same physical register, matching real
++// hardware's single implicit operand.
++class HexShift<string mnem>
++    : EclipseInst<(outs GPR:$dst), (ins GPR:$src, i16imm:$n), mnem#" $dst,$n",
++                  []> {
++  let Constraints = "$dst = $src";
++}
++
++def HXL : HexShift<"HXL">;
++def HXR : HexShift<"HXR">;
++
++// DHXL/DHXR operate on the pair AC(ac):AC(ac+1), not a single independently
++// allocatable GPR — this backend has no register-pair class (no other
++// paired/32-bit machine-level operation exists here at all; every i32 op
++// goes through a runtime libcall instead, see eclipse_rt.c), and with only
++// AC0/AC1 ever handed to the register allocator (AC2/AC3 are permanently
++// reserved — see EclipseRegisterInfo.td), a real pair operation would need
++// the allocator to guarantee $dst/$src land in two *specific, adjacent*
++// physical registers, which an ordinary tied GPR operand does not express
++// or enforce. So: defined here (real, verified instructions, all four
++// covered by this same DEBUGGING_NOTES.md entry) for future use, but
++// deliberately NOT wired into any Pat or into LowerShift/i32 codegen yet —
++// doing that safely needs either a dedicated paired-register class or
++// hand-emitted code against hardcoded physical registers outside the
++// normal allocator (the same kind of bigger, riskier change this backend's
++// own history warns against rushing — see LowerShift's UDIVrr comment).
++// $dst/$src name only the pair's high register (ac); the low register
++// (ac+1) is real hardware's implicit second operand, not modeled as a
++// separate MachineOperand.
++class DHexShift<string mnem>
++    : EclipseInst<(outs GPR:$dst), (ins GPR:$src, i16imm:$n), mnem#" $dst,$n",
++                  []> {
++  let Constraints = "$dst = $src";
++}
++
++def DHXL : DHexShift<"DHXL">;
++def DHXR : DHexShift<"DHXR">;
 +
 +//===----------------------------------------------------------------------===//
 +// Memory: frame-relative (AC2/FP-relative) and absolute (page-zero)
@@ -6188,10 +6315,10 @@ index 000000000..801225763
 +#endif // LLVM_LIB_TARGET_ECLIPSE_MCTARGETDESC_ECLIPSEMCTARGETDESC_H
 diff --git a/llvm/lib/Target/Eclipse/README.md b/llvm/lib/Target/Eclipse/README.md
 new file mode 100644
-index 000000000..56d37aaf5
+index 000000000..a03ca0994
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/README.md
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,299 @@
 +# The Eclipse LLVM backend
 +
 +An out-of-tree-style LLVM target (`lib/Target/Eclipse`, built via
@@ -6322,9 +6449,23 @@ index 000000000..56d37aaf5
 +  8-bit truncation/extension semantics are real (`LowerSIGN_EXTEND_INREG`
 +  in `EclipseISelLowering.cpp`).
 +- **`<<`/`>>`**, including arithmetic right-shift of negative values —
-+  built from self-add/UDIV/SDIV-with-floor-correction loops
-+  (`LowerShift`), since the ISA exposes no shift/rotate-with-writeback
-+  instruction. Constant shift counts only.
++  constant shift counts only (no variable-count shift/rotate-with-
++  writeback instruction is exposed). `<<` and the common multiple-of-4
++  case of unsigned `>>` use real Eclipse S/140 hardware, `HXL`/`HXR`
++  ("hex shift left/right" — one instruction shifts by N hex digits, i.e.
++  4*N bits, N in 1-4; verified against eclipseemu for every N, see
++  `EclipseInstrInfo.td`), which this backend didn't use at all until
++  now: e.g. `x << 15` used to cost 15 chained self-adds, now costs one
++  `HXL` plus 3 self-adds for the 3-bit remainder, and `x >> 8`/`x >> 4`
++  drop from the full multi-instruction hardware-`DIV` sequence
++  (`UDIVrr`'s post-RA expansion) to a single `HXR`. A non-multiple-of-4
++  `>>`, and every arithmetic `>>` (`HXL`/`HXR` are logical/zero-fill,
++  not sign-preserving), still go through the previous UDIV/SDIV-with-
++  floor-correction sequence (`LowerShift`). `DHXL`/`DHXR` (the same
++  shift on the 32-bit accumulator pair `AC(ac):AC(ac+1)`) are defined
++  and verified too but not yet wired into any codegen path — see
++  `LowerShift`'s comment for why (no register-pair class exists here,
++  and the whole register file is only two scratch accumulators).
 +- **Signed and unsigned `*`/`/`/`%`.** `MUL`/`DIV` are zero-operand
 +  hardware instructions operating on `AC0:AC1:AC2`; expansion happens
 +  *post*-register-allocation (`EclipseInstrInfo::expandPostRAPseudo`), not
@@ -6414,7 +6555,25 @@ index 000000000..56d37aaf5
 +  soft-float path above) is future work requiring the same
 +  `eclipseemu`-verification methodology as `ECLIPSE_ISA_NOTES.md`.
 +- **Variable shift counts are not supported** (`LowerShift` handles
-+  constant counts only — `report_fatal_error`s otherwise).
++  constant counts only — `report_fatal_error`s otherwise). The real
++  `HXL`/`HXR`/`DHXL`/`DHXR` hardware shift instructions this backend now
++  uses for constant `<<`/multiple-of-4 `>>` (see the `<<`/`>>` bullet
++  above) don't change this: their own shift-count operand is a hardware
++  immediate (1-4), not a register, so they can't lower a runtime-
++  variable count either. `eclipse_rt.c`'s soft-float mantissa
++  alignment/normalization (`sf_shr`/`sf_shl`) is the main place this
++  would matter — it does a *runtime*-variable-count shift one
++  compile-time-constant-amount bit at a time in a C loop specifically to
++  work around this gap (see that function's own comment) — investigated
++  as part of the `HXL`/`HXR` work but not changed: each loop iteration's
++  individual shift is already the cheap single-bit case, so the loop's
++  real cost is per-iteration overhead (compare/branch/decrement), not
++  the shift instruction itself, and wiring `DHXL`/`DHXR` into it directly
++  would need inline asm against hardcoded physical registers (no
++  register-pair class exists, and the pair would consume the *entire*
++  two-register scratch file, leaving nothing for the surrounding
++  computation) — a real, separate, riskier change to an already fragile
++  file, not attempted here.
 +- **No tail calls, single-word return values only.** (Varargs *are*
 +  supported — real `va_start`/`va_arg`/`va_end`, which is what
 +  `printf`/`scanf` are built on.)
