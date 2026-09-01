@@ -2,7 +2,16 @@
 # eclipse-cc: compile one or more C source files to a runnable dgasm/
 # eclipseemu program for the Data General Nova/Eclipse LLVM backend.
 #
-# Usage: eclipse-cc [-o out.simh] file.c [file.c ...]
+# Usage: eclipse-cc [-o out.simh] [--hwfloat] file.c [file.c ...]
+#
+# --hwfloat: opt-in, additive real-hardware-FPU float add/subtract (see
+# the LLVM backend's Eclipse.td FeatureHWFloat and rt/eclipse_hwfloat.s
+# in this directory). Every invocation *without* this flag -- which is
+# every existing use of this script -- is completely unaffected: same
+# `-mattr=` (none), same runtime sources, same generated code, byte for
+# byte. See rt/eclipse_hwfloat.s's own header comment for the full
+# design and DEBUGGING_NOTES.md for the reverse-engineering/verification
+# behind it.
 #
 # Pipeline: clang -cc1 (one .ll per source, incl. the runtime library) ->
 # llvm-link (merge into one module) -> opt -internalize,globaldce (strip
@@ -23,18 +32,33 @@ LLC="$LLVM_BUILD/bin/llc"
 LLVM_LINK="$LLVM_BUILD/bin/llvm-link"
 OPT="$LLVM_BUILD/bin/opt"
 RT_SRC="$SCRIPT_DIR/rt/eclipse_rt.c"
+HWFLOAT_SRC="$SCRIPT_DIR/rt/eclipse_hwfloat.s"
 REORDER="$SCRIPT_DIR/reorder_asm.py"
 TRIPLE="eclipse-dg-none"
 RESOURCE_DIR="$("$CLANG" -print-resource-dir)"
 
 out="a.simh"
+hwfloat=0
 sources=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
+    --hwfloat) hwfloat=1; shift ;;
     *) sources+=("$1"); shift ;;
   esac
 done
+
+# clang-side flags, only meaningful for future Clang-level uses of this
+# feature (nothing in the current implementation reads it there -- the
+# actual libcall-selection decision is entirely llc/subtarget-side, see
+# EclipseSubtarget.cpp/EclipseISelLowering.cpp) -- passed anyway so
+# `-target-feature` and `-mattr` never drift out of sync with each other.
+cc1_hwfloat_flags=()
+llc_hwfloat_flags=()
+if [ "$hwfloat" -eq 1 ]; then
+  cc1_hwfloat_flags=(-target-feature +hwfloat)
+  llc_hwfloat_flags=(-mattr=+hwfloat)
+fi
 
 if [ ${#sources[@]} -eq 0 ]; then
   echo "eclipse-cc: no input files" >&2
@@ -64,6 +88,7 @@ compile_one() {
   "$CLANG" -cc1 -triple "$TRIPLE" -nostdsysteminc \
     -isystem "$RESOURCE_DIR/include" \
     -I "$SCRIPT_DIR/rt/include" -I "$SCRIPT_DIR/rt" \
+    "${cc1_hwfloat_flags[@]}" \
     -emit-llvm "$src" -o "$ll"
   ll_files+=("$ll")
 }
@@ -123,7 +148,19 @@ build_and_assemble() {
     "$merged" -o "$stripped"
 
   local asm="$work/out.s"
-  "$LLC" -mtriple="$TRIPLE" -filetype=asm "$stripped" -o "$asm"
+  "$LLC" -mtriple="$TRIPLE" "${llc_hwfloat_flags[@]}" -filetype=asm "$stripped" -o "$asm"
+
+  # --hwfloat: append the hand-written __addsf3_hw/__subsf3_hw assembly
+  # (see rt/eclipse_hwfloat.s's own header comment) onto llc's own
+  # output before reorder_asm.py runs, so its `var` lines get hoisted
+  # to page-zero exactly like every compiler-emitted one -- reorder_asm.py
+  # is pure line-oriented text manipulation with no dependency on where a
+  # line originally came from (see its own header comment). Only ever
+  # applies to programs actually built with --hwfloat; every other build
+  # never touches $asm here at all.
+  if [ "$hwfloat" -eq 1 ]; then
+    cat "$HWFLOAT_SRC" >> "$asm"
+  fi
 
   local reordered="$work/out_r.s"
   python3 "$REORDER" "$asm" "$reordered"

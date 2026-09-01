@@ -2498,6 +2498,324 @@ commit stages only the hunks described above, verified with `git diff
 --cached` before committing, leaving the concurrent work uncommitted for
 its own session to land.)
 
+### 27. Real Eclipse S/140 hardware FPU support (`--hwfloat`), opt-in and additive — float add/subtract via FAS/FSS instead of software libcalls
+
+This is the "unrelated opt-in hardware-floating-point change" entry #26
+mentioned working concurrently alongside. Background: this target has
+implemented `float`/`double` entirely in software since the "soft
+float" work (see `SOFT_FLOAT_NOTES.md`) — every `+`/`-`/`*`/`/` is a
+real C function call, measured at roughly 5,000 real machine
+instructions per single `float` multiply. `EclipseISelLowering.h`'s own
+header comment used to say plainly that this backend "does not
+hand-encode ... Eclipse FPU opcodes" because "nothing here would be
+empirically verified against real hardware the way eccc's ISA facts
+are." This entry changes that, but narrowly and only opt-in: real
+Eclipse S/140 hardware FPU instructions now implement `float`
+add/subtract when a program is compiled with a new `--hwfloat` flag;
+every invocation without that flag — which is every existing use of
+this toolchain — is byte-for-byte unaffected, verified below.
+
+**1. The hardware is real, and genuinely separate from the already-
+documented FPS100.** This project's Background section documents an
+*external* FPS100 I/O-device coprocessor at device code `054` that
+`eclipseemu` cannot simulate at all (device `054` isn't implemented),
+making that whole path unverifiable except on real hardware. The
+Eclipse S/140 CPU turns out to *also* have a genuine CPU-native FPU —
+real instructions, a real register file (`FPAC0`-`FPAC3`, readable via
+eclipseemu's `e FPAC0` etc., distinct from the integer `AC0`-`AC3`) —
+that `eclipseemu` *does* simulate (partially — see point 3). Confirmed
+`dgasm -t eclipse_s140` recognizes `FAD`/`FSD`/`FMD`/`FDD` (double-
+precision add/sub/mul/div), `FAS`/`FSS`/`FMS`/`FDS` (single-precision),
+`FLDD`/`FSTD`/`FLDS`/`FSTS` (load/store), `FCMP`, `FMOV`, `FNEG`,
+`FEXP`, `FLAS`/`FFAS` (int↔float conversion) as real mnemonics; many
+plausible-looking alternates (`FSB`, `FDV`, `FLD`, `FST`, `FIX`, `FLT`,
+`FABS`, `FCMPS`, `FCMPD`, ...) are rejected outright. Cross-cautionary
+finding from the same probing session: a fifth-seeming-plausible
+mnemonic, `DLSH`, assembles fine but is a genuine silent no-op in
+`eclipseemu` — a direct instance of this project's own standing
+warning ("not everything `dgasm` accepts is necessarily implemented by
+`eclipseemu`") that motivated verifying every instruction end-to-end
+below rather than trusting assembly success alone.
+
+**2. Number format: IBM System/360-style hex float (reverse-
+engineered, not assumed).** Secondhand web research suggested Nova/
+Eclipse-family FPUs follow the IBM S/360 convention (sign bit + 7-bit
+exponent in excess-64 notation over powers of *16* + a mantissa
+normalized to a hex-digit/4-bit boundary, not IEEE's single-bit
+normalization) — plausible but unconfirmed going in. Verified directly:
+independently derived the encoding for `1.0`/`2.0`/`3.0`/`0.5`/etc.
+from the hypothesis (`1.0 = 0x41100000`, matching the well-known real
+S/370 constant), then hand-assembled a probe (`FLDS 0,val1_hi` /
+`FLDS 1,val2_hi` / `FAS 0,1` / `FSTS 1,result_hi`, `org 050`, single-
+stepped and inspected via `e FPAC0`/`e FPAC1` in `eclipseemu`) and
+confirmed the hardware computes bit-exact correct sums for ~14 value
+combinations, including negative operands and results (`-0.125+-0.875
+= -1.0`, `1000.0+-999.0 = 1.0`, `-1.0+1.0 = 0.0`, ...). The hypothesis
+is confirmed, not merely plausible.
+
+**Real dgasm gotcha found along the way, unrelated to the FPU itself:**
+`var` octal literals need an explicit leading `0` digit to be parsed as
+octal at all (C-style convention) — a value whose top bit is set (any
+negative-signed word, e.g. a negative float's high word) formatted as
+a bare 6-digit octal string with no natural leading zero (e.g.
+`140460`) gets silently re-parsed as *decimal* instead, producing a
+completely different bit pattern (`140460` intended as octal
+`0xC130` came back as `022254` — decimal `100000`'s mod-65536 wraparound
+`34464`, which *is* `0103240` octal — confirmed by testing a battery of
+`var x = <literal>` / `LDA 0,x` round-trips: every value below
+`0100000` (no natural ambiguity) round-tripped correctly; every one at
+or above it silently corrupted, and adding the leading `0` fixed every
+case). This produced a very convincing false trail early on — a run of
+`FAS` probes with negative operands looked exactly like broken hardware
+add/subtract until this was isolated with a plain integer `LDA`/`STA`
+round-trip that had nothing to do with the FPU at all.
+
+**3. Multiply/divide are NOT usable on `eclipseemu` — probed and
+confirmed broken there, not just "not attempted."** `FMS`/`FDS` (and
+the FPAC-by-memory form, `FMMS`) assemble and execute (real PC
+advancement, no crash) but always leave the destination `FPAC` at
+exactly zero regardless of operand values — confirmed with `2×2`,
+`1×1`, `2×3`, `2×-2`, `8÷2`, `1÷1`, and both `FMS 0,1`/`FMS 1,0`
+operand orderings, every one landing on hard zero. This is the same
+class of finding as `DLSH` above: real hardware per the manual, not
+correctly simulated on this specific `eclipseemu` build. `FLAS`/`FFAS`
+(int↔float conversion) assembled but showed operand-encoding-dependent,
+inconsistent behavior across otherwise-equivalent invocations (e.g.
+`FFAS 1,0` returning a correct result in one context and nothing in
+another, depending on which physical `FPAC` actually held live data) —
+not trusted, left unused. Neither gap blocks this entry's scope: only
+`ADD_F32`/`SUB_F32` are hardware-accelerated; `MUL_F32`/`DIV_F32` and
+int↔float conversion stay on the existing software libcalls
+unconditionally, exactly as the task anticipated as an acceptable
+fallback for exactly this situation.
+
+**4. Design: alternate libcall implementation, not SelectionDAG-level
+Custom lowering.** `float` has no register class on this backend at
+all (`MVT::f32` is never legal — see `EclipseISelLowering.h`), so a
+genuine Custom-lowered `ISD::FADD`/`ISD::FSUB` was never really on the
+table: LLVM's type legalizer "softens" any operation on an illegal
+float type into a libcall *before* per-operation legality is ever
+consulted, and building a real `f32` register class (plus the register-
+pair allocation machinery this backend has explicitly avoided even for
+its existing `i32` support) was assessed as materially higher-risk than
+needed. Instead: a new `hwfloat` `SubtargetFeature` (`Eclipse.td`,
+`FeatureHWFloat`, off by default) swaps which `RTLIB::LibcallImpl`
+`ADD_F32`/`SUB_F32` resolve to — `__addsf3_hw`/`__subsf3_hw` (new,
+hand-written-assembly alternates, `rt/eclipse_hwfloat.s`) instead of
+the existing software `__addsf3`/`__subsf3` — set in *two* places
+(`EclipseISelLowering.cpp`'s constructor and
+`EclipseSubtarget::initLibcallLoweringInfo`, exactly like every other
+libcall this backend wires up — see that method's own comment for why
+both copies are needed) based on `STI.hasHWFloat()`. This exactly
+mirrors a real, existing upstream LLVM pattern: `RuntimeLibcalls.td`
+already has ARM's own `__addsf3vfp`/`__subsf3vfp`/etc. — alternate
+libcall implementations for an optional hardware-FPU path, selected the
+same way. `__addsf3_hw`/`__subsf3_hw` needed adding to
+`RuntimeLibcalls.td` itself (a small, additive, low-risk change — two
+new `def`s next to the existing `__addsf3`/`__subsf3`, following that
+exact file's own established pattern).
+
+Confirmed the feature genuinely only changes what it should:
+
+```
+$ llc -mtriple=eclipse-dg-none -filetype=asm sanity_add.ll   # no -mattr
+	EJSR __addsf3,0
+	EJSR __subsf3,0
+	EJSR __mulsf3,0
+$ llc -mtriple=eclipse-dg-none -mattr=+hwfloat -filetype=asm sanity_add.ll
+	EJSR __addsf3_hw,0
+	EJSR __subsf3_hw,0
+	EJSR __mulsf3,0                     # unchanged -- no hardware multiply
+```
+
+— `diff`ing the two `.s` files shows *only* those two `EJSR` targets
+change; every other instruction is byte-identical.
+
+**5. `EclipseSubtarget`'s member-construction order needed fixing for
+the feature bit to be visible in time.** `TLInfo` (`EclipseTargetLowering`,
+which reads `STI.hasHWFloat()` in its own constructor to pick the
+libcall) is constructed in `EclipseSubtarget`'s member-initializer
+list — but `ParseSubtargetFeatures` (which sets `HasHWFloat`) used to
+run from the constructor *body*, always *after* every member is already
+constructed. `TLInfo` would have always seen `HasHWFloat == false`
+regardless of `-mattr=`. Fixed with the standard LLVM idiom other
+subtargets use for the same problem: an `initializeSubtargetDependencies`
+helper that runs `ParseSubtargetFeatures` first and returns `*this`,
+called from the *first* member's own initializer (`InstrInfo`'s) so it
+completes before any later member — `TLInfo` included — is constructed.
+
+**6. Hand-written assembly, and the calling-convention gotchas that
+came with it.** The LLVM backend has no SelectionDAG support for
+emitting `FLDS`/`FAS`/`FSTS` (per point 4) and Clang has no inline-asm
+support for this target, so `__addsf3_hw`/`__subsf3_hw` are hand-
+written directly against the real ISA (`rt/eclipse_hwfloat.s`) and
+textually appended to `llc`'s own output by `eclipse-cc` (only when
+`--hwfloat` is passed) before `reorder_asm.py` runs — safe because
+`reorder_asm.py` is pure line-oriented text manipulation, agnostic to
+where a line originally came from. Making a hand-written function
+correctly *callable* by real compiler-generated code (and able to
+itself call real compiled C helpers — see point 7) needed the calling
+convention nailed down precisely, and two non-obvious parts of it were
+gotten wrong on the first attempt, both found via hand-assembled
+verification harnesses (never assumed from reading `LowerCall`'s
+source):
+
+- **Page-zero addressing.** `reorder_asm.py`'s `PZ_VAR_RE` only hoists
+  `var` lines matching the *compiler's own* pointer-slot/constant-pool
+  naming (`*_SLOT`/`*_PTR`/`*_offN`/`CPI<n>_<m>`) into page-zero; this
+  file's own `__hwf_*` scratch words are ordinary "bulk" data left
+  wherever they land — far past page-zero's 0-255 range on any
+  nontrivial linked program. A plain `LDA`/`STA` can only reach
+  page-zero; confirmed empirically ("Address out of range. Got 5368,
+  should be 0-255") the first time this file used them against its own
+  scratch. Fixed by using `ELDA`/`ESTA` (the same extended/absolute
+  addressing the compiler's own code already uses for every other bulk
+  global) for every access to `__hwf_*`. `FLDS`/`FSTS` themselves need
+  no such fix — confirmed via the same probe that they reach the full
+  address space natively (no assembler complaint against a `__hwf_*`
+  operand thousands of words past page-zero), consistent with them
+  being genuine 2-word extended-addressing instructions in their own
+  right.
+- **Word order and argument order, two separate and easy-to-conflate
+  gotchas.** (a) A 32-bit *value's* two words are pushed/read LOW word
+  first, HIGH word second (parameters) — the opposite of the natural-
+  looking assumption — while a *return* value comes back the other way,
+  AC0 = HIGH, AC1 = LOW. Confirmed with a dedicated, assumption-free
+  probe: two trivial C functions, `get_hi16(x)`/`get_lo16(x)`, called
+  with two distinguishable pushed words (`0xAAAA` then `0xBBBB`) —
+  `get_hi16` came back `0xBBBB` (the *second*-pushed word), `get_lo16`
+  came back `0xAAAA` (the *first*), unambiguously fixing which is
+  which. (b) For a *multi-argument* call, arguments are pushed
+  **right-to-left** — `SOFT_FLOAT_NOTES.md` already said this about the
+  software stack in general, but it's easy to read past as a detail
+  that wouldn't matter for a 2-argument function specifically; it does.
+  For `f(a, b)`, the *second* source argument (`b`) is pushed first
+  (lands at `FP-8`/`FP-7`), the *first* (`a`) second (`FP-6`/`FP-5`).
+  Confirmed empirically by deliberately reversing a hand-assembled test
+  harness's push order for a direct call to `__subsf3_hw` and
+  reproducing the *exact* same wrong-sign bug described next.
+
+Getting (b) backwards doesn't fail loudly. `__addsf3_hw` is commutative
+(`a+b == b+a`), so which physical slot is "a" and which is "b" is
+invisible there — every add-only test passed on the first try. It only
+surfaced as a bug in `__subsf3_hw`, which silently computed `b-a`
+instead of `a-b` for every call with two genuinely different operands
+that reached this code path at all — and even that was initially
+masked: a standalone `float d = 12.5f - 4.25f;` (both literal constants)
+gave the *correct* answer, because Clang's frontend constant-folds a
+literal-literal subtraction at parse time, before `--hwfloat` or
+`__subsf3_hw` ever enter the picture — so the very first "does subtract
+work" test looked like a pass while testing nothing. The bug only
+showed up once real *variables* were subtracted (`float x=12.5f,
+y=4.25f; float r = x - y;` — the smallest possible repro, no reuse or
+sequencing needed at all). Diagnosed by decisively ruling out every
+other candidate first, each with its own direct probe: the IEEE↔hex-
+float conversion functions (point 7) round-trip-verified correct in
+isolation when called from ordinary compiled C; `FLDS`/`FAS`/`FSTS`
+verified correct with large ("bulk") addresses; the `FSS` instruction's
+own `FPAC1 -= FPAC0` semantics re-verified with a clean, assumption-free
+harness (`FLDS 0,A / FLDS 1,B / FSS 0,1` → result `= B - A`, checked
+both operand-value orderings); and finally the actual compiled call
+site for `x - y` hand-traced address-by-address through `main`'s own
+(fairly involved, large-frame, indirectly-addressed) generated code,
+confirming the *caller* really does push `x` before `y` — which, given
+the right-to-left convention above, means `x` (the first source
+argument) lands in the *second* argument slot, not the first. Fixed by
+swapping which parameter offset (`FP-8`/`FP-7` vs `FP-6`/`FP-5`) this
+file reads into its own `__hwf_a_*`/`__hwf_b_*` scratch, in both
+`__addsf3_hw` and `__subsf3_hw` (the fix is invisible for `__addsf3_hw`,
+as expected, but was applied there too since it's the same genuine ABI
+fact either way).
+
+**7. IEEE-754 ↔ hex-float bridge — the format stays IEEE-754
+everywhere else.** This target's `float` ABI, `printf`/`print_float`,
+struct layout, and the existing software `__addsf3`/etc. all use
+IEEE-754 single precision, unconditionally, unchanged by this feature.
+Only `__addsf3_hw`/`__subsf3_hw`'s own bodies know the hardware's
+native hex-float format exists: two new C functions,
+`ieee754_to_hexfloat32`/`hexfloat32_to_ieee754` (`eclipse_rt.c`, non-
+static so the hand-written assembly can call them by name — see that
+file's own comment on why), convert at each function's entry/exit.
+Pure integer bit manipulation (no floating point involved in the
+conversion itself) — extract sign/exponent/mantissa, align the binary
+mantissa to a 4-bit (hex-digit) boundary via `e = ceil((E+1)/4)`,
+round-to-nearest at the alignment shift, renormalize on carry-out,
+re-pack. Ported from a standalone Python implementation checked against
+24 test values (bit-exact for every value with a clean hex-float
+representation; ~1e-5 relative rounding difference for the couple of
+values needing more precision than hex float's 4-bit exponent
+granularity can represent exactly — an inherent "wobble" property of
+the *format itself*, not a conversion bug, consistent with hex-float's
+well-documented reduced effective precision versus IEEE binary). Two
+implementation constraints already established elsewhere in this file's
+soft-float section applied directly: variable-*amount* shifts on a
+32-bit value lower to `SRL_PARTS`/`SHL_PARTS`, which this backend can't
+select — used the existing `sf_shl`/`sf_shr` bit-at-a-time helpers
+instead of a raw `<<`/`>>` with a runtime amount; and a raw 32-bit
+comparison used directly in a branch condition crashes ISel — used the
+existing `u32_eq`/`u32_lt`/`u32_ge` non-inlined-function-call helpers
+for every 32-bit comparison, mirroring `sf_normalize`'s own
+already-proven pattern exactly.
+
+**8. Verification results.**
+
+*Feature OFF (default, every existing invocation)* — required to be
+byte-for-byte unchanged:
+- `regress_hwstack.sh`: every example clean-HALTs with correct output,
+  plus exactly the 4 known/expected "Step expired" cases (`isr_c_test`,
+  `test_fps_add`, `test_fps_md`, `fps_dma_test`) — unchanged from
+  baseline.
+- Full c-testsuite: **197/220** — unchanged from the documented floor.
+- `sanity_add.s` `diff` (point 4): confirms zero codegen difference
+  anywhere outside the two libcall symbol names, for a program that
+  doesn't even use `--hwfloat`.
+
+*Feature ON* (`examples/test_hwfloat.c`, compiled with
+`eclipse-cc --hwfloat`, run on real `eclipseemu`) — whole numbers,
+negative operands, values crossing to negative, zero (including
+`-5.0 - -5.0`), fractional values, and division-then-hardware-subtract
+(`1/4 - 1/8`), plus the reused-variable regression case from point 6:
+
+```
+16.750000   (12.5 + 4.25)
+8.250000    (12.5 - 4.25)
+-1.500000   (-3.5 + 2.0)
+-5.500000   (-3.5 - 2.0)
+-899.000000 (100.0 - 999.0)
+0.000000    (0.0 + 0.0)
+0.000000    (-5.0 - -5.0)
+0.125000    (0.0625 + 0.0625)
+0.125000    (1/4 - 1/8, software divide + hardware subtract)
+16.750000   (x + y, reused variables)
+8.250000    (x - y, reused variables -- was -8.25 before the fix)
+```
+
+— all correct, and (compiled *without* `--hwfloat`, same source)
+byte-identical output from the unmodified default software path.
+
+**9. Known gap, pre-existing and unrelated — not fixed here.** While
+building the reused-variable regression test, a genuine, *pre-existing*
+bug surfaced: `static float ga = 12.5f; static float gb = 4.25f;`
+(file-scope float globals, as opposed to locals) print `0.000000` for
+both `ga+gb` and `ga-gb` — confirmed present with `--hwfloat` off too
+(plain default software float), so this predates and is unrelated to
+this entry's work. Left unfixed and out of scope: this entry's mandate
+is float add/subtract via real hardware, opt-in and additive, with the
+existing software path byte-for-byte preserved — a pre-existing
+software-float bug is explicitly a "leave it exactly as it already
+behaves" case, not something to fix incidentally. Flagged here as a
+real, reproducible follow-up for whoever picks up global float support
+next; not reproducible with function parameters or ordinary locals,
+only file-scope `static`/global `float` variables specifically.
+
+**Page-zero cost**: `__addsf3_hw`/`__subsf3_hw`'s own `EJSR`/`ISZ`/`DSZ`
+call-site bookkeeping costs nothing beyond what any other function call
+already costs (the shared `_SP`-equivalent hardware-stack-pointer
+mechanism, not per-callee state) — their `__hwf_*` scratch is
+deliberately bulk, not page-zero (point 6), specifically so this
+feature doesn't compete for the shared 256-word budget at all when
+enabled.
+
 ## Reproducing the eclipseemu-only verification steps
 
 None of these require real hardware or a working FPU simulation — they

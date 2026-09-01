@@ -28,6 +28,35 @@ Printing a `float` is `print_float(f)` (declared in `stdio.h`), **not**
 for why that's a deliberate, budget-driven design choice, not a missing
 feature.
 
+## Optional hardware-accelerated path (`--hwfloat`)
+
+Everything above is the **unconditional default** — it's what every
+existing invocation of this toolchain gets, unchanged, whether or not
+you've read this section. Separately, this target's Eclipse S/140 CPU
+turns out to have a genuine hardware FPU (distinct from, and much more
+usable than, the external FPS100 I/O-device coprocessor documented in
+`DEBUGGING_NOTES.md`'s Background section — `eclipseemu` cannot
+simulate the FPS100 at all, but does simulate the CPU-native FPU).
+Passing `--hwfloat` to `eclipse-cc` (or `-mattr=+hwfloat` to `llc`
+directly) swaps `float` `+`/`-` specifically over to real `FAS`/`FSS`
+hardware instructions instead of the software `__addsf3`/`__subsf3`
+above — see `rt/eclipse_hwfloat.s` and `DEBUGGING_NOTES.md`'s entry on
+this feature for the full design, the reverse-engineered hardware
+number format (IBM System/360-style hex float, *not* IEEE — bridged
+transparently at the `__addsf3_hw`/`__subsf3_hw` boundary, so `float`'s
+storage format/ABI stays IEEE-754 everywhere else regardless of this
+flag), and the calling-convention gotchas found getting it right.
+
+`*`, `/`, comparisons, and int↔float conversion are **not** covered by
+`--hwfloat` — this target's real hardware multiply/divide instructions
+(`FMS`/`FDS`) were probed and found not correctly simulated by
+`eclipseemu` (they execute without error but always zero their
+destination), and hardware int↔float conversion (`FLAS`/`FFAS`) showed
+unreliable, operand-encoding-dependent behavior. Those five operations
+keep using the software implementation above unconditionally, with or
+without `--hwfloat` — a documented, deliberate scope limit, not an
+oversight.
+
 ## Known limit: the shared page-zero budget
 
 This target's `LDA`/`STA` instructions only have an 8-bit displacement

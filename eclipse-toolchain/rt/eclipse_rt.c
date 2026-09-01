@@ -1561,6 +1561,156 @@ static int print_uint32(u32 val) {
   return n + 1;
 }
 
+/* --- hardware-float (`--hwfloat`) IEEE<->hex-float bridge ---------------
+ *
+ * The optional `+hwfloat` SubtargetFeature (off by default -- see the
+ * LLVM backend's Eclipse.td FeatureHWFloat) replaces __addsf3/__subsf3
+ * with __addsf3_hw/__subsf3_hw: a hand-written assembly file
+ * (rt/eclipse_hwfloat.s, NOT compiled from C -- this backend has no
+ * SelectionDAG support for FLDS/FAS/FSTS and Clang has no inline-asm
+ * for this target) that runs the real Eclipse S/140 FPU instead of this
+ * section's own software arithmetic above. That hardware FPU's "short"
+ * (single-precision) format is IBM System/360-style hex-float --
+ * sign + 7-bit excess-64 exponent over powers of *16* + 24-bit
+ * hex-digit-normalized mantissa -- a genuinely different bit layout
+ * from the IEEE-754 this file's own `float` uses everywhere else (the
+ * ABI, printf/print_float, struct layout, ...). See DEBUGGING_NOTES.md
+ * for the reverse-engineered format itself and the evidence behind it.
+ *
+ * These two functions convert between the two formats; eclipse_hwfloat.s
+ * calls them (via an ordinary EJSR, same calling convention as any other
+ * function here) at the entry/exit of __addsf3_hw/__subsf3_hw, so
+ * nothing outside those two functions' own bodies ever needs to know the
+ * hardware format exists -- every other piece of this target's float
+ * support (this section's own software arithmetic included) keeps using
+ * IEEE-754 exclusively, unconditionally, same as before this feature
+ * existed. Only ever reachable (hence only ever protected from
+ * globaldce, and only ever costing page-zero budget) on a program built
+ * with --hwfloat -- see eclipse-cc's own comment on why that protection
+ * is automatic and needs no special-casing here.
+ *
+ * Ported from a standalone Python implementation cross-checked
+ * bit-for-bit against real `eclipseemu` FAS/FSS results (see
+ * DEBUGGING_NOTES.md for the verification) -- not derived fresh here.
+ * Same "not fully IEEE-compliant" simplifications as the rest of this
+ * section: no subnormal input handling, overflow saturates to the
+ * largest representable magnitude, underflow flushes to zero. The
+ * IEEE->hex direction rounds to nearest (not truncating) at the 24-bit
+ * hex mantissa boundary -- but hex float's 4-bit-at-a-time exponent
+ * granularity still means up to 3 bits of a value's true precision
+ * can't be represented exactly ("wobble"), an inherent property of this
+ * hardware's own number format, not a bug in this conversion. Uses only
+ * sf_shl/sf_shr (never a raw runtime-variable-amount `<<`/`>>`) and
+ * u32_eq/u32_lt/u32_ge for every 32-bit comparison, for the exact same
+ * SRL_PARTS/SHL_PARTS and 32-bit-branch-condition reasons documented on
+ * those helpers above.
+ */
+/* Non-static (external linkage), unlike this file's other internal
+ * helpers: called by NAME from eclipse_hwfloat.s's hand-written
+ * assembly, which -- like __addsf3_hw/__subsf3_hw's own libcall names --
+ * needs the exact, unmangled symbol this backend emits for an ordinary
+ * external C function (matching sf_bits/__addsf3/etc.'s own reasoning
+ * above). Never referenced from any LLVM IR call site (only from raw
+ * assembly text added after `llc` runs -- see eclipse_hwfloat.s), so
+ * globaldce always considers it unreachable unless a --hwfloat build
+ * explicitly protects it -- eclipse-cc's existing "protect exactly the
+ * undefined symbols dgasm reports" retry loop already does this
+ * automatically, the same generic mechanism that already covers
+ * __addsf3_hw/__subsf3_hw themselves and every other runtime symbol
+ * here; no special-casing needed for these two specifically. */
+u32 ieee754_to_hexfloat32(u32 bits) {
+  u32 sign, mant23, sig24, hexmant24;
+  int exp8, e, s;
+
+  if (u32_eq(bits, 0) || u32_eq(bits, SF_SIGN_MASK)) {
+    return bits & SF_SIGN_MASK; /* +-0.0 -> hex-float zero, sign kept */
+  }
+  sign = bits & SF_SIGN_MASK;
+  exp8 = (int)((bits & SF_EXP_MASK) >> SF_EXP_SHIFT);
+  mant23 = bits & SF_MANT_MASK;
+  if (exp8 == 0) {
+    return sign; /* subnormal input -- flush to zero */
+  }
+  if (exp8 == 255) {
+    return sign | 0x7F000000UL | 0x00FFFFFFUL; /* inf/nan -- saturate */
+  }
+
+  /* value = sig24 * 2^(exp8-127-23) = 0.1(mant23 bits) * 2^total_shift */
+  sig24 = SF_HIDDEN_BIT | mant23;
+  {
+    int total_shift = exp8 - SF_EXP_BIAS + 1;
+    /* e = ceil(total_shift / 4), s = 4*e - total_shift (s in 0..3) --
+     * C's `/` truncates toward zero, which only equals ceil-division
+     * directly for a non-negative numerator, hence the two branches. */
+    e = total_shift >= 0 ? (total_shift + 3) / 4 : -((-total_shift) / 4);
+    s = 4 * e - total_shift;
+  }
+
+  if (s > 0) {
+    hexmant24 = sf_shr(sig24 + sf_shl(1UL, s - 1), s); /* round to nearest */
+  } else {
+    hexmant24 = sig24;
+  }
+  if (u32_ge(hexmant24, 1UL << 24)) {
+    /* rounding carried out of the top -- renormalize by one hex digit */
+    hexmant24 = sf_shr(hexmant24, 4);
+    e++;
+  }
+  hexmant24 &= 0x00FFFFFFUL;
+
+  {
+    int exp_biased = e + 64;
+    if (exp_biased < 0) {
+      return sign; /* underflow */
+    }
+    if (exp_biased > 127) {
+      return sign | 0x7F000000UL | 0x00FFFFFFUL; /* overflow */
+    }
+    return sign | ((u32)(exp_biased & 0x7F) << 24) | hexmant24;
+  }
+}
+
+/* Non-static -- see ieee754_to_hexfloat32's own comment just above. */
+u32 hexfloat32_to_ieee754(u32 bits) {
+  u32 sign, hexmant24;
+  int exp_biased, e, shift, exp2, exp8;
+
+  if (u32_eq(bits, 0) || u32_eq(bits, SF_SIGN_MASK)) {
+    return bits & SF_SIGN_MASK;
+  }
+  sign = bits & SF_SIGN_MASK;
+  exp_biased = (int)((bits >> 24) & 0x7FUL);
+  hexmant24 = bits & 0x00FFFFFFUL;
+  if (u32_eq(hexmant24, 0)) {
+    return sign;
+  }
+  e = exp_biased - 64;
+
+  /* Normalize so bit 23 (SF_HIDDEN_BIT) is set -- mirrors sf_normalize's
+   * own single-bit-at-a-time loop above; a hex-float mantissa can have
+   * up to 3 leading zero *bits* (it's only normalized to a nonzero hex
+   * *digit*, a coarser 4-bit granularity) that IEEE's single-bit
+   * normalization needs squeezed out. */
+  shift = 0;
+  while (u32_lt(hexmant24, SF_HIDDEN_BIT)) {
+    hexmant24 <<= 1;
+    shift++;
+  }
+
+  /* value = 0.hexmant24(24 bits) * 16^e = hexmant24 * 2^(4e-24)
+   *       = (1.mant23) * 2^(4e-1-shift), reading hexmant24 (now
+   *       normalized, bit23 set) as an IEEE-style 1.mant23 significand. */
+  exp2 = 4 * e - 1 - shift;
+  exp8 = exp2 + SF_EXP_BIAS;
+  if (exp8 <= 0) {
+    return sign; /* underflow */
+  }
+  if (exp8 >= 255) {
+    return sign | SF_EXP_MASK; /* overflow -> Inf */
+  }
+  return sign | ((u32)exp8 << SF_EXP_SHIFT) | (hexmant24 & SF_MANT_MASK);
+}
+
 /* --- 32-bit integer division/remainder (RTLIB::UDIV_I32/SDIV_I32/
  * UREM_I32/SREM_I32, i.e. __udivsi3/__divsi3/__umodsi3/__modsi3) ---
  *
