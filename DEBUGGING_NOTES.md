@@ -2197,6 +2197,172 @@ We do not yet know whether this means:
    -n 'var CPI0_'`, and cross-reference every `LDA n,CPI0_N` against what
    C-level constant it's supposed to correspond to, in source order.
 
+### 25. Follow-up on entry #24's "pre-existing, unrelated bug" — reproduced and narrowed, root cause not fully pinned down, not fixed
+
+Entry #24 found (but explicitly didn't investigate) a bug where a
+`long` local's low 16-bit word read back as `0` inside a large `main()`
+with ~20 other locals, but not in an isolated 4-line reproduction, and
+speculated it was "most likely adjacent to the large-stack-frame class
+of bug entry #21 already fixed one instance of". The original repro
+program itself wasn't preserved. This entry rebuilt a reproduction from
+scratch, confirmed the bug on real `eclipseemu`, and ruled out entry
+#21's own mechanism as the cause — but did not reach a confirmed single
+root cause, and made no code change.
+
+**Reproduction** (reliable, confirmed on `eclipseemu`): a `main()` with
+40 `int` locals, one `long`, 5 more `int` locals, a loop-free sum over
+all of them, a `long shifted = L << 1;`, then a call to *any* function
+that takes **two or more** parameters, then `printf("shifted=%ld\n",
+shifted)`. The printed value's low word is `0`
+(`shifted=246874112` instead of the correct `246913578` — high word
+`03767` octal correct both times, low word `0` instead of `0111752`
+octal) — the exact same symptom shape entry #24 described.
+
+```c
+extern int printf(const char *, ...);
+__attribute__((noinline)) void twoarg(int x, int y) { (void)x; (void)y; }
+int main(void) {
+    int b0 = 1;   int b1 = 2;   /* ... 40 int locals total, b0..b39 = 1..40 ... */
+    int b39 = 40;
+    long L = 123456789L;
+    int a0 = 1, a1 = 2, a2 = 3, a3 = 4, a4 = 5;
+    int sum = 0;
+    sum += b0 + b1 + /* ... every b and a local ... */ + a4;
+    long shifted = L << 1;
+    twoarg(10, 20);                    /* any call pushing >=2 words */
+    printf("shifted=%ld\n", shifted);  /* prints 246874112, should be 246913578 */
+    return 0;
+}
+```
+
+**What was ruled out, confirmed by direct experiment (not assumed):**
+
+- **Not entry #21's mechanism.** Entry #21 is about a stack object's own
+  FP-relative displacement exceeding the hardware's 8-bit indexed-
+  addressing range (-128..127), triggering `eliminateFrameIndex`'s
+  address-materialize-through-`_scratch` fallback. In every variant of
+  this repro, `shifted`'s and `L`'s own displacements stayed at 88-107
+  words — comfortably in range, direct `LDFI`/`STFI`, no fallback ever
+  taken for either object itself. `%const` values of `128` do appear in
+  the constant pool in *both* passing and failing variants (something
+  else in the frame does cross the boundary either way), so mere
+  co-occurrence of an entry-#21 fallback elsewhere in the function is
+  not sufficient by itself to explain the difference between a passing
+  and failing variant.
+- **Not about the value, the shift, or `L` itself.** `L` alone always
+  printed correctly in every variant tried, including ones where
+  `shifted` printed wrong. The corruption is specific to `shifted` — a
+  *second*, compiler-synthesized `long` stack object — and specifically
+  to its low word (word 1 of 2; the high word, word 0, was correct in
+  every single repro run).
+- **Not variadic-ness.** First hypothesis, disproven directly: a
+  hand-written variadic function (`void myva(int n, ...)`) reproduced
+  it, but so did a perfectly ordinary, non-variadic two-parameter
+  function (`twoarg` above) — and a non-variadic *one*-parameter
+  function (`onearg(int)`) never did, even called from a function with
+  an intentionally huge callee-side frame of its own (a 40-local
+  `bigcall(int)`, to rule out "large callee frame" as the real trigger
+  independent of argument count). The determining factor empirically is
+  **how many words the call pushes as arguments (>=2), not whether the
+  callee is variadic or how large the callee's own frame is.**
+- **Not caused by any call at all** — confirmed a plain call with zero
+  or one pushed argument (`noop()`, `printf("hi\n")` with no `%`
+  arguments, `onearg(42)`, `bigcall(42)`) never corrupts `shifted`,
+  regardless of frame size up to the tested range. Printing `shifted`
+  as the *first* statement after computing it (before any call at all)
+  is always correct.
+- **Frame-size-dependent**, separately from the >=2-argument-push
+  requirement: with the exact repro shape above, 38 "before" locals
+  (`main`'s own `SAVE 134`) never reproduces it; 40 "before" locals
+  (`SAVE 138`/`SAVE 136` depending on which call variant) reproduces it
+  reliably. Both conditions (>=2 pushed words, and a large enough
+  enclosing frame) are independently necessary in every variant tested.
+
+**What the low word's address computation actually looks like**
+(confirmed by reading `EclipseISelLowering.cpp` and cross-checking
+against `-stop-before=prolog-epilog`/`-stop-after=prolog-epilog` MIR
+dumps): a stack-resident `i32` (`long`) load/store always splits into
+two `i16` accesses. `EclipseISelDAGToDAG.cpp`'s `ISD::LOAD`/`ISD::STORE`
+handling only matches a *bare* `FrameIndex` base pointer directly to
+`LDFI`/`STFI` — so only word 0 (the high word, at the object's own
+offset) ever gets that direct match. Word 1 (the low word, at
+`FrameIndex + 1` word) is `ADD(FrameIndex, 2-bytes)`, which
+`PerformDAGCombine` (same file, the large comment starting around its
+`ISD::ADD` check) rewrites into `EclipseISD::WORD_ADD(LEAFI-materialized
+base, EclipseISD::HALVE(2, 2))` — i.e. the low word's real address is
+computed at runtime (`FP + object-offset`, then `+1` from a runtime
+halving of the generic legalizer's byte-granular `+2`), routed through
+the single shared page-zero `_scratch` word as the final indirect
+load/store address, the same mechanism `eliminateFrameIndex`'s own
+out-of-range fallback and `emitIndirectMem`'s general pointer
+dereference also both use. The high word never goes through any of
+this — it's always a plain, direct, compile-time-resolved `LDFI`/`STFI`
+displacement. This asymmetry (only the low word needs a *runtime*
+address computation at all) lines up exactly with the symptom (only the
+low word is ever wrong).
+
+**Where this investigation stalled:** `-stop-before=prolog-epilog` and
+`-stop-after=prolog-epilog` MIR dumps of both a passing (38-local) and
+failing (40-local) variant were traced instruction-by-instruction by
+hand, including every spill slot touching the low word's address or
+value and every `%stack.N`/real-offset pair involved in computing it
+(`STFI`/`LDFI` reload immediately preceding each `STABS`/`STABSI &
+_scratch` pair). In both variants the generated `MachineInstr` sequence
+is self-consistent and structurally identical in shape — no dropped
+reload, no stack-slot reused by two overlapping live ranges was found
+by this method, in either variant, despite ~15 separate spill slots
+checked this way. (Aside: while tracing a *different*, hand-written
+variadic-function repro during this same investigation, one push
+argument's value was observed being read from a register that had last
+been written by an unrelated earlier computation rather than a fresh
+reload from its own spill slot — a real anomaly, but the `twoarg`
+non-variadic repro above reproduces the main `shifted` bug without
+exhibiting that specific symptom in its own MIR, so this looks like a
+second, separate defect rather than the explanation for this one; not
+investigated further, not confirmed as a real bug on its own, flagged
+here only so it isn't silently lost.) Direct `eclipseemu` single-step
+inspection of the runtime address `shifted`'s low word resolves to, and
+of the shared hardware-stack-pointer word (page-zero address `040`,
+used both by `eliminateFrameIndex`'s fallback / `emitIndirectMem` /
+`PerformDAGCombine`'s `_scratch` indirection *and*, per entry #11's
+design, by `LowerCall`/`emitPushPop`'s argument-pushing and by real
+`SAVE`/`RTN`) was attempted but did not converge on a clear answer
+within this session's time budget — the probed low-word address read
+back `0` at every checkpoint taken, including checkpoints that should
+have been *before* the corruption (making the specific probe
+inconclusive rather than confirmatory; likely too coarse a step
+granularity relative to the handful of instructions where the actual
+write and any clobber would happen).
+
+**Leading (unconfirmed) hypothesis**, offered for whoever picks this up
+next: `_scratch` and the page-zero hardware-stack-pointer word are both
+single, shared, unsynchronized page-zero locations that multiple,
+independently-generated instruction sequences funnel a runtime address
+through (the low-word `WORD_ADD`/`HALVE` materialization, entry #21's
+`eliminateFrameIndex` fallback, `emitIndirectMem`'s general pointer
+dereference, and — for the stack-pointer word specifically —
+`emitPushPop`'s argument marshaling and real `SAVE`/`RTN`). None of
+these carry an explicit `MachineMemOperand`/chain relationship to each
+other, so nothing prevents two of them from interleaving unsafely if
+the surrounding code shape and register/frame pressure line up right —
+which would explain why this needs both a large-enough frame *and*
+multiple pushed argument words to surface (more concurrent demand on
+the same page-zero words), while never needing the offending object's
+*own* displacement to exceed entry #21's 8-bit range. This was not
+verified to the same standard as entries #21/#24's own findings — no
+fix was attempted, and none should be attempted without first
+confirming this mechanism directly (e.g. instrumenting `_scratch`'s
+value across the push sequence, or trying a build with a second,
+independent scratch word for the `WORD_ADD`/`HALVE` path specifically
+to see if that alone makes the repro above pass).
+
+**Verified**: reproduces reliably and byte-for-byte on real
+`eclipseemu` (not just "looks wrong"), both with the repro above and
+with the original hand-written variadic-function variant that led to
+finding the >=2-pushed-words condition. No backend code was changed;
+`regress_hwstack.sh` and the c-testsuite baseline were not re-run
+because nothing in the backend was touched this session.
+
 ## Reproducing the eclipseemu-only verification steps
 
 None of these require real hardware or a working FPU simulation — they
