@@ -2363,6 +2363,141 @@ finding the >=2-pushed-words condition. No backend code was changed;
 `regress_hwstack.sh` and the c-testsuite baseline were not re-run
 because nothing in the backend was touched this session.
 
+### 26. Follow-up on entry #25 — root cause confirmed, fixed with a second scratch word
+
+Continuation of entry #25 (read that entry first — this picks up exactly
+where it stalled). Entry #25's own leading hypothesis is confirmed: the
+shared page-zero `_scratch` word was being reused, unsynchronized,
+between two independently-generated mechanisms that can land in the same
+few statements of a large function — `PerformDAGCombine`'s `WORD_ADD`/
+`HALVE` low-word address materialization, and
+`EclipseRegisterInfo::eliminateFrameIndex`'s own out-of-range fallback
+(entry #21). Fixed with entry #25's own first-suggested experiment: a
+second, independent page-zero scratch word (`_scratch2`) dedicated to
+the `WORD_ADD`/`HALVE` path alone.
+
+**Confirming the root cause, not just the symptom.** Rather than jumping
+straight to the fix-and-test cycle, this session first dumped MIR at
+`-stop-before=prolog-epilog` and `-stop-after=prolog-epilog` for entry
+#25's own repro (reproduced fresh, byte-for-byte identical symptom:
+`shifted=246874112` instead of `246913578`, low word `0`) and hand-
+traced every `_scratch` touch in the region between computing `shifted`
+and the corrupted post-call read. Two concrete findings came out of that
+trace, both confirming entry #25's hypothesis was pointed at the right
+mechanism (even though its own single-step attempt hadn't converged):
+
+- `LDABS`/`STABS`/`LDABSI`/`STABSI` — the instructions every one of
+  these mechanisms is built from — carry no `mayLoad`/`mayStore` in
+  `EclipseInstrInfo.td` and no `MachineMemOperand` at their `BuildMI`
+  call sites anywhere in `EclipseISelLowering.cpp` or
+  `EclipseRegisterInfo.cpp` (confirmed by grepping both files and by
+  checking the generated `EclipseGenInstrInfo.inc`: they get
+  `MCID::UnmodeledSideEffects` from TableGen's own pattern-less-
+  instruction inference instead, not a real load/store flag). This
+  means nothing downstream of instruction selection has any principled
+  way to know two `STABS ...,&_scratch` instructions from *different*
+  original mechanisms touch the same memory location — there is no
+  chain, no aliasing info, nothing; entry #25's "no explicit
+  `MachineMemOperand`/chain relationship" line was exactly right.
+- In the actual post-`prolog-epilog` MIR for the large, failing repro,
+  `eliminateFrameIndex`'s fallback (entry #21) fires *constantly* — the
+  frame is large enough that nearly every stack access beyond the first
+  ~127 words needs it, and its own documented sequence
+  (`STABS $val,&_scratch` to stash a store's value up front, unrelated
+  offset-decomposition arithmetic in between, `LDABS &_scratch` to
+  reload it, then `STABS $addr,&_scratch`/`STABSI $val,&_scratch` for
+  the real indirect access — see entry #21) is *itself* just one more
+  independent, unchained user of the same word, no different in kind
+  from the `WORD_ADD`/`HALVE` path. With a 40-local frame plus a
+  multi-argument call in between, both mechanisms end up needing
+  `_scratch` within the same handful of statements — exactly the
+  "densely interleaved, nothing to keep one from clobbering the other"
+  scenario entry #25 described, even though *this specific* function's
+  compiled instruction order didn't happen to physically interleave the
+  two mechanisms' own instruction pairs (each individual `STABS`+
+  indirect-access pair stayed adjacent in this repro's output — no
+  reordering pass tore one apart). The real exposure is structural, not
+  a one-off scheduling accident: two totally independent generators
+  share one word with no coordination at all, and this repro's specific
+  code shape (large frame, multi-word `long`, a value that must survive
+  a call and therefore gets register-allocator-spilled to yet another
+  out-of-range slot, needing its *own* `eliminateFrameIndex` fallback
+  right where the `WORD_ADD`/`HALVE` path also needs `_scratch`) is
+  simply the first one that happened to line the two up badly enough to
+  matter.
+
+**Fix**: a second, independent page-zero word, `_scratch2`
+(`EclipseAsmPrinter.cpp`, emitted immediately after `_scratch`, still
+swept into `reorder_asm.py`'s fixed preamble the same way), used *only*
+by a load/store whose address is exactly an `EclipseWordAdd` node —
+i.e. only the `PerformDAGCombine`-driven low-word/runtime-GEP
+materialization entry #25 already identified, never `eliminateFrameIndex`'s
+fallback, `emitIndirectMem`'s other (non-`WORD_ADD`) uses, `emitPushPop`,
+or `emitCallIndirect`, all of which keep using the original `_scratch`
+exactly as before. Implemented as a new pseudo-instruction pair in
+`EclipseInstrInfo.td`, `LDINDW`/`STINDW`, matched by a strictly deeper
+Pattern than `LDIND`/`STIND`'s plain `GPR:$addr` (`(load (EclipseWordAdd
+GPR:$base, GPR:$off))` and the store/extload/truncstore equivalents) so
+SelectionDAG's normal complexity-based preference — the same mechanism
+`ELDAGA`/`ESTAGA` already rely on in this file — picks it automatically
+whenever the address is `WORD_ADD`-shaped, with no change needed to
+`PerformDAGCombine` itself. A new custom inserter,
+`emitIndirectMemWordAdd` (`EclipseISelLowering.cpp`, right next to
+`emitIndirectMem`), adds `$base`+`$off` into a fresh virtual register
+(an ordinary tied-operand `ADDrr`, same idiom `LEAFI`'s own expansion
+uses) and then indirects through `_scratch2` exactly like
+`emitIndirectMem` does through `_scratch`. This is purely additive: no
+existing pseudo, pattern, or custom-inserter function was modified, only
+new ones added alongside them, and `eliminateFrameIndex` itself was not
+touched at all.
+
+**Confirmed causally, not just correlationally.** Recompiling entry
+#25's exact repro after the fix and diffing the generated assembly shows
+`_scratch2` appearing at precisely the sites this fix targets — the
+low-word read/store of `L` and of `shifted`, including the specific
+post-`twoarg`-call read that used to come back `0` — while every other
+`_scratch` use in the same function (the dense run of
+`eliminateFrameIndex` fallbacks around it) is untouched and still on the
+original `_scratch`. Running the fixed build on real `eclipseemu`:
+
+```
+shifted=246913578
+```
+
+— correct (high word `03767` octal, low word `0111752` octal, matching
+entry #25's own expected value), where the pre-fix build printed
+`shifted=246874112` (low word `0`) with byte-identical source and
+identical repro steps otherwise. Isolating the change to `_scratch2`
+alone (nothing else in the backend touched) makes this a genuine before/
+after causal test, not just "a fix happened to be near the bug."
+
+**Full regression, byte-identical to baseline**: `regress_hwstack.sh`'s
+15 examples — 11 `HALT` with correct output, and exactly the same 4
+pre-existing `Step expired` cases as baseline (`isr_c_test`,
+`test_fps_add`, `test_fps_md`, `fps_dma_test`, all unrelated to this
+change — FPU/device-polling limitations noted in earlier entries), no
+new failures and no output changes on any passing example.
+c-testsuite: 197/220, identical to the pre-fix baseline re-measured this
+same session (same 23 non-passing test IDs before and after: `00040`,
+`00041`, `00104`, `00157`, `00163`, `00166`, `00168`, `00174`, `00175`,
+`00178`, `00179`, `00180`, `00187`, `00189`, `00195`, `00203`, `00204`,
+`00205`, `00212`, `00216`, `00217`, `00218`, `00220`) — no regressions,
+no new passes (expected: this bug's repro shape, a specific combination
+of frame size and call-argument count, doesn't happen to be exercised by
+c-testsuite's own test set).
+
+**Page-zero cost**: exactly one word (`_scratch2`), the minimum this
+fix could cost — no blanket "give every mechanism its own word,"
+just the one confirmed collision.
+
+(This session also worked concurrently in the same tree as an unrelated
+opt-in hardware-floating-point change — `Eclipse.td`, `EclipseSubtarget.
+{h,cpp}`, `RuntimeLibcalls.td`, and part of `EclipseISelLowering.{h,cpp}`
+had another agent's uncommitted work in them throughout; this entry's
+commit stages only the hunks described above, verified with `git diff
+--cached` before committing, leaving the concurrent work uncommitted for
+its own session to land.)
+
 ## Reproducing the eclipseemu-only verification steps
 
 None of these require real hardware or a working FPU simulation — they

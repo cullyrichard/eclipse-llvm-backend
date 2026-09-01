@@ -548,6 +548,29 @@ index 000000000..ab7966cb0
 +}
 +
 +} // namespace clang
+diff --git a/llvm/include/llvm/IR/RuntimeLibcalls.td b/llvm/include/llvm/IR/RuntimeLibcalls.td
+index b0d9663cc..f51360255 100644
+--- a/llvm/include/llvm/IR/RuntimeLibcalls.td
++++ b/llvm/include/llvm/IR/RuntimeLibcalls.td
+@@ -1097,6 +1097,18 @@ def __addxf3 : RuntimeLibcallImpl<ADD_F80>;
+ def __addtf3 : RuntimeLibcallImpl<ADD_F128>;
+ def __gcc_qadd : RuntimeLibcallImpl<ADD_PPCF128>;
+ 
++// Alternate ADD_F32/SUB_F32 implementations for the Eclipse (Data
++// General Nova/Eclipse) target's optional `+hwfloat` SubtargetFeature:
++// real Eclipse S/140 hardware FPU instructions (FAS/FSS) instead of the
++// default software libcall (__addsf3/__subsf3, still the unconditional
++// default -- see llvm/lib/Target/Eclipse/EclipseSubtarget.cpp). Mirrors
++// the existing __addsf3vfp/__subsf3vfp pattern ARM uses for its own
++// optional hardware-FPU alternates above. Selected explicitly via
++// setLibcallImpl, not any triple-keyed availability list, the same way
++// this target already wires up every other libcall it uses.
++def __addsf3_hw : RuntimeLibcallImpl<ADD_F32>;
++def __subsf3_hw : RuntimeLibcallImpl<SUB_F32>;
++
+ def __subsf3 : RuntimeLibcallImpl<SUB_F32>;
+ def __subdf3 : RuntimeLibcallImpl<SUB_F64>;
+ def __subxf3 : RuntimeLibcallImpl<SUB_F80>;
 diff --git a/llvm/include/llvm/TargetParser/Triple.h b/llvm/include/llvm/TargetParser/Triple.h
 index 18634a8bb..8a7612ff1 100644
 --- a/llvm/include/llvm/TargetParser/Triple.h
@@ -651,10 +674,10 @@ index 000000000..252505f6d
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSE_H
 diff --git a/llvm/lib/Target/Eclipse/Eclipse.td b/llvm/lib/Target/Eclipse/Eclipse.td
 new file mode 100644
-index 000000000..11a9b3268
+index 000000000..2c816e802
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/Eclipse.td
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,48 @@
 +//===- Eclipse.td - Describe the Eclipse Target Machine ---*- tablegen -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -672,6 +695,26 @@ index 000000000..11a9b3268
 +
 +def EclipseInstrInfo : InstrInfo;
 +
++// Opt-in use of the real Eclipse S/140 hardware FPU (FAS/FSS -- add and
++// subtract on the CPU-native IBM-360-style hex-float FPAC registers)
++// instead of this target's default, always-available software float
++// implementation (__addsf3/__subsf3 etc. in eclipse_rt.c). OFF by
++// default: every existing invocation of this toolchain gets exactly
++// today's soft-float codegen, unchanged, unless a caller explicitly
++// requests `-mattr=+hwfloat` (llc) / `--hwfloat` (eclipse-cc). See
++// EclipseSubtarget.cpp's initLibcallLoweringInfo and
++// EclipseISelLowering.cpp's constructor for where this actually changes
++// which libcall implementation gets selected, and DEBUGGING_NOTES.md in
++// the eclipse-package repo for the reverse-engineered hardware format
++// and the eclipseemu verification this feature is based on. Multiply/
++// divide (FMS/FDS) and int<->float conversion (FLAS/FFAS) were probed
++// too but found unreliable/unimplemented on eclipseemu -- not covered
++// by this feature; software libcalls remain the only path for those
++// regardless of this feature's setting.
++def FeatureHWFloat : SubtargetFeature<"hwfloat", "HasHWFloat", "true",
++  "Use real Eclipse S/140 hardware FPU instructions (FAS/FSS) for "
++  "float add/subtract instead of software libcalls">;
++
 +def : ProcessorModel<"generic", NoSchedModel, []>;
 +
 +def EclipseInstPrinter : AsmWriter {
@@ -685,10 +728,10 @@ index 000000000..11a9b3268
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
 new file mode 100644
-index 000000000..9393e4ef0
+index 000000000..896e22dfd
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
-@@ -0,0 +1,703 @@
+@@ -0,0 +1,713 @@
 +//===-- EclipseAsmPrinter.cpp - Eclipse LLVM assembly writer ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -862,6 +905,16 @@ index 000000000..9393e4ef0
 +  OutStreamer->emitRawText("var _STACKTOP = 020000");
 +  OutStreamer->emitRawText("var _STACKLIM = 0177700");
 +  OutStreamer->emitRawText("var _scratch = 0");
++  // A second, independent scratch word, used ONLY by loads/stores whose
++  // address is an EclipseWordAdd node (PerformDAGCombine's low-word/
++  // runtime-GEP address materialization) -- see EclipseInstrInfo.td's
++  // LDINDW/STINDW comment and DEBUGGING_NOTES.md entry #26. Emitted
++  // right after `_scratch`, still ahead of the blank line, so it's swept
++  // into reorder_asm.py's fixed preamble the same way (that script scans
++  // for the first "var _scratch" line specifically, which this is not --
++  // see its own comment -- but it consumes through the next blank line
++  // regardless, and this line is before that blank line).
++  OutStreamer->emitRawText("var _scratch2 = 0");
 +  OutStreamer->emitRawText("");
 +}
 +
@@ -1920,10 +1973,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..5c2bd5e75
+index 000000000..72f5d3fcb
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1809 @@
+@@ -0,0 +1,1875 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2137,8 +2190,29 @@ index 000000000..5c2bd5e75
 +  // eclipse_rt.c's soft-float section and the README's "no i32 runtime
 +  // library" limitation: f64 softening would need genuine i64 support
 +  // this backend doesn't have).
-+  setLibcallImpl(RTLIB::ADD_F32, RTLIB::impl___addsf3);
-+  setLibcallImpl(RTLIB::SUB_F32, RTLIB::impl___subsf3);
++  //
++  // ADD_F32/SUB_F32 alone are conditioned on the optional `+hwfloat`
++  // SubtargetFeature (Eclipse.td's FeatureHWFloat, default off): when
++  // set, real Eclipse S/140 hardware FPU instructions (FAS/FSS, run
++  // through a hand-written assembly wrapper matching this target's
++  // ordinary calling convention — see rt/eclipse_hwfloat.s in the
++  // eclipse-package repo) replace the software __addsf3/__subsf3 this
++  // target otherwise always uses. Every other float libcall below stays
++  // on its software implementation unconditionally, hwfloat or not —
++  // FMS/FDS (hardware multiply/divide) and FLAS/FFAS (hardware
++  // int<->float conversion) were both probed on eclipseemu and found
++  // unreliable/unimplemented there (FMS/FDS silently zero their
++  // destination instead of computing a product/quotient; FFAS's operand
++  // semantics didn't behave consistently across otherwise-equivalent
++  // encodings) — see DEBUGGING_NOTES.md for the full probe methodology
++  // and results. This exact ADD_F32/SUB_F32 choice is duplicated in
++  // EclipseSubtarget::initLibcallLoweringInfo — see that method's own
++  // comment for why both copies are needed.
++  bool HWFloat = STI.hasHWFloat();
++  setLibcallImpl(RTLIB::ADD_F32,
++                 HWFloat ? RTLIB::impl___addsf3_hw : RTLIB::impl___addsf3);
++  setLibcallImpl(RTLIB::SUB_F32,
++                 HWFloat ? RTLIB::impl___subsf3_hw : RTLIB::impl___subsf3);
 +  setLibcallImpl(RTLIB::MUL_F32, RTLIB::impl___mulsf3);
 +  setLibcallImpl(RTLIB::DIV_F32, RTLIB::impl___divsf3);
 +  // NOTE: these are the *three-way* (-1/0/1) compare libcalls -- the
@@ -3431,6 +3505,10 @@ index 000000000..5c2bd5e75
 +    return emitIndirectMem(MI, MBB, /*IsLoad*/ true);
 +  case Eclipse::STIND:
 +    return emitIndirectMem(MI, MBB, /*IsLoad*/ false);
++  case Eclipse::LDINDW:
++    return emitIndirectMemWordAdd(MI, MBB, /*IsLoad*/ true);
++  case Eclipse::STINDW:
++    return emitIndirectMemWordAdd(MI, MBB, /*IsLoad*/ false);
 +  case Eclipse::CALLIND:
 +    return emitCallIndirect(MI, MBB);
 +  default:
@@ -3615,6 +3693,47 @@ index 000000000..5c2bd5e75
 +  return MBB;
 +}
 +
++// LDINDW/STINDW: the EclipseWordAdd-address-specific counterpart to
++// emitIndirectMem above -- see EclipseInstrInfo.td's LDINDW/STINDW
++// comment and DEBUGGING_NOTES.md entry #26 for why this needs its own
++// page-zero word (`_scratch2`) rather than reusing emitIndirectMem's
++// `_scratch` directly. $base/$off arrive as two still-separate operands
++// (PerformDAGCombine deliberately leaves them split -- see
++// EclipseWordAdd's own comment in EclipseInstrInfo.td), so this adds
++// them into a *fresh* virtual register first (an ordinary tied-operand
++// ADDrr, exactly like every other two-address accumulate in this file --
++// see e.g. LEAFI's own expansion in EclipseRegisterInfo.cpp -- never
++// reusing $base's or $off's own register in place, since either one may
++// still have other uses elsewhere in the DAG), then indirects through
++// `_scratch2` exactly like emitIndirectMem does through `_scratch`.
++MachineBasicBlock *
++EclipseTargetLowering::emitIndirectMemWordAdd(MachineInstr &MI,
++                                               MachineBasicBlock *MBB,
++                                               bool IsLoad) const {
++  const auto &TII = *MBB->getParent()->getSubtarget<EclipseSubtarget>().getInstrInfo();
++  MachineRegisterInfo &MRI = MBB->getParent()->getRegInfo();
++  DebugLoc DL = MI.getDebugLoc();
++  if (IsLoad) {
++    Register Dst = MI.getOperand(0).getReg();
++    Register Base = MI.getOperand(1).getReg();
++    Register Off = MI.getOperand(2).getReg();
++    Register Addr = MRI.createVirtualRegister(&Eclipse::GPRRegClass);
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::ADDrr), Addr).addReg(Off).addReg(Base);
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::STABS)).addReg(Addr).addExternalSymbol("_scratch2");
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::LDABSI), Dst).addExternalSymbol("_scratch2");
++  } else {
++    Register Src = MI.getOperand(0).getReg();
++    Register Base = MI.getOperand(1).getReg();
++    Register Off = MI.getOperand(2).getReg();
++    Register Addr = MRI.createVirtualRegister(&Eclipse::GPRRegClass);
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::ADDrr), Addr).addReg(Off).addReg(Base);
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::STABS)).addReg(Addr).addExternalSymbol("_scratch2");
++    BuildMI(*MBB, MI, DL, TII.get(Eclipse::STABSI)).addReg(Src).addExternalSymbol("_scratch2");
++  }
++  MI.eraseFromParent();
++  return MBB;
++}
++
 +// Indirect call through a runtime function-pointer value -- see
 +// EclipseInstrInfo.td's CALLIND/CALLIND_JSR comments for the full ISA
 +// research (JSR has no register-target addressing mode on real Nova/
@@ -3735,10 +3854,10 @@ index 000000000..5c2bd5e75
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.h b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
 new file mode 100644
-index 000000000..9202f4c0d
+index 000000000..ae857980e
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,364 @@
 +//===-- EclipseISelLowering.h - Eclipse DAG Lowering Interface -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -3756,9 +3875,24 @@ index 000000000..9202f4c0d
 +// oversized integer type), and i32 multiply/divide plus all float
 +// arithmetic fall back to its default runtime-libcall behavior. This
 +// backend does not hand-encode i32 carry propagation or Eclipse FPU
-+// opcodes — see README.md "Known limitations" for why (nothing here would
-+// be empirically verified against real hardware the way eccc's ISA facts
-+// are, and a wrong hand-rolled encoding is worse than an honest libcall).
++// opcodes at the SelectionDAG level — see README.md "Known limitations"
++// for why (nothing here would be empirically verified against real
++// hardware the way eccc's ISA facts are, and a wrong hand-rolled encoding
++// is worse than an honest libcall).
++//
++// Update: real Eclipse S/140 hardware FPU instructions (FAS/FSS) *were*
++// eventually empirically verified against eclipseemu (see
++// DEBUGGING_NOTES.md) — but they're used via an optional, opt-in
++// `+hwfloat` SubtargetFeature (Eclipse.td's FeatureHWFloat) that swaps
++// which *libcall implementation* ADD_F32/SUB_F32 resolve to (a
++// hand-written assembly wrapper, not SelectionDAG-level codegen — see
++// this constructor's own comment on that setLibcallImpl call), not a
++// new f32 register class or Custom op lowering. f32 still has no
++// register class here, and the reasoning above for why still holds for
++// everything this feature doesn't cover (multiply/divide, int<->float
++// conversion, and the entire default/software path, which remains
++// unconditionally what every existing invocation of this toolchain
++// gets).
 +//
 +//===----------------------------------------------------------------------===//
 +
@@ -4068,6 +4202,13 @@ index 000000000..9202f4c0d
 +                                       bool IsDown) const;
 +  MachineBasicBlock *emitIndirectMem(MachineInstr &MI, MachineBasicBlock *MBB,
 +                                      bool IsLoad) const;
++  // LDINDW/STINDW: the EclipseWordAdd-address-specific counterpart to
++  // emitIndirectMem above, through the dedicated `_scratch2` page-zero
++  // word instead of the shared `_scratch` -- see EclipseInstrInfo.td's
++  // LDINDW/STINDW comment and DEBUGGING_NOTES.md entry #26.
++  MachineBasicBlock *emitIndirectMemWordAdd(MachineInstr &MI,
++                                             MachineBasicBlock *MBB,
++                                             bool IsLoad) const;
 +  MachineBasicBlock *emitCallIndirect(MachineInstr &MI,
 +                                       MachineBasicBlock *MBB) const;
 +  MachineBasicBlock *emitVLAAlloc(MachineInstr &MI,
@@ -4479,10 +4620,10 @@ index 000000000..4caee1b13
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEINSTRINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.td b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
 new file mode 100644
-index 000000000..9cc78dd1e
+index 000000000..7841762d1
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
-@@ -0,0 +1,711 @@
+@@ -0,0 +1,751 @@
 +//===- EclipseInstrInfo.td - Eclipse Instruction defs ------*- tablegen -*-=//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4854,6 +4995,46 @@ index 000000000..9cc78dd1e
 +def : Pat<(i16 (sextloadi8 GPR:$addr)), (LDIND GPR:$addr)>;
 +def : Pat<(i16 (zextloadi8 GPR:$addr)), (LDIND GPR:$addr)>;
 +def : Pat<(truncstorei8 GPR:$src, GPR:$addr), (STIND GPR:$src, GPR:$addr)>;
++
++// A second, independent page-zero scratch word (`_scratch2`), used ONLY
++// for a load/store whose address is exactly an EclipseWordAdd node --
++// i.e. PerformDAGCombine's own low-word/runtime-GEP address
++// materialization (EclipseISelLowering.cpp's big ISD::ADD comment),
++// never LDIND/STIND's *general* dereference above (an ordinary loaded
++// pointer *value*, or any other GPR-typed address that didn't come from
++// that combine). See DEBUGGING_NOTES.md entry #26 (a continuation of
++// #25): a real corruption was traced to `_scratch` being shared,
++// unsynchronized, between this address-materialization path and
++// EclipseRegisterInfo::eliminateFrameIndex's own out-of-range fallback,
++// which *also* uses `_scratch` as a general-purpose value-stash during
++// its own address decomposition -- a large enough frame needs both
++// mechanisms densely interleaved within the same few statements, with
++// nothing keeping one mechanism's brief "value stashed in `_scratch`,
++// about to be reloaded" window safe from the other's use of the same
++// word in between. Splitting this path onto its own word removes that
++// specific collision, at the cost of one more page-zero word.
++//
++// $base/$off are added together first (the combine leaves that split,
++// rather than folding it, so DAGCombiner's own re-visiting of a plain
++// ADD here can never re-match and loop -- see EclipseWordAdd's own
++// comment above), then handled exactly like LDIND/STIND's own
++// STABS-then-indirect expansion, just against `_scratch2`.
++//
++// Only fires when the address is *exactly* this shape -- a strictly
++// deeper match than LDIND/STIND's plain `GPR:$addr` above, so
++// SelectionDAG's normal complexity-based preference always picks this
++// one first when it applies (the same mechanism ELDAGA/ESTAGA rely on;
++// see the "Global data addressing" comment above).
++let usesCustomInserter = 1 in {
++def LDINDW : EclipsePseudo<(outs GPR:$dst), (ins GPR:$base, GPR:$off), "# LDINDW",
++                            [(set GPR:$dst, (load (EclipseWordAdd GPR:$base, GPR:$off)))]>;
++def STINDW : EclipsePseudo<(outs), (ins GPR:$src, GPR:$base, GPR:$off), "# STINDW",
++                            [(store GPR:$src, (EclipseWordAdd GPR:$base, GPR:$off))]>;
++}
++def : Pat<(i16 (extloadi8  (EclipseWordAdd GPR:$base, GPR:$off))), (LDINDW GPR:$base, GPR:$off)>;
++def : Pat<(i16 (sextloadi8 (EclipseWordAdd GPR:$base, GPR:$off))), (LDINDW GPR:$base, GPR:$off)>;
++def : Pat<(i16 (zextloadi8 (EclipseWordAdd GPR:$base, GPR:$off))), (LDINDW GPR:$base, GPR:$off)>;
++def : Pat<(truncstorei8 GPR:$src, (EclipseWordAdd GPR:$base, GPR:$off)), (STINDW GPR:$src, GPR:$base, GPR:$off)>;
 +
 +//===----------------------------------------------------------------------===//
 +// Software stack (a plain page-zero memory word, `_SP`, manipulated with
@@ -5698,10 +5879,10 @@ index 000000000..fb7731dbb
 +def GPR : RegisterClass<"Eclipse", [i16], 16, (add AC0, AC1, AC2, AC3)>;
 diff --git a/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp b/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp
 new file mode 100644
-index 000000000..8ff824f75
+index 000000000..e1a4b1bbd
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp
-@@ -0,0 +1,67 @@
+@@ -0,0 +1,88 @@
 +//===-- EclipseSubtarget.cpp - Eclipse Subtarget Information -------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -5721,16 +5902,26 @@ index 000000000..8ff824f75
 +using namespace llvm;
 +
 +// ParseSubtargetFeatures itself is generated by GET_SUBTARGETINFO_CTOR
-+// above (this target has no subtarget features to parse beyond the
-+// generic default).
++// above -- it sets HasHWFloat (see Eclipse.td's FeatureHWFloat and this
++// file's initLibcallLoweringInfo below) plus whatever else a future
++// SubtargetFeature adds; nothing else beyond that and the generic
++// default.
++
++const EclipseSubtarget &
++EclipseSubtarget::initializeSubtargetDependencies(StringRef CPU,
++                                                    StringRef FS) {
++  // Must run before TLInfo (EclipseTargetLowering) is constructed below
++  // -- see this method's declaration in EclipseSubtarget.h for why.
++  ParseSubtargetFeatures(CPU.empty() ? "generic" : CPU,
++                          CPU.empty() ? "generic" : CPU, FS);
++  return *this;
++}
 +
 +EclipseSubtarget::EclipseSubtarget(const Triple &TT, StringRef CPU,
 +                                    StringRef FS, const TargetMachine &TM)
 +    : EclipseGenSubtargetInfo(TT, CPU, /*TuneCPU*/ CPU, FS),
-+      InstrInfo(*this), FrameLowering(*this), TLInfo(TM, *this) {
-+  ParseSubtargetFeatures(CPU.empty() ? "generic" : CPU,
-+                          CPU.empty() ? "generic" : CPU, FS);
-+}
++      InstrInfo(initializeSubtargetDependencies(CPU, FS)),
++      FrameLowering(*this), TLInfo(TM, *this) {}
 +
 +// See this method's declaration in EclipseSubtarget.h for why this exists
 +// separately from EclipseTargetLowering's constructor's own
@@ -5739,8 +5930,19 @@ index 000000000..8ff824f75
 +// softening. Only f32 (`float`) is wired; `double` stays unimplemented
 +// (see eclipse_rt.c's soft-float section).
 +void EclipseSubtarget::initLibcallLoweringInfo(LibcallLoweringInfo &Info) const {
-+  Info.setLibcallImpl(RTLIB::ADD_F32, RTLIB::impl___addsf3);
-+  Info.setLibcallImpl(RTLIB::SUB_F32, RTLIB::impl___subsf3);
++  // `+hwfloat` (see Eclipse.td's FeatureHWFloat) swaps ADD_F32/SUB_F32
++  // to the real-hardware-FPU implementations instead of the default
++  // software ones -- everything else here is unconditional and
++  // identical either way, matching EclipseISelLowering.cpp's own copy
++  // of this same choice (see this class's declaration for why both
++  // copies need it). MUL_F32/DIV_F32 and int<->float conversion have no
++  // hardware path on this target (FMS/FDS were probed and found
++  // unreliable on eclipseemu -- see DEBUGGING_NOTES.md), so they stay
++  // on the software libcalls unconditionally, even with hwfloat on.
++  Info.setLibcallImpl(RTLIB::ADD_F32, HasHWFloat ? RTLIB::impl___addsf3_hw
++                                                  : RTLIB::impl___addsf3);
++  Info.setLibcallImpl(RTLIB::SUB_F32, HasHWFloat ? RTLIB::impl___subsf3_hw
++                                                  : RTLIB::impl___subsf3);
 +  Info.setLibcallImpl(RTLIB::MUL_F32, RTLIB::impl___mulsf3);
 +  Info.setLibcallImpl(RTLIB::DIV_F32, RTLIB::impl___divsf3);
 +  // See the matching setLibcallImpl block in EclipseISelLowering.cpp's
@@ -5771,10 +5973,10 @@ index 000000000..8ff824f75
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseSubtarget.h b/llvm/lib/Target/Eclipse/EclipseSubtarget.h
 new file mode 100644
-index 000000000..7c49a4cff
+index 000000000..f9db85bda
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseSubtarget.h
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,96 @@
 +//===-- EclipseSubtarget.h - Define Subtarget for the Eclipse -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -5804,11 +6006,36 @@ index 000000000..7c49a4cff
 +  EclipseTargetLowering TLInfo;
 +  SelectionDAGTargetInfo TSInfo;
 +
++  // Set by ParseSubtargetFeatures (auto-generated by GET_SUBTARGETINFO_CTOR
++  // from Eclipse.td's FeatureHWFloat -- the field name here must match
++  // that SubtargetFeature's second argument exactly) when `+hwfloat` is
++  // requested via `-mattr=`/`-target-feature`. Defaults to false, i.e.
++  // every existing invocation with no such flag behaves exactly as
++  // before this feature existed. See Eclipse.td's FeatureHWFloat comment
++  // for the full story.
++  bool HasHWFloat = false;
++
++  // Called from the very first member initializer below (InstrInfo's),
++  // *before* TLInfo (EclipseTargetLowering) is constructed -- its
++  // constructor reads hasHWFloat() to decide which ADD_F32/SUB_F32
++  // libcall implementation to wire up, so ParseSubtargetFeatures (which
++  // sets HasHWFloat) has to have already run by then. Plain field
++  // initializers can't guarantee that ordering against another member's
++  // constructor (C++ initializes members in declaration order regardless
++  // of initializer-list order, and ParseSubtargetFeatures itself was
++  // previously only called from the constructor *body*, which always
++  // runs after every member is already constructed) -- this is the
++  // standard fix other LLVM subtargets use for the same problem.
++  const EclipseSubtarget &initializeSubtargetDependencies(StringRef CPU,
++                                                            StringRef FS);
++
 +public:
 +  EclipseSubtarget(const Triple &TT, StringRef CPU, StringRef FS,
 +                    const TargetMachine &TM);
 +
 +  void ParseSubtargetFeatures(StringRef CPU, StringRef TuneCPU, StringRef FS);
++
++  bool hasHWFloat() const { return HasHWFloat; }
 +
 +  const EclipseInstrInfo *getInstrInfo() const override { return &InstrInfo; }
 +  const TargetFrameLowering *getFrameLowering() const override {
