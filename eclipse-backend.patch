@@ -685,10 +685,10 @@ index 000000000..11a9b3268
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
 new file mode 100644
-index 000000000..1e53e2068
+index 000000000..9393e4ef0
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
-@@ -0,0 +1,740 @@
+@@ -0,0 +1,703 @@
 +//===-- EclipseAsmPrinter.cpp - Eclipse LLVM assembly writer ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -753,14 +753,8 @@ index 000000000..1e53e2068
 +  return Out;
 +}
 +
-+static StringRef stripSlotSuffix(StringRef SlotName) {
-+  return SlotName.ends_with("_SLOT") ? SlotName.drop_back(5) : SlotName;
-+}
-+
 +bool EclipseAsmPrinter::doInitialization(Module &M) {
 +  HasMain = M.getFunction("main") != nullptr;
-+  if (HasMain)
-+    addCallSlot("main_SLOT");
 +
 +  for (const Function &F : M) {
 +    if (F.isDeclaration() || !F.hasFnAttribute("interrupt"))
@@ -858,7 +852,9 @@ index 000000000..1e53e2068
 +    OutStreamer->emitRawText("\tSTA 0,040");
 +    OutStreamer->emitRawText("\tLDA 0,_STACKLIM");
 +    OutStreamer->emitRawText("\tSTA 0,042");
-+    OutStreamer->emitRawText("\tJSR @main_SLOT,0");
++    // Direct EJSR, absolute mode -- see EclipseInstrInfo.td's CALL comment
++    // for why "main" (a real symbol) needs no page-zero slot here anymore.
++    OutStreamer->emitRawText("\tEJSR main,0");
 +    OutStreamer->emitRawText("\tHALT");
 +    OutStreamer->emitRawText("");
 +  }
@@ -869,29 +865,12 @@ index 000000000..1e53e2068
 +  OutStreamer->emitRawText("");
 +}
 +
-+void EclipseAsmPrinter::emitEndOfAsmFile(Module &M) {
-+  OutStreamer->emitRawText("");
-+  OutStreamer->emitRawText("// --- indirect call jump table ---");
-+  for (const std::string &Slot : CallSlots)
-+    OutStreamer->emitRawText(
-+        ("var " + Twine(Slot) + " = " + stripSlotSuffix(Slot)).str());
-+
-+  if (!AddrSlots.empty()) {
-+    OutStreamer->emitRawText("");
-+    OutStreamer->emitRawText("// --- global address slots (LEAGA) ---");
-+    for (const std::string &Target : AddrSlots)
-+      OutStreamer->emitRawText(
-+          ("var " + Twine(Target) + "_PTR = " + Target).str());
-+  }
-+
-+  if (!OffsetSlots.empty()) {
-+    OutStreamer->emitRawText("");
-+    OutStreamer->emitRawText("// --- LEAGA offset constants ---");
-+    for (auto &Entry : OffsetSlots)
-+      OutStreamer->emitRawText(
-+          ("var " + Twine(Entry.first) + " = " + Twine(Entry.second)).str());
-+  }
-+}
++// No module-end bookkeeping needed anymore: direct calls (EJSR) and
++// global access (ELEF/ELDA/ESTA) both reach their targets via real
++// extended addressing, with no page-zero jump-table/pointer-slot
++// declarations left to flush here -- see EclipseInstrInfo.td's CALL and
++// LEAGA comments, and DEBUGGING_NOTES.md, for what this replaced.
++void EclipseAsmPrinter::emitEndOfAsmFile(Module &M) {}
 +
 +void EclipseAsmPrinter::emitGlobalVariable(const GlobalVariable *GV) {
 +  MCSymbol *Sym = getSymbol(GV);
@@ -917,9 +896,10 @@ index 000000000..1e53e2068
 +  // &g;` -- rather than materializing it at runtime the way LEAGA does for
 +  // an ordinary *value* use, this can go directly into the `var` line as a
 +  // symbol reference: dgasm resolves `var NAME = OTHERSYMBOL` to
-+  // OTHERSYMBOL's own assigned address at assemble time, exactly the same
-+  // mechanism already relied on for every `_SLOT`/`_PTR` slot this backend
-+  // emits elsewhere (see CALL's "<callee>_SLOT" and LEAGA's "<target>_PTR").
++  // OTHERSYMBOL's own assigned address at assemble time -- the same
++  // "symbol[+N]" expression-folding dgasm's assembler does for every
++  // ELEF/ELDA/ESTA address operand elsewhere in this file (see LEAGA's
++  // emitInstruction case).
 +  // No offset/GEP/bitcast unwrapping attempted here -- only a bare
 +  // GlobalValue used directly as the initializer, which is what `&foo`/`foo`
 +  // (a function decaying to its own pointer) actually look like at the IR
@@ -966,10 +946,11 @@ index 000000000..1e53e2068
 +      int16_t Word =
 +          static_cast<int16_t>(Val.lshr(ShiftAmt).trunc(16).getZExtValue());
 +      // Only the first (most-significant) word keeps the real symbol
-+      // name — LEAGA/the `_PTR` slot always materializes *this* word's
-+      // address, and every later word is only ever reached relative to
-+      // it via the `_off1`-style mechanism, never addressed by its own
-+      // name — same convention emitArrayElements below already uses for
++      // name — LEAGA/ELDAGA/ESTAGA always materialize/access *this*
++      // word's address directly, and every later word is only ever
++      // reached relative to it via a "target+N" address expression
++      // (extendedAddrExpr), never addressed by its own name — same
++      // convention emitArrayElements below already uses for
 +      // array elements past the first.
 +      std::string Name = i == 0 ? Sym->getName().str()
 +                                 : (Sym->getName() + "_word" + Twine(i)).str();
@@ -1065,9 +1046,9 @@ index 000000000..1e53e2068
 +  // itself a pointer to another global (a function pointer field, e.g.
 +  // `struct S { int (*fptr)(); } s = { &zero };`) instead becomes a symbol
 +  // reference to that global's own assembler name, exactly like the
-+  // top-level scalar-pointer-initializer case just above this lambda (same
-+  // dgasm `var NAME = OTHERSYMBOL` mechanism `_SLOT`/`_PTR` slots already
-+  // rely on elsewhere in this file) -- this was a real, confirmed gap, not
++  // top-level scalar-pointer-initializer case just above this lambda
++  // (same dgasm `var NAME = OTHERSYMBOL` mechanism relied on elsewhere in
++  // this file) -- this was a real, confirmed gap, not
 +  // a hypothetical: `struct S s = { &zero };` previously fell through to
 +  // the final "unsupported leaf constant" case below and silently stored a
 +  // literal 0 instead of zero's real address (found via c-testsuite 00089,
@@ -1175,6 +1156,50 @@ index 000000000..1e53e2068
 +        ("var " + Twine(GetCPISymbol(i)->getName()) + " = " + Twine(Value))
 +            .str());
 +  }
++}
++
++// Builds the dgasm address-expression text for an ELEF/ELDA/ESTA
++// instruction targeting a GlobalAddress operand: the target's own symbol
++// name, plus "+N"/"-N" if the operand carries a nonzero compile-time
++// offset. dgasm's expression evaluator resolves "symbol+integer" to the
++// symbol's own assigned address plus that integer at assemble time
++// (confirmed empirically -- see DEBUGGING_NOTES.md), so folding a
++// constant offset in here needs no extra instruction or page-zero word,
++// unlike the old LEAGA/_PTR scheme's runtime AC2-based ADD for the same
++// case.
++//
++// MO.getOffset() is a *byte* offset (LLVM's GlobalAddress offsets always
++// are), but this backend's addresses are word-granular (every Eclipse
++// word is 2 of those DataLayout bytes -- same reason
++// EclipseFrameLowering::processFunctionBeforeFrameFinalized divides
++// object sizes by 2). That "2 DataLayout bytes per word" rule only holds
++// for globals this backend actually *packs* two-bytes-to-a-word -- i.e.
++// numeric array initializers, emitted one full word per element by
++// emitGlobalVariable regardless of the element's own DataLayout size (so
++// 2 bytes worth of offset really does mean 1 word of address). A string
++// literal is emitted completely differently: dgasm's `var name = "..."`
++// (no `packed` suffix) reserves one full word *per character* (see
++// dgasm's assembler.c, VARIABLE_STRING vs VARIABLE_PACKED_STRING) -- so a
++// byte offset into a string is already a word offset, and dividing it by
++// 2 here would truncate every *odd* byte offset down to its even
++// neighbour's word, silently reading/writing the wrong character (the
++// exact bug the original LEAGA implementation of this same rule fixed --
++// see the "found via a local char arr[5]" history in this project's
++// DEBUGGING_NOTES.md).
++std::string EclipseAsmPrinter::extendedAddrExpr(const MachineOperand &MO) {
++  StringRef Target = getSymbol(MO.getGlobal())->getName();
++  int64_t Divisor = 2;
++  if (const auto *GV = dyn_cast<GlobalVariable>(MO.getGlobal())) {
++    if (GV->hasInitializer()) {
++      if (const auto *CDA = dyn_cast<ConstantDataArray>(GV->getInitializer()))
++        if (CDA->isString())
++          Divisor = 1;
++    }
++  }
++  int64_t Offset = MO.getOffset() / Divisor;
++  if (Offset == 0)
++    return Target.str();
++  return (Target + (Offset > 0 ? "+" : "") + Twine(Offset)).str();
 +}
 +
 +namespace {
@@ -1295,88 +1320,26 @@ index 000000000..1e53e2068
 +            .str());
 +    return;
 +  }
-+  case Eclipse::CALL: {
-+    StringRef Slot = MI->getOperand(0).getSymbolName();
-+    addCallSlot(Slot);
-+    break; // fall through to normal lowering for the JSR text itself
-+  }
 +  case Eclipse::LEAGA: {
 +    StringRef Dst = EclipseInstPrinter::getRegisterName(MI->getOperand(0).getReg());
-+    StringRef Target = getSymbol(MI->getOperand(1).getGlobal())->getName();
-+    addAddrSlot(Target);
-+    OutStreamer->emitRawText(
-+        (Twine("\tLDA ") + Dst + "," + Target + "_PTR").str());
-+
-+    // A GlobalAddress operand's offset is real: `opt` folds a
-+    // compile-time-constant `getelementptr(@global, N)` (from indexing
-+    // an array with a literal, or one the optimizer proved constant)
-+    // directly into this offset field rather than leaving it as a
-+    // separate runtime ADD — confirmed by inspecting the IR this
-+    // backend actually receives (`getelementptr inbounds nuw (i8, ptr
-+    // @foo, i16 N)` baked into the load's pointer operand). Previously
-+    // ignored entirely here: every LEAGA silently loaded the global's
-+    // *base* address regardless of N, so indexed access anywhere past
-+    // element 0 of an array read whatever unrelated data happened to
-+    // follow it in memory — a real, confirmed-the-hard-way bug (traced
-+    // actual DOA/DOB values sent to a real device on eclipseemu against
-+    // the known-correct source data to find it).
-+    //
-+    // AC2 is temporarily repurposed as scratch to hold the offset
-+    // constant for the ADD, saved/restored around it exactly like
-+    // MULrr/UDIVrr's post-RA expansion already does for the hardware
-+    // MUL/DIV operand convention (EclipseInstrInfo.cpp) — $dst is
-+    // always AC0 or AC1 (LEAGA's register class excludes the reserved
-+    // AC2/AC3), so this can never save/restore the wrong register.
-+    //
-+    // MI->getOperand(1).getOffset() is a *byte* offset (LLVM's
-+    // GlobalAddress offsets always are), but this backend's addresses
-+    // are word-granular (every Eclipse word is 2 of those DataLayout
-+    // bytes — same reason EclipseFrameLowering::
-+    // processFunctionBeforeFrameFinalized divides object sizes by 2).
-+    // Adding the raw byte count here landed 2x too far — confirmed the
-+    // hard way: reading at "base + 10" actually returned element 10's
-+    // value, not element 5's, once traced against the real deposited
-+    // memory addresses in a generated .simh.
-+    //
-+    // That "2 DataLayout bytes per word" rule only holds for globals
-+    // this backend actually *packs* two-bytes-to-a-word — i.e. numeric
-+    // array initializers, emitted one full word per element by
-+    // emitGlobalVariable below regardless of the element's own
-+    // DataLayout size (so 2 bytes worth of *offset* really does mean 1
-+    // word of address). A string literal is emitted completely
-+    // differently: dgasm's `var name = "..."` (no `packed` suffix, what
-+    // emitGlobalVariable emits) reserves one full word *per character*
-+    // (see dgasm's assembler.c, VARIABLE_STRING vs VARIABLE_PACKED_STRING)
-+    // — so a byte offset into a string is already a word offset, and
-+    // dividing it by 2 here truncates every *odd* byte offset down to
-+    // its even neighbour's word (bytes 2 and 3 both landing on word 1,
-+    // etc.), silently reading/writing the wrong character. Found via a
-+    // local `char arr[5] = {'H','e','l','l','o'}` whose compiler-
-+    // generated initializer copy (an unaligned `llvm.memcpy` from the
-+    // string constant, expanded into byte-sized sub-loads by LLVM's
-+    // generic unaligned-access lowering) corrupted exactly the odd-byte-
-+    // offset accesses this truncation predicts.
-+    int64_t Divisor = 2;
-+    if (const auto *GV = dyn_cast<GlobalVariable>(MI->getOperand(1).getGlobal())) {
-+      if (GV->hasInitializer()) {
-+        if (const auto *CDA = dyn_cast<ConstantDataArray>(GV->getInitializer()))
-+          if (CDA->isString())
-+            Divisor = 1;
-+      }
-+    }
-+    int64_t Offset = MI->getOperand(1).getOffset() / Divisor;
-+    if (Offset != 0) {
-+      std::string OffSym = addOffsetSlot(Target, Offset);
-+      // 040: fixed hardware stack-pointer location, same one real SAVE/
-+      // RTN use — see the BGEU/BLTU case above's comment (including on
-+      // the ISZ/DSZ push/pop direction).
-+      OutStreamer->emitRawText("\tISZ 040,0");
-+      OutStreamer->emitRawText("\tSTA 2,@040");
-+      OutStreamer->emitRawText(("\tLDA 2," + Twine(OffSym)).str());
-+      OutStreamer->emitRawText((Twine("\tADD 2,") + Dst).str());
-+      OutStreamer->emitRawText("\tLDA 2,@040");
-+      OutStreamer->emitRawText("\tDSZ 040,0");
-+    }
++    std::string Addr = extendedAddrExpr(MI->getOperand(1));
++    // ELEF: real Eclipse S/140 "extended load effective address" -- loads
++    // the operand's own resolved *address*, not the word stored there
++    // (confirmed empirically -- see DEBUGGING_NOTES.md). A single
++    // instruction, no page-zero pointer word at all.
++    OutStreamer->emitRawText((Twine("\tELEF ") + Dst + "," + Addr).str());
++    return;
++  }
++  case Eclipse::ELDAGA: {
++    StringRef Dst = EclipseInstPrinter::getRegisterName(MI->getOperand(0).getReg());
++    std::string Addr = extendedAddrExpr(MI->getOperand(1));
++    OutStreamer->emitRawText((Twine("\tELDA ") + Dst + "," + Addr).str());
++    return;
++  }
++  case Eclipse::ESTAGA: {
++    StringRef Src = EclipseInstPrinter::getRegisterName(MI->getOperand(0).getReg());
++    std::string Addr = extendedAddrExpr(MI->getOperand(1));
++    OutStreamer->emitRawText((Twine("\tESTA ") + Src + "," + Addr).str());
 +    return;
 +  }
 +  default:
@@ -1431,10 +1394,10 @@ index 000000000..1e53e2068
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.h b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.h
 new file mode 100644
-index 000000000..2c2b2c809
+index 000000000..cd561d350
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.h
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,118 @@
 +//===-- EclipseAsmPrinter.h - Eclipse LLVM assembly writer -----*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -1445,18 +1408,23 @@ index 000000000..2c2b2c809
 +//
 +// Drives the module-level structure a real dgasm source file needs (an
 +// `org`/`dev` preamble, an optional `_start`/HALT entry trampoline when
-+// the module defines `main`, `var` declarations for globals/string
-+// literals/constant-pool entries, and one `var <callee>_SLOT = <callee>`
-+// per distinct call target for the indirect-call jump table) around the
-+// per-function instruction text. See README.md and the sibling `eccc`
-+// project's crates/eccc-codegen/src/symbolic.rs, which this mirrors.
++// the module defines `main`, and `var` declarations for globals/string
++// literals/constant-pool entries) around the per-function instruction
++// text. See README.md and the sibling `eccc` project's
++// crates/eccc-codegen/src/symbolic.rs, which this mirrors. Direct calls
++// (EJSR) and global access (ELEF/ELDA/ESTA) both reach their targets via
++// real Eclipse S/140 extended addressing now, with no page-zero
++// jump-table or pointer-slot bookkeeping left for this file to track at
++// all -- see EclipseInstrInfo.td's CALL and LEAGA comments, and
++// DEBUGGING_NOTES.md, for that history.
 +//
-+// IMPORTANT — page-zero placement: all `var` declarations (constant
-+// pool, globals, the jump table, `_SP`/`_scratch`) must physically end up
-+// within the first ~200 words of the address space: `LDA`/`STA ac,addr`
-+// default to *page-zero* (absolute, no index) addressing with only an
-+// 8-bit displacement, and dgasm assigns addresses strictly in textual
-+// source order starting at `org` (confirmed by reading its assembler.c
++// IMPORTANT — page-zero placement: all `var` declarations that must
++// still be page-zero-resident (the constant pool, `_STACKTOP`/
++// `_STACKLIM`/`_scratch`) must physically end up within the first ~200
++// words of the address space: `LDA`/`STA ac,addr` default to
++// *page-zero* (absolute, no index) addressing with only an 8-bit
++// displacement, and dgasm assigns addresses strictly in textual source
++// order starting at `org` (confirmed by reading its assembler.c
 +// directly, not assumed). Growing function bodies can push a `var` line
 +// emitted after them past address 255, which dgasm rejects.
 +//
@@ -1472,9 +1440,7 @@ index 000000000..2c2b2c809
 +// within each group. Pure line-oriented text manipulation, easy to
 +// verify independently of AsmPrinter's internals. Matches eccc's own
 +// proven layout (docs/DESIGN.md / docs/CALLING_CONVENTION.md): small
-+// page-zero data first, arbitrarily-large code after, reached only via
-+// PC-relative jumps or through-the-jump-table calls, never direct
-+// page-zero addressing.
++// page-zero data first, arbitrarily-large code after.
 +//
 +//===----------------------------------------------------------------------===//
 +
@@ -1488,30 +1454,6 @@ index 000000000..2c2b2c809
 +namespace llvm {
 +
 +class EclipseAsmPrinter : public AsmPrinter {
-+  SmallVector<std::string, 8> CallSlots;
-+  // Pointer-word slots for LEAGA (see EclipseInstrInfo.td's LEAGA comment):
-+  // "var <name>_PTR = <name>" holds a global's *address* as a page-zero
-+  // data word, the same indirection CallSlots already uses for function
-+  // addresses. Stores the *target* name (e.g. ".str"); the printer
-+  // appends "_PTR" itself when declaring and referencing the slot.
-+  SmallVector<std::string, 8> AddrSlots;
-+  // Constant page-zero words holding a nonzero LEAGA offset (see the
-+  // LEAGA case in emitInstruction): `getelementptr(@global, N)` folded
-+  // into a GlobalAddress operand's offset, for N != 0. This ISA has no
-+  // immediate-operand ADD, so combining a compile-time-constant offset
-+  // into a loaded pointer needs the offset materialized as its own data
-+  // word first, the same reason every other "constant" in this backend
-+  // goes through a var/constant-pool word (see EclipseInstrInfo.td's
-+  // file header). Keyed by (target, offset) so the same offset into the
-+  // same global is only declared once. This is a *separate* bookkeeping
-+  // vector from AddrSlots (not reusing MF->getConstantPool()) because a
-+  // constant pool entry added this late — during per-instruction text
-+  // emission — would arrive after emitConstantPool() already ran for
-+  // this function and never get its `var` line emitted at all; AddrSlots
-+  // and CallSlots already solve exactly this ordering problem by
-+  // collecting names during instruction emission and flushing them in
-+  // emitEndOfAsmFile, so this follows the same proven pattern.
-+  SmallVector<std::pair<std::string, int64_t>, 8> OffsetSlots;
 +  bool HasMain = false;
 +
 +  // Name of the module's `__attribute__((interrupt))` function, if any
@@ -1523,35 +1465,20 @@ index 000000000..2c2b2c809
 +  // (doInitialization), not a "pick one" situation.
 +  std::string InterruptHandlerName;
 +
-+  void addCallSlot(StringRef Slot) {
-+    if (!llvm::is_contained(CallSlots, Slot.str()))
-+      CallSlots.push_back(Slot.str());
-+  }
-+
-+  void addAddrSlot(StringRef Target) {
-+    if (!llvm::is_contained(AddrSlots, Target.str()))
-+      AddrSlots.push_back(Target.str());
-+  }
-+
-+  // Returns the symbol name to use for `Target`'s Offset constant word,
-+  // declaring it (once) if this is the first time this exact
-+  // (Target, Offset) pair has been seen.
-+  std::string addOffsetSlot(StringRef Target, int64_t Offset) {
-+    std::string Name = (Target + "_off" + Twine(Offset)).str();
-+    for (auto &Entry : OffsetSlots)
-+      if (Entry.first == Name)
-+        return Name;
-+    OffsetSlots.emplace_back(Name, Offset);
-+    return Name;
-+  }
++  // Builds the dgasm address-expression text ("target" or "target+-N")
++  // for an ELEF/ELDA/ESTA instruction's GlobalAddress operand -- see the
++  // definition in EclipseAsmPrinter.cpp for the full rationale (dgasm's
++  // "symbol+integer" expression folding, and the byte-vs-word offset
++  // divisor rule shared with emitGlobalVariable).
++  std::string extendedAddrExpr(const MachineOperand &MO);
 +
 +  // NB: internal JMPs (conditional-branch trailing jumps and plain
-+  // unconditional ones) stay direct/PC-relative here, not indirected
-+  // through a page-zero slot the way CALL is. Unlike CALL — one slot per
-+  // *function*, a naturally small set — a real program can have many
-+  // dozens of basic blocks; giving every one a permanent page-zero slot
-+  // was tried and overflowed the 256-word page-zero budget on nothing
-+  // fancier than eclipse_rt.c's printf/scanf. Out-of-range jumps (dgasm:
++  // unconditional ones) stay direct/PC-relative, base-ISA JMP (no
++  // extended EJMP form used here) — a real program can have many dozens
++  // of basic blocks; giving every one a permanent page-zero slot (the
++  // scheme CALL itself used before it moved to direct EJSR) was tried and
++  // overflowed the 256-word page-zero budget on nothing fancier than
++  // eclipse_rt.c's printf/scanf. Out-of-range jumps (dgasm:
 +  // "Address out of range", displacement outside -128..127) are instead
 +  // relaxed selectively, only where actually needed, by
 +  // eclipse-toolchain/reorder_asm.py — it runs after llc, when real
@@ -1993,10 +1920,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..f0e51446b
+index 000000000..87ade562d
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1738 @@
+@@ -0,0 +1,1744 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -3285,39 +3212,45 @@ index 000000000..f0e51446b
 +    Chain = SDValue(DAG.getMachineNode(Eclipse::PUSH, dl, MVT::Other, Ops), 0);
 +  }
 +
-+  // Direct call (a real GlobalValue or an external/libcall symbol): indirect
-+  // through a page-zero jump-table slot named "<callee>_SLOT" — see
-+  // EclipseInstrInfo.td's CALL def and docs/CALLING_CONVENTION.md. Always an
-+  // ExternalSymbol operand (even for a real GlobalValue callee): "<name>_SLOT"
-+  // isn't itself a GlobalValue, just a compiler-synthesized data symbol
-+  // EclipseAsmPrinter emits alongside it.
++  // Direct call (a real GlobalValue or an external/libcall symbol): a
++  // direct EJSR straight to the callee's own symbol -- see
++  // EclipseInstrInfo.td's CALL def for why this needs no page-zero slot at
++  // all (real Eclipse extended addressing, unlike base-ISA JSR, reaches
++  // the callee's address directly regardless of distance). Always an
++  // ExternalSymbol operand (even for a real GlobalValue callee): CALL's
++  // Pattern matches texternalsym, and a GlobalValue's own name string is
++  // all EJSR's assembly text needs -- no separate compiler-synthesized
++  // symbol required anymore (the "<name>_SLOT" indirection this replaced
++  // did need one, since dgasm's `var NAME = OTHERSYMBOL` mechanism was
++  // the only way to get a page-zero pointer word; EJSR needs no such
++  // word).
 +  //
 +  // Indirect call (calling through a function-pointer *value* computed at
 +  // runtime -- Callee is neither of the two SDNode kinds above, just an
 +  // ordinary i16 SSA value already materialized into a register by the time
 +  // it reaches here, e.g. loaded from a struct field or a local variable):
-+  // there's no compile-time-known callee to hang a "_SLOT" symbol off of at
-+  // all. Real Nova/Eclipse JSR has no "jump to whatever's in a register"
-+  // addressing mode -- only direct, AC1/AC2/AC3-indexed, and
-+  // memory-indirect, the same set LDA/STA support (confirmed against the
-+  // DG ISA and re-confirmed empirically on eclipseemu) -- so this goes
-+  // through a distinct EclipseISD::CALL_INDIRECT node instead, which
++  // there's no compile-time-known callee symbol for EJSR's assembly-text
++  // operand to reference at all. Real Nova/Eclipse JSR/EJSR have no "jump
++  // to whatever's in a register" addressing mode -- only a compile-time
++  // expression or memory-indirect (confirmed against the DG ISA and
++  // re-confirmed empirically on eclipseemu) -- so this goes through a
++  // distinct EclipseISD::CALL_INDIRECT node instead, which
 +  // EclipseInstrInfo.td's CALLIND pseudo expands (via emitCallIndirect) into
 +  // storing the pointer value into the shared page-zero `_scratch` word
 +  // (the same one LDIND/STIND already use for general pointer dereference)
-+  // followed by "JSR @_scratch,0".
++  // followed by base-ISA "JSR @_scratch,0" -- unrelated to and untouched by
++  // the direct-call change above.
 +  SDVTList NodeTys = DAG.getVTList(MVT::Other, MVT::Glue);
 +  SmallVector<SDValue, 4> CallOps{Chain, Callee};
 +  if (auto *G = dyn_cast<GlobalAddressSDNode>(Callee)) {
-+    std::string SlotName = (G->getGlobal()->getName() + "_SLOT").str();
 +    const char *PersistentName =
-+        DAG.getMachineFunction().createExternalSymbolName(SlotName);
++        DAG.getMachineFunction().createExternalSymbolName(
++            G->getGlobal()->getName());
 +    CallOps[1] = DAG.getTargetExternalSymbol(PersistentName, MVT::i16);
 +    Chain = DAG.getNode(EclipseISD::CALL, dl, NodeTys, CallOps);
 +  } else if (auto *E = dyn_cast<ExternalSymbolSDNode>(Callee)) {
-+    std::string SlotName = (Twine(E->getSymbol()) + "_SLOT").str();
 +    const char *PersistentName =
-+        DAG.getMachineFunction().createExternalSymbolName(SlotName);
++        DAG.getMachineFunction().createExternalSymbolName(E->getSymbol());
 +    CallOps[1] = DAG.getTargetExternalSymbol(PersistentName, MVT::i16);
 +    Chain = DAG.getNode(EclipseISD::CALL, dl, NodeTys, CallOps);
 +  } else {
@@ -4481,10 +4414,10 @@ index 000000000..4caee1b13
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEINSTRINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.td b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
 new file mode 100644
-index 000000000..3383bb40d
+index 000000000..11dde1489
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
-@@ -0,0 +1,592 @@
+@@ -0,0 +1,649 @@
 +//===- EclipseInstrInfo.td - Eclipse Instruction defs ------*- tablegen -*-=//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4663,12 +4596,15 @@ index 000000000..3383bb40d
 +def LEAFI : EclipsePseudo<(outs GPR:$dst), (ins i16imm:$fi), "# LEAFI", []>;
 +
 +// LDABS/STABS have NO Pattern for a *global* (tglobaladdr) load/store,
-+// deliberately: see the "page-zero indirect data addressing" comment
-+// below LEAGA's definition for why a global's actual content is never
-+// addressed directly (only tconstpool — genuinely single-word values —
-+// still uses these two directly, just below). A bare LDABS/STABS
-+// definition still exists because LEAFI's frame-index materialization
-+// and other internal uses reference the opcodes directly.
++// deliberately: see the "global data addressing" comment below LEAGA's
++// definition — a global goes through real extended addressing
++// (ELDAGA/ESTAGA, i.e. ELDA/ESTA) instead, which reaches the entire
++// address space directly rather than LDA/STA's page-zero-only 8-bit
++// displacement (only tconstpool — genuinely single-word values, always
++// page-zero-resident by design — still uses these two directly, just
++// below). A bare LDABS/STABS definition still exists because LEAFI's
++// frame-index materialization and other internal uses reference the
++// opcodes directly.
 +def LDABS : EclipseInst<(outs GPR:$dst), (ins i16imm:$addr), "LDA $dst,$addr", []>;
 +def STABS : EclipseInst<(outs), (ins GPR:$src, i16imm:$addr), "STA $src,$addr", []>;
 +
@@ -4679,38 +4615,76 @@ index 000000000..3383bb40d
 +// unlike a global's address, so this is the same LDABS instruction.
 +def : Pat<(i16 (EclipseWrapper tconstpool:$cp)), (LDABS tconstpool:$cp)>;
 +
-+// Page-zero indirect data addressing. `LDA/STA ac,addr` only has an
-+// 8-bit displacement (0-255), and this backend originally put every
-+// global's/string's *actual content* there directly — meaning a single
-+// 256-word budget was shared by the entire program's data, not just its
-+// pointers. A program pulling in a modest combination of runtime-library
-+// functions (confirmed empirically: printf + string.h + ctype.h +
-+// stdlib.h together) could exceed that outright. Since indirect
-+// addressing ("LDA ac,@addr") has no such range limit — the *pointer*
-+// lives in page-zero, but what it points to can be anywhere — globals
-+// are now reached that way universally: a global's wrapper used *as a
-+// value* (bare, not `load`-wrapped, e.g. a string literal or array
-+// decaying to a pointer) materializes its address via LEAGA, exactly as
-+// before; but now the *load-wrapped* case (LDABS's old direct-content
-+// Pattern, removed above) is deliberately left unhandled here too, so
-+// SelectionDAG's ordinary bottom-up matching falls back to composing two
-+// independently-proven pieces: LEAGA (this address materialization) feeds
-+// its result register into LDIND/STIND's *existing*, unrelated
-+// register-pointer-dereference pattern (used for `*p`-style C pointer
-+// dereference via the shared `_scratch` word) — no new Pat needed for
-+// that composition to work. Every global access now costs one extra
-+// instruction (materialize the address) plus one extra memory read
-+// (through `_scratch`) versus the old direct scheme, but the page-zero
-+// cost of a global drops from "one word per word of content" to exactly
-+// one pointer word, regardless of size — reorder_asm.py places the
-+// pointer slot in page-zero and the actual content wherever it
-+// naturally falls (no longer reordered to the front).
++// Global data addressing via real Eclipse S/140 extended addressing
++// (ELEF/ELDA/ESTA — a 2-word encoding whose second word holds a genuine
++// absolute address reaching the entire 32K-word address space directly,
++// confirmed against the real S/140 Programmer's Reference and
++// empirically on eclipseemu/dgasm; see DEBUGGING_NOTES.md). `LDA/STA
++// ac,addr` (the *base*-ISA instructions used everywhere else in this
++// file) only has an 8-bit displacement (0-255) — this backend originally
++// put every global's/string's *actual content* directly in page-zero
++// under that limit, meaning a single 256-word budget was shared by the
++// entire program's data, not just its pointers (confirmed empirically to
++// fail outright on nothing fancier than printf + string.h + ctype.h +
++// stdlib.h together). That was fixed once already by *indirecting*
++// through a page-zero pointer word (LEAGA materializing an address, then
++// LDIND/STIND's `_scratch`-based dereference) — real, but still not
++// free: still one page-zero word per distinct global, plus two runtime
++// instructions per access. ELEF/ELDA/ESTA remove that page-zero cost
++// entirely: since their own address operand already reaches the full
++// address space with no page-zero involvement at all, a global's address
++// or content is materialized/accessed with a *single* instruction and
++// *zero* page-zero words, not through an indirect pointer.
++//
++// Three instructions cover the three shapes global access takes here:
++//   - LEAGA (real mnemonic ELEF, "extended load effective address"):
++//     materializes a global's *address* as a value — `&global`, a string
++//     literal or array decaying to a pointer, a function value. Confirmed
++//     empirically that ELEF loads the operand's own resolved address,
++//     not the word stored there (unlike ELDA) — see DEBUGGING_NOTES.md.
++//   - ELDAGA/ESTAGA (real mnemonics ELDA/ESTA): a *direct* load/store of
++//     a global's content with no runtime-computed offset involved — the
++//     common case, one real instruction in place of LEAGA+LDIND/STIND's
++//     three. Only fires when the load/store's pointer operand is
++//     *exactly* a bare global address (see the Pats below) — deeper
++//     matches win under SelectionDAG's normal pattern-complexity
++//     preference, so this doesn't disturb any other composition.
++// Every other case — a *runtime*-computed offset added to a global base
++// (indexing an array with a non-constant, `PerformDAGCombine`'s
++// WORD_ADD), or an 8-bit truncating/extending load or store
++// (extloadi8/sextloadi8/zextloadi8/truncstorei8) — still composes LEAGA
++// (now ELEF-backed, still just materializing an address into a register)
++// with LDIND/STIND exactly as before; nothing about those paths changes.
++//
++// A compile-time-constant offset (a literal array index, a struct field
++// — already folded into the GlobalAddress operand's own Offset field by
++// `isOffsetFoldingLegal`, see EclipseISelLowering.h) is folded directly
++// into the emitted address *expression text* ("target+N") rather than
++// materialized as a separate constant word and added at runtime: dgasm's
++// expression evaluator resolves "symbol+integer" to the symbol's own
++// assigned address plus that integer at assemble time (confirmed
++// empirically — see DEBUGGING_NOTES.md), so this needs no extra
++// instruction or page-zero word at all, unlike the old LEAGA scheme's
++// AC2-based runtime ADD for the same case. See EclipseAsmPrinter.cpp's
++// emitInstruction (the LEAGA/ELDAGA/ESTAGA cases) for the actual text
++// construction, including the same byte-vs-word-offset divisor rule
++// emitGlobalVariable already established (word-granular for a numeric
++// global, unscaled for a string literal).
 +//
 +// tconstpool is deliberately NOT changed to this scheme (see the Pat
-+// just above): a constant-pool entry is already exactly one word, so
-+// indirecting it would only add overhead with no page-zero savings.
++// above LDABS's def): a constant-pool entry is already exactly one word,
++// so indirecting — or extended-addressing — it would only add overhead
++// with no page-zero savings.
 +def LEAGA : EclipseInst<(outs GPR:$dst), (ins i16imm:$addr), "# LEAGA", []>;
 +def : Pat<(i16 (EclipseWrapper tglobaladdr:$addr)), (LEAGA tglobaladdr:$addr)>;
++
++let mayLoad = 1 in
++def ELDAGA : EclipseInst<(outs GPR:$dst), (ins i16imm:$addr), "# ELDAGA", []>;
++def : Pat<(i16 (load (EclipseWrapper tglobaladdr:$addr))), (ELDAGA tglobaladdr:$addr)>;
++
++let mayStore = 1 in
++def ESTAGA : EclipseInst<(outs), (ins GPR:$src, i16imm:$addr), "# ESTAGA", []>;
++def : Pat<(store GPR:$src, (EclipseWrapper tglobaladdr:$addr)), (ESTAGA GPR:$src, tglobaladdr:$addr)>;
 +
 +// Page-zero *indirect* load/store: "LDA/STA ac,@addr" — one extra level of
 +// indirection through whatever address is stored at the (page-zero) word
@@ -4853,28 +4827,44 @@ index 000000000..3383bb40d
 +}
 +}
 +
-+// Calls go indirectly through a page-zero jump-table slot, exactly like
-+// eccc's own `call` (docs/CALLING_CONVENTION.md): JSR's direct displacement
-+// can't reach an arbitrarily distant target on real hardware, but
-+// page-zero addressing has no such limit. `$func` is already the
-+// "<callee>_SLOT" symbol name (EclipseISelLowering.cpp's LowerCall builds
-+// it, and EclipseAsmPrinter emits one `var <callee>_SLOT = <callee>`
-+// declaration per distinct callee it sees).
++// Direct calls go through EJSR, real Eclipse S/140 extended addressing:
++// a 2-word instruction whose second word holds a genuine absolute address
++// reaching the entire 32K-word address space directly (confirmed against
++// the real S/140 Programmer's Reference and empirically on eclipseemu —
++// see DEBUGGING_NOTES.md's entry on this change). This replaced an
++// earlier page-zero jump-table scheme (`var <callee>_SLOT = <callee>`,
++// `JSR @<callee>_SLOT,0`) that existed only because base-ISA JSR's direct
++// displacement can't reach an arbitrarily distant target — EJSR has no
++// such limit, so no page-zero slot is needed at all: `$func` is the
++// callee's own symbol name (a real GlobalValue's name or an external/
++// libcall symbol), not a synthesized slot name.
++//
++// The explicit ",0" forces *absolute* addressing rather than dgasm's
++// default (bare "EJSR $func", one operand) — which auto-selects
++// *PC-relative* addressing instead, a real ±16383-word range limit dgasm
++// enforces at assemble time ("Address out of range") unlike absolute
++// mode's full unsigned 0-32767 coverage of this target's entire address
++// space. Confirmed against dgasm's own opcode.c: EJSR's one-operand form
++// defaults index to 1 (PC-relative), while an explicit "0" third field
++// forces index 0 (absolute) — see get_addressing_mode/
++// encode_extendedflow_instruction there. No generated program has come
++// remotely close to that relative range either way, but absolute mode
++// removes the question entirely rather than relying on every call site
++// happening to stay under 16384 words from its callee.
 +let isCall = 1, Defs = [AC0, AC1, AC3], Uses = [AC2] in
-+def CALL : EclipseInst<(outs), (ins calltarget:$func), "JSR @$func,0",
++def CALL : EclipseInst<(outs), (ins calltarget:$func), "EJSR $func,0",
 +                        [(EclipseCall texternalsym:$func)]>;
 +
 +// Indirect call through a runtime-computed function-pointer value: unlike
-+// CALL, there's no compile-time-known callee symbol to hang a "<callee>_SLOT"
-+// page-zero slot off of (EclipseAsmPrinter.cpp emits one such `var` line per
-+// distinct *direct* call target — see CALL's comment above — but a value
-+// computed at runtime, held in a register, has no name at all). JSR itself
-+// only has the same "@<page-zero addr>,0" indirect addressing mode CALL
-+// already uses; there's no separate "jump to whatever's in a register"
-+// hardware mode on this ISA (confirmed against the DG Nova/Eclipse
-+// instruction set: JSR's addressing modes are exactly LDA/STA's -- direct,
-+// indexed-by-AC1/AC2/AC3, and indirect-through-*memory*, never a bare
-+// register target -- and empirically re-confirmed on eclipseemu below).
++// CALL, there's no compile-time-known callee symbol at all here (a value
++// computed at runtime, held in a register, has no name an assembler
++// expression like EJSR's could reference), so CALL's direct-EJSR scheme
++// doesn't apply — this still needs to go through *some* indirection. Real
++// Nova/Eclipse JSR/EJSR only ever address a compile-time-resolvable
++// expression or an indirect-through-*memory* pointer word; there's no
++// "jump to whatever's in a register" hardware mode on this ISA at all
++// (confirmed against the DG Nova/Eclipse instruction set -- and
++// empirically re-confirmed on eclipseemu below).
 +//
 +// So the function-pointer value (already an ordinary i16 SSA value by the
 +// time it reaches here, wherever it came from -- a load, a parameter, a

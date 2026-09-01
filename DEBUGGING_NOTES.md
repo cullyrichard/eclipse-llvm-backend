@@ -1740,6 +1740,187 @@ disassembly-of-incidental-memory shown at each `HALT`/timeout PC, which
 shifts along with this fix's code-layout changes and was never
 meaningful program state.
 
+### 22. Direct calls via `EJSR`, eliminating the page-zero call-table slot (changed design, verified)
+
+Not a bug fix — a deliberate design change once real Eclipse S/140
+*extended addressing* was confirmed to exist and work on this exact
+toolchain. Every previous entry in this log (and the backend's own
+README) treated "no immediate operands, only page-zero (0-255 word)
+absolute addressing, or ±127-word PC/AC-relative addressing" as the
+hard ISA ceiling — true for the base Nova instruction set this backend
+had exclusively targeted so far, and the entire reason `CALL` went
+through a page-zero jump table (`var <callee>_SLOT = <callee>`, `JSR
+@<callee>_SLOT,0`) instead of a direct `JSR`: a direct `JSR`'s signed
+displacement genuinely can't reach an arbitrarily distant function on
+real hardware.
+
+**What's actually there**: real Eclipse (not the base Nova ISA) has a
+genuine extended-addressing instruction family — `ELDA`/`ESTA`/`EJMP`/
+`EJSR`/`ELEF`/`EISZ`/`EDSZ`/`ELDB`/`ESTB` — each a 2-word encoding whose
+second word holds a real address reaching the *entire* 32K-word address
+space directly, no page-zero indirection needed. Confirmed against the
+real S/140 Programmer's Reference and empirically on this exact
+`dgasm`/`eclipseemu` toolchain: a hand-written `EJSR farfunc` correctly
+saved its return address in AC3 (matching this backend's existing
+calling convention) and jumped/returned correctly across a distance
+(050 to 500 octal) far exceeding the base-ISA displacement limit.
+
+**Addressing-mode subtlety, checked before relying on it**: `dgasm`'s
+one-operand `EJSR $func` form auto-selects *PC-relative* addressing
+(confirmed by reading `opcode.c`'s `encode_extendedflow_instruction`:
+`argc == 1` defaults `index` to 1, i.e. relative), which still has a
+real ±16383-word range limit `dgasm` enforces at assemble time. The
+explicit three-operand form (`EJSR $func,0`) forces *absolute*
+addressing instead — unsigned 0-32767, this target's entire address
+space, no distance limit at all. This backend now always emits the
+explicit `,0` form for exactly this reason: no generated program has
+come remotely close to the relative limit, but there's no reason to
+depend on that holding rather than removing the question entirely.
+
+**Change**: `EclipseInstrInfo.td`'s `CALL` def emits `"EJSR $func,0"`
+instead of `"JSR @$func,0"`; `EclipseISelLowering.cpp`'s `LowerCall` no
+longer synthesizes a `"<callee>_SLOT"` name, just passes the callee's
+own symbol through; `EclipseAsmPrinter.cpp`/`.h` drop the `CallSlots`
+bookkeeping and the "indirect call jump table" `var` emission entirely.
+`main`'s `_start` trampoline call is now `EJSR main,0`. The *indirect*
+(function-pointer) call mechanism (`CALLIND`/`CALLIND_JSR`, entry #17)
+is untouched — `EJSR` still can't take a register operand on real
+hardware, so a runtime-computed callee still goes through the shared
+`_scratch` word exactly as before; that mechanism was never a
+page-zero *budget* problem in the first place (one shared word, not one
+per call site).
+
+**Verified**: `regress_hwstack.sh` byte-identical to the pre-change
+baseline except for benign PC/incidental-disassembly shifts at each
+`HALT`/timeout line (same pattern as entry #21) and the same four
+pre-existing "Step expired" cases (`isr_c_test`, `test_fps_add`,
+`test_fps_md`, `fps_dma_test`). Full c-testsuite: 197/220, PASS set
+diffed directly against the pre-change baseline — identical, zero
+regressions. `00216` (previously `COMPILE_FAIL` on page-zero exhaustion)
+now compiles and assembles successfully and instead times out at
+runtime — real forward progress from the freed page-zero budget, not
+yet a pass on its own.
+
+### 23. Global access via `ELEF`/`ELDA`/`ESTA`, eliminating the page-zero pointer-per-global scheme (changed design, verified) — plus a `reorder_asm.py` multi-word-instruction bug found and fixed alongside it
+
+Follow-on to entry #22, applying the same real-extended-addressing
+capability to the bigger page-zero cost in this project: the
+pointer-per-global scheme entry in "Known limitations" (the one entry
+above this whole numbered log describes, "Page-zero holds pointers, not
+data") — `LEAGA` materializing a global's address by loading a
+page-zero `var <name>_PTR = <name>` word, then `LDIND`/`STIND`
+dereferencing through the shared `_scratch` word. That scheme itself
+was a real fix for a real, earlier budget problem (see the README
+section above) — but it still cost one page-zero word per distinct
+global, regardless of size.
+
+**Design**: `ELEF` ("extended load effective address") loads the
+*address* an extended operand resolves to, not the word stored there —
+confirmed empirically on eclipseemu (`ELEF 0,farvar` with `farvar` at
+address 500 loaded `500` into AC0, not `farvar`'s stored value). `ELDA`/
+`ESTA` load/store a word at an extended address directly. Three
+`EclipseInstrInfo.td` defs now cover global access:
+- `LEAGA` (unchanged name, changed implementation): now expands to a
+  single `ELEF $dst,$addr` — no page-zero pointer word at all. Used
+  wherever a global's *address* is needed as a value (`&global`, string
+  literal/array decay, a function value), and as the address-
+  materialization half of the existing runtime-offset composition with
+  `LDIND`/`STIND` (a non-constant array index, an 8-bit extending/
+  truncating access) — both unchanged.
+- New `ELDAGA`/`ESTAGA` (real mnemonics `ELDA`/`ESTA`): match the
+  common case of a *direct* load/store of a global's content with no
+  runtime offset — one real instruction instead of `LEAGA`+`LDIND`/
+  `STIND`'s three. New, more specific `Pat`s
+  (`(load (EclipseWrapper tglobaladdr))` / `(store ..., (EclipseWrapper
+  tglobaladdr))`) win under SelectionDAG's normal deepest-match
+  preference over the older two-node composition, without disturbing
+  any case that doesn't match exactly (extload/truncstore, a runtime
+  offset) — those still fall through to the unchanged composition.
+- A compile-time-constant offset (an array index, a struct field —
+  already folded into the `GlobalAddress` operand's `Offset` field by
+  `isOffsetFoldingLegal`, entry #18) is now folded directly into the
+  emitted address text (`"target+N"`) instead of materialized as a
+  separate constant word added at runtime via AC2: confirmed
+  empirically that `dgasm`'s expression evaluator resolves
+  `"symbol+integer"` to the symbol's own assigned address plus that
+  integer at assemble time (`ELDA 0,farvar+2` correctly read the third
+  word after `farvar`). This needs no extra instruction or page-zero
+  word at all, and incidentally fixes a latent gap in the old `LEAGA`
+  implementation, which performed the equivalent runtime add through
+  AC2 without ever declaring AC2 as a clobbered register in TableGen.
+
+Removed as a result: the `AddrSlots`/`addAddrSlot` (`*_PTR`) and
+`OffsetSlots`/`addOffsetSlot` (`*_offN`) bookkeeping in
+`EclipseAsmPrinter`, and their `var`-line emission in
+`emitEndOfAsmFile` (now empty — nothing left to flush at module end).
+`tconstpool` is untouched, per its existing comment: already one word
+each, indirecting or extended-addressing it would add overhead with no
+page-zero savings.
+
+**A real regression found during verification, root-caused and fixed —
+not in the backend itself**: the first full c-testsuite run after this
+change showed exactly one regression from the entry #22 baseline,
+`00150` (a global struct pointer with nested struct/pointer/array
+fields) going from `PASS` to `TIMEOUT`. Traced with a step-by-step
+`eclipseemu` trace (`PC`/`AC2`/`AC3` sampled every 15 steps) to a `JMP
+0` trap partway through `main`, with `AC2`/`AC3` (the frame pointer)
+still holding a plausible, unchanged value right up to the jump — ruling
+out the classic return-address-corruption shape and pointing instead at
+program data getting silently overwritten. Confirmed directly:
+`eclipse-toolchain/reorder_asm.py`'s `compute_addresses` — which
+replicates `dgasm`'s own pass-1 sequential address assignment, and which
+`fix_stack_pointer` trusts to compute where the *real* end of the
+program's data is so it can place `_STACKTOP` safely above it — assumed
+every real instruction is exactly one 16-bit word (true for every
+opcode this backend emitted before entries #22/#23; the file's own
+comment said so explicitly). `EJSR`/`ELEF`/`ELDA`/`ESTA` are genuinely
+2 words each, so any program with enough of them ahead of its trailing
+bulk data accumulated a real, silent under-count — confirmed on `00150`:
+`compute_addresses` computed the program's end at decimal 235, while
+`dgasm`'s real, assembled output actually ended at decimal 243, an
+8-word gap. `_STACKTOP` (`end_addr + 4096` margin) landed 8 words too
+low, so the upward-growing hardware stack immediately overwrote the
+tail of the program's own global data (`gs1`/the compound literal/`s`)
+the moment `main`'s prologue and first locals were pushed — invisible on
+small programs (not enough extended instructions ahead of the data to
+accumulate a large enough gap to matter) and only surfacing once a
+program had enough of them, which is exactly why the regression was a
+single test, not many.
+
+**Fix** (`eclipse-toolchain/reorder_asm.py`, synced to
+`eclipse-package/eclipse-toolchain/reorder_asm.py`): a new
+`EXTENDED_INSN_RE` matching the full real extended-addressing mnemonic
+family (`EJSR`/`EJMP`/`ELEF`/`ELDA`/`ESTA`/`EISZ`/`EDSZ`/`ELDB`/`ESTB`
+— only the first four are actually emitted by this backend today, the
+rest included for the same family this project's own opportunity
+research already confirmed exists), and `compute_addresses` now
+advances the address counter by 2 for a matching line instead of
+unconditionally by 1. Re-verified directly: with the fix,
+`compute_addresses`'s own `end_addr` for `00150` now matches `dgasm`'s
+real final deposited address exactly (both decimal 243).
+
+**Verified**: `regress_hwstack.sh` byte-identical to entry #22's own
+output except for the same benign PC/incidental-disassembly shifts, and
+the same four pre-existing "Step expired" cases. Full c-testsuite (with
+the `reorder_asm.py` fix in place): 197/220, PASS set diffed directly
+against entry #22's own baseline — identical, zero regressions (`00150`
+itself re-confirmed `PASS` again). Without the fix, this phase's backend
+change alone regressed exactly `00150` and nothing else, from 197 to
+196 — confirmed by diffing the two `PASS` sets directly, not just
+comparing counts. Hand-verified end-to-end on eclipseemu, separately
+from the c-testsuite: a global scalar load/store, a constant array
+index, a struct field access (folded-offset `ELDA`), `&global`, and a
+final runtime pointer dereference through the loaded address, all in
+one program, produced the arithmetically correct combined result.
+`00216` (page-zero-exhaustion `COMPILE_FAIL` before entry #22, `TIMEOUT`
+after it) still does not pass after this phase — it compiles, assembles,
+and runs further than before, but still ends in an unrelated `JMP 0`
+trap; directly confirmed this is *not* a recurrence of the
+`compute_addresses` bug above (its own computed `_STACKTOP` clears the
+program's real end address by the full margin for this test) — some
+other, pre-existing defect in that large/complex test, not investigated
+further (out of scope for this change).
+
 ## RESOLVED: the "regmd always reads 15" / waitstop-never-signals bug
 
 **This is fixed.** Root cause: a genuine, previously-undocumented

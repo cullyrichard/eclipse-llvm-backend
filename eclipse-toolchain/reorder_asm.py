@@ -137,10 +137,11 @@ def reorder(text: str) -> str:
 # computing real addresses by replicating dgasm's own pass1 statement
 # sizing (confirmed by reading its assembler.c directly, not assumed):
 # STMT_LABEL and `dev` lines are zero-width; a string `var` is
-# `len(string)+1` words; everything else (a real instruction, or a
-# numeric/symbol `var`) is exactly 1 word. Iterates to a fixed point,
-# since inserting a new slot's `var` line shifts every later address and
-# can turn a previously in-range jump out of range too.
+# `len(string)+1` words; a real *extended-addressing* instruction
+# (EXTENDED_INSN_RE below) is 2 words, everything else (a real base-ISA
+# instruction, or a numeric/symbol `var`) is exactly 1 word. Iterates to
+# a fixed point, since inserting a new slot's `var` line shifts every
+# later address and can turn a previously in-range jump out of range too.
 
 ORG_RE = re.compile(r"^\s*org\s+(\S+)")
 LABEL_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(//.*)?$")
@@ -148,6 +149,27 @@ VAR_DECL_RE = re.compile(r"^\s*var\s+(\S+)\s*=\s*(.*)$")
 DEV_RE = re.compile(r"^\s*dev\s")
 JMP_RE = re.compile(r"^(\s*)JMP\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
 STRING_LIT_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"')
+
+# Real Eclipse S/140 extended-addressing instructions (EclipseInstrInfo.td's
+# CALL/LEAGA/ELDAGA/ESTAGA defs emit EJSR/ELEF/ELDA/ESTA; EJMP/EISZ/EDSZ/
+# ELDB/ESTB round out the same family per the S/140 Programmer's Reference
+# and dgasm's opcode.c, though this backend doesn't emit those yet) are a
+# genuine 2-word encoding -- the second word holds the real address --
+# unlike every base-ISA instruction this backend otherwise emits, which is
+# always exactly 1 word (confirmed against dgasm's opcode.c: these are the
+# only entries with ENCODING_EXTENDEDFLOW/ENCODING_EXTENDEDLOAD, size 2;
+# everything else this backend prints is size 1). compute_addresses below
+# has to know this or it silently under-counts the real address of
+# anything after one of these -- confirmed the hard way: before this,
+# fix_stack_pointer placed `_STACKTOP` under the program's true end
+# address on any program with enough EJSR/ELDA/ESTA/ELEF instructions
+# before its trailing bulk data to accumulate a several-word discrepancy,
+# so the upward-growing hardware stack immediately collided with and
+# corrupted that data (c-testsuite 00150 regressed exactly this way when
+# the backend started emitting these instructions -- see
+# DEBUGGING_NOTES.md).
+EXTENDED_INSN_RE = re.compile(
+    r"^\s*(EJSR|EJMP|ELEF|ELDA|ESTA|EISZ|EDSZ|ELDB|ESTB)\b")
 
 
 def dgasm_number(tok: str) -> int:
@@ -202,11 +224,13 @@ def compute_addresses(lines):
         if m:
             label_addr[m.group(1)] = addr
             continue
-        # A real instruction: every opcode this backend emits is one
-        # 16-bit word (no immediate operands on this ISA — see
-        # EclipseInstrInfo.td's file header — so nothing multi-word).
+        # A real instruction: 2 words for extended addressing
+        # (EXTENDED_INSN_RE above), 1 word for everything else (no
+        # immediate operands on the base ISA at all — see
+        # EclipseInstrInfo.td's file header — so nothing else is
+        # multi-word).
         line_addr[i] = addr
-        addr += 1
+        addr += 2 if EXTENDED_INSN_RE.match(line) else 1
     return label_addr, line_addr, addr
 
 
