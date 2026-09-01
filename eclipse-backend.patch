@@ -6188,10 +6188,10 @@ index 000000000..801225763
 +#endif // LLVM_LIB_TARGET_ECLIPSE_MCTARGETDESC_ECLIPSEMCTARGETDESC_H
 diff --git a/llvm/lib/Target/Eclipse/README.md b/llvm/lib/Target/Eclipse/README.md
 new file mode 100644
-index 000000000..d9be9f54c
+index 000000000..56d37aaf5
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/README.md
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,267 @@
 +# The Eclipse LLVM backend
 +
 +An out-of-tree-style LLVM target (`lib/Target/Eclipse`, built via
@@ -6246,13 +6246,22 @@ index 000000000..d9be9f54c
 +  oversized-but-unregistered integer type), and i32 `mul`/`div`/`rem` plus
 +  every float operation fall back to runtime libcalls (`__muldi3`-style).
 +  **Those runtime routines don't exist yet** — see "Known limitations."
-+- **No immediate-operand instructions exist on the base ISA at all.**
-+  Every constant this backend needs — a literal, a computed frame offset
-+  for `&local`, a global's address — goes through a `var`/constant-pool
++- **No immediate-operand instructions exist on the base ISA at all** (real
++  hardware backs this up: Nova/Eclipse never had an ADDI-style
++  instruction either), and this backend doesn't use the genuine extended
++  immediate instruction real Eclipse *does* have (`ADDI`) — every literal
++  constant this backend needs still goes through a `var`/constant-pool
 +  data word, loaded with `LDA`. See `EclipseInstrInfo.td`'s file header
-+  and `EclipseRegisterInfo::eliminateFrameIndex`'s `LEAFI` handling.
-+  Real hardware backs this up: Nova/Eclipse never had an ADDI-style
-+  instruction either.
++  and `EclipseRegisterInfo::eliminateFrameIndex`'s `LEAFI` handling. What
++  real Eclipse *does* have, and this backend *does* use, is a genuine
++  extended-**addressing** instruction family (`EJSR`/`ELEF`/`ELDA`/
++  `ESTA`) — a 2-word encoding whose second word holds a real address
++  reaching the entire 32K-word address space directly, confirmed against
++  the real S/140 Programmer's Reference and empirically on eclipseemu
++  (see DEBUGGING_NOTES.md). That's an addressing-range capability, not an
++  arbitrary-immediate-constant one — it's what lets calls and global
++  access below skip page-zero indirection entirely, but it doesn't change
++  the "every literal constant is a `var`/constant-pool word" story above.
 +- **Comparisons/branches**: every one reduces to a subtraction plus one of
 +  four skip-then-jump conditional branches (`MOV#`/`MOVL#` +
 +  `SZR`/`SNR`/`SZC`/`SNC` + `JMP`) — the same technique
@@ -6261,10 +6270,20 @@ index 000000000..d9be9f54c
 +  layout), this backend uses the tighter skip-and-fall-through form and
 +  implements real `analyzeBranch`/`insertBranch` so LLVM's branch-folding
 +  and layout passes can reason about it normally.
-+- **Calls go through a page-zero jump table** (`var <callee>_SLOT =
-+  <callee>`, `JSR @<callee>_SLOT,0`), exactly like eccc: a direct `JSR`'s
++- **Direct calls go through `EJSR`**, real Eclipse extended addressing
++  (`EJSR $func,0`, explicit absolute mode — see the extended-addressing
++  note above), reaching the callee directly with no page-zero
++  indirection at all. This replaced an earlier page-zero jump-table
++  scheme (`var <callee>_SLOT = <callee>`, `JSR @<callee>_SLOT,0`, closer
++  to eccc's own design) that existed only because base-ISA `JSR`'s
 +  signed displacement can't reach an arbitrarily distant function on real
-+  hardware, but page-zero addressing has no such limit.
++  hardware — `EJSR` has no such limit, so unlike the old scheme this
++  costs zero page-zero words per distinct callee (see
++  DEBUGGING_NOTES.md). *Indirect* calls (through a runtime-computed
++  function-pointer value) are unrelated and unchanged: `EJSR` still can't
++  take a register operand on real hardware, so those still go through
++  the shared page-zero `_scratch` word (`CALLIND`/`CALLIND_JSR`) — see
++  DEBUGGING_NOTES.md entry #17.
 +- **The software stack** (`_SP`, a plain page-zero word manipulated with
 +  `ISZ`/`DSZ` plus one level of indirect addressing) and the
 +  prologue/epilogue sequence (push caller's FP and return address, adopt
@@ -6316,12 +6335,20 @@ index 000000000..d9be9f54c
 +  conditional negate (`LowerSDIVREM`) rather than sign-priming the
 +  hardware divide, since that only works for the unsigned case.
 +- **Address-of-global** (`&global`, string literals used as `char *`,
-+  array-to-pointer decay) via `LEAGA` in `EclipseInstrInfo.td`: since `LDA`
-+  always dereferences and there are no immediate-operand instructions,
-+  taking an address materializes an auxiliary page-zero pointer word
-+  (`var <name>_PTR = <name>`), the same indirection `CALL` already uses
-+  for function addresses. Address-of-*local* (`&x` for a stack variable)
-+  uses the separate `LEAFI` pseudo.
++  array-to-pointer decay) via `LEAGA` in `EclipseInstrInfo.td`: expands to
++  a single `ELEF` (real Eclipse "extended load effective address")
++  instruction, which loads the operand's own resolved address directly —
++  confirmed empirically that `ELEF` returns the address, not the word
++  stored there (unlike `ELDA`). No page-zero pointer word involved at
++  all (see "Page-zero holds only what real extended addressing can't
++  reach" below). A *direct* load/store of a global's content (no
++  runtime-computed offset) instead goes straight through `ELDAGA`/
++  `ESTAGA` (real mnemonics `ELDA`/`ESTA`), one instruction in place of
++  `LEAGA` plus a `LDIND`/`STIND` dereference; every other case (a
++  runtime array index, an 8-bit extending/truncating access) still
++  composes `LEAGA`'s materialized address with `LDIND`/`STIND` exactly
++  as before. Address-of-*local* (`&x` for a stack variable) uses the
++  separate `LEAFI` pseudo — unrelated, still frame-index-based.
 +- **Device I/O via inline asm** (`asm volatile("DOAS %0,011" :: "r"(c))`)
 +  — the escape hatch for `SKPDN`/`SKPBN`/`DIAC`/`DOAS`/`NIO*`, which have
 +  no ordinary-C mapping. `eclipse-toolchain/rt/eclipse_rt.c` wraps the
@@ -6342,18 +6369,23 @@ index 000000000..d9be9f54c
 +- **Page-zero placement.** `LDA`/`STA ac,addr` default to page-zero
 +  (absolute, 8-bit displacement) addressing, and dgasm assigns addresses
 +  strictly in textual source order — so `var` declarations that must
-+  actually *be in page-zero* (the constant pool, the call/address/
-+  long-jump pointer slots) have to precede all code in the final file,
-+  regardless of which function emitted them, while a global's *actual
-+  content* (no longer page-zero-resident at all — see "page-zero holds
-+  pointers, not data" below) is moved to the very *end* instead, after
-+  all code. `eclipse-toolchain/reorder_asm.py` does this as a pure text
-+  pass after `llc` (also sanitizing LLVM's `.str`-style anonymous-
-+  constant names, which dgasm's identifier grammar rejects, and
-+  selectively relaxing any internal jump that ends up out of dgasm's
-+  8-bit PC-relative range) — deliberately *not* solved inside
-+  `AsmPrinter` itself; see `EclipseAsmPrinter.h`'s header comment for
-+  why.
++  actually *be in page-zero* (the constant pool, plus any long-jump
++  relaxation slots `reorder_asm.py` itself inserts — see below) have to
++  precede all code in the final file, regardless of which function
++  emitted them, while a global's *actual content* (never page-zero-
++  resident at all now that both calls and global access reach their
++  targets via real extended addressing — see "Design decisions" above)
++  is moved to the very *end* instead, after all code.
++  `eclipse-toolchain/reorder_asm.py` does this as a pure text pass after
++  `llc` (also sanitizing LLVM's `.str`-style anonymous-constant names,
++  which dgasm's identifier grammar rejects, and selectively relaxing any
++  internal jump that ends up out of dgasm's 8-bit PC-relative range) —
++  deliberately *not* solved inside `AsmPrinter` itself; see
++  `EclipseAsmPrinter.h`'s header comment for why. Its own address model
++  has to know that `EJSR`/`ELEF`/`ELDA`/`ESTA` are genuine 2-word
++  instructions (unlike everything else this backend emits) or its
++  end-of-program address calculation silently under-counts — see
++  DEBUGGING_NOTES.md for a real regression this caused and fixed.
 +
 +## Known limitations
 +
@@ -6386,39 +6418,47 @@ index 000000000..d9be9f54c
 +- **No tail calls, single-word return values only.** (Varargs *are*
 +  supported — real `va_start`/`va_arg`/`va_end`, which is what
 +  `printf`/`scanf` are built on.)
-+- **Not relocatable.** Globals/constants/the jump table all live at
-+  compiler-chosen absolute page-zero addresses, baked in at compile time —
-+  fundamentally position-*dependent*, same as eccc. `org 0100` in
++- **Not relocatable.** Globals/constants/functions all live at
++  compiler-chosen absolute addresses, baked in at compile time —
++  fundamentally position-*dependent*, same as eccc. `org 050` in
 +  `EclipseAsmPrinter::emitStartOfAsmFile` is just a convenient default
 +  address for paper-tape/console loading, not a relocation base; making
 +  the output truly relocatable would mean reworking global/constant
 +  addressing to go through a runtime-computed base instead.
-+- **Page-zero holds pointers, not data — fixed from an earlier, real
-+  budget problem.** `LDA`/`STA ac,addr` only has an 8-bit displacement
++- **Page-zero holds only what real extended addressing can't reach —
++  fixed twice from the same underlying budget problem, most recently by
++  using real hardware capability instead of another layer of
++  indirection.** `LDA`/`STA ac,addr` only has an 8-bit displacement
 +  (page-zero, 0-255 words), and this backend originally stored every
 +  global's/string's *actual content* there directly, meaning the whole
 +  program's data shared one 256-word budget — confirmed to fail outright
 +  on nothing fancier than `printf` + `string.h` + `ctype.h` + `stdlib.h`
-+  together in one file. Fixed by routing every global access through
-+  indirection instead (`EclipseInstrInfo.td`'s "page-zero indirect data
-+  addressing" comment): a global's actual content now lives wherever
-+  `reorder_asm.py` places it (no longer forced to the front), and
-+  page-zero holds only a one-word pointer to it — composed from two
-+  already-proven, independent pieces (`LEAGA` materializes the address,
-+  `LDIND`/`STIND`'s existing register-pointer-dereference pattern reads
-+  through it), not a new addressing mode. Page-zero cost per global
-+  dropped from "one word per word of content" to exactly one word,
-+  regardless of size; the previously-failing `printf`+`string.h`+
-+  `ctype.h`+`stdlib.h` combination now compiles, assembles, and runs
-+  correctly (verified). `eclipse-cc`'s `opt -passes=internalize,globaldce`
-+  step (strips unused runtime-library functions before `llc`) remains in
-+  the pipeline as a complementary, independent optimization. Constant-pool
-+  entries (`tconstpool`) deliberately still use direct page-zero
-+  addressing, not this indirection — they're already exactly one word
-+  each, so indirecting them would add overhead with no page-zero savings.
-+  The tradeoff: every global access now costs one extra instruction (the
-+  address materialization) plus one extra memory read (through the
-+  shared `_scratch` word), versus the old direct scheme.
++  together in one file. First fixed by routing every global access
++  through one level of page-zero pointer indirection (`LEAGA` loading a
++  `var <name>_PTR = <name>` word, `LDIND`/`STIND` dereferencing through
++  it) — real progress (one word per global regardless of size, instead of
++  one word per word of content), but still a page-zero cost per distinct
++  global. Fixed again, more thoroughly, once real Eclipse extended
++  addressing (`ELEF`/`ELDA`/`ESTA` — confirmed against the real S/140
++  Programmer's Reference and empirically on eclipseemu; see
++  DEBUGGING_NOTES.md) turned out to reach the entire 32K-word address
++  space directly, with no page-zero involvement needed at all: a
++  global's address or content is now materialized/accessed with a
++  *single* instruction and *zero* page-zero words, full stop — see
++  "Design decisions" above (`LEAGA`) and "Working end to end" above
++  (`ELDAGA`/`ESTAGA`). The previously-failing `printf`+`string.h`+
++  `ctype.h`+`stdlib.h` combination compiles, assembles, and runs
++  correctly (verified, both before and after this second fix).
++  `eclipse-cc`'s `opt -passes=internalize,globaldce` step (strips unused
++  runtime-library functions before `llc`) remains in the pipeline as a
++  complementary, independent optimization. Constant-pool entries
++  (`tconstpool`) deliberately still use direct page-zero addressing, not
++  extended addressing — they're already exactly one word each, so there's
++  no page-zero cost to eliminate there in the first place. Calls went
++  through the same two-stage fix, for the same reason: a page-zero
++  `<callee>_SLOT` jump table (one word per distinct callee) first, then
++  direct `EJSR` (zero words) once extended addressing was confirmed —
++  see "Design decisions" above.
 diff --git a/llvm/lib/Target/Eclipse/TargetInfo/CMakeLists.txt b/llvm/lib/Target/Eclipse/TargetInfo/CMakeLists.txt
 new file mode 100644
 index 000000000..78e9504f0
