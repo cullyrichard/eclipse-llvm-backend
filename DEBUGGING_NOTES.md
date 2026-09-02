@@ -2836,3 +2836,182 @@ clang -cc1 -triple eclipse-dg-none -S -I eclipse-toolchain/rt/include \
 { cat test.simh; echo 'dep PC 50'; echo 'step 100000'; echo 'e PC'; \
   echo 'quit'; } | eclipseemu
 ```
+
+### 28. Quotient and remainder of the same operands, needed live simultaneously, silently corrupted each other (fixed) — a genuine hidden-clobber bug in `UDIVrr`/`UREMrr`, replaced with a combined `UDIVREMrr`
+
+**Repro:**
+
+```c
+#include <stdio.h>
+int main(void) {
+    unsigned int ua = 65000, ub = 7;
+    printf("%u %u\n", ua / ub, ua % ub);    /* should print "9285 5" */
+    unsigned int a2 = 100, b2 = 7;
+    printf("%u %u\n", a2 / b2, a2 % b2);    /* should print "14 2" */
+    unsigned int a4 = 65000, b4 = 3;
+    printf("%u %u\n", a4 / b4, a4 % b4);    /* should print "21666 2" */
+    return 0;
+}
+```
+
+Before this fix, real `eclipseemu` printed `9285 0`, `14 0`, `21666 0` —
+the quotient was always right, the remainder always `0`. Computing
+division and remainder of the same two operands *separately*, at
+unrelated call sites not needing to be simultaneously live, already
+worked correctly; the bug was specifically about needing both results
+of the *same* division live at the same time.
+
+**Root cause.** `UDIVrr`/`UREMrr`'s post-RA expansion
+(`EclipseInstrInfo.cpp`'s `expandPostRAPseudo`) drives the real
+zero-operand hardware `DIV` instruction by saving AC2 (this backend's
+reserved frame pointer) to the hardware stack, moving `$rhs`/`$lhs`
+into AC2/AC1, unconditionally zeroing AC0 (`SUB 0,0,0` — primes DIV's
+dividend high word), running `DIV`, copying out *one* of AC0
+(remainder) or AC1 (quotient) into `$dst`, then restoring AC2. AC0 and
+AC1 both get unconditionally destroyed by this sequence, but
+`EclipseInstrInfo.td` only ever declared AC2 as an implicit clobber
+(`Defs = [AC2]`) — a comment already on that `.td` line, from an
+earlier session, records that declaring AC0/AC1 too was tried once and
+broke register allocation outright ("ran out of registers"), because
+with only two allocatable registers on this target (AC0/AC1 — AC2/AC3
+are permanently reserved), `$dst`/`$lhs`/`$rhs` already exhaust the
+entire pool on their own; adding AC0/AC1 as *additional* implicit Defs
+double-counts register demand the allocator can never satisfy.
+
+So the register allocator, with no way to know AC0/AC1 get clobbered
+beyond `$dst`, could (and did, for this repro) keep one `UDIVrr`
+pseudo's already-computed quotient result live in AC0 or AC1 across a
+subsequent `UREMrr` pseudo computing the remainder of the same two
+operands — and that second pseudo's own operand-marshalling sequence
+(zero AC0, move `$lhs` into AC1) silently overwrote the first pseudo's
+result before it was ever read. Two *separate* pseudo instructions,
+each individually respecting the declared 2-register contract, still
+collided with each other's *undeclared* clobber.
+
+**Why the obvious fix doesn't work.** Just adding `AC0, AC1` back to
+`UDIVrr`/`UREMrr`'s `Defs` would correctly model the clobber, but is
+exactly the change a previous session already tried and rejected (see
+the `.td` comment, and `EclipseISelLowering.cpp`'s `LowerShift`
+comment on `UDIVrr`) — with only two allocatable registers, declaring
+that `UDIVrr` clobbers *both* AC0 and AC1 in addition to writing
+`$dst` (itself one of AC0/AC1) leaves no register anywhere for the
+allocator to keep *any other value* live across the instruction,
+breaking allocation for any function with more concurrent live values
+than that.
+
+**The actual fix: stop hiding the clobber by declaring it truthfully.**
+The real hardware `DIV` instruction already produces *both* quotient
+(AC1) and remainder (AC0) from a single execution, regardless of which
+one the IR actually asked for — `UDIVrr` and `UREMrr` were each
+independently running that same full sequence and simply discarding
+whichever half they didn't need, then rerunning the *entire* sequence
+from scratch if the other half was also needed. Replaced both with a
+single new pseudo, `UDIVREMrr` (`EclipseInstrInfo.td`), with **two**
+declared outputs — `(outs GPR:$quot, GPR:$rem)` — that runs the save-
+AC2/marshal-operands/zero-AC0/`DIV`/restore-AC2 sequence exactly once
+and extracts *both* real results. Since `$quot`/`$rem` are drawn from
+the very same 2-register GPR pool as `$lhs`/`$rhs` (which are dead by
+the time `$quot`/`$rem` are born, exactly as `$dst` already relied on
+for the single-output pseudos), there is no undeclared clobber left to
+hide: the register allocator now sees the true, complete register
+demand of a `DIV` up front, and correctly refuses to keep anything else
+live across it — which is the actual hardware constraint, truthfully
+modeled, not the allocation-breaking over-declaration the earlier
+attempt made.
+
+`expandPostRAPseudo`'s `UDIVREMrr` case: `$quot`/`$rem` are necessarily
+some permutation of exactly `{AC0, AC1}`. If the allocator happened to
+assign them `quot=AC1, rem=AC0` — exactly where `DIV` naturally leaves
+its two results — nothing further is needed. Otherwise, AC2 (dead at
+that point: its saved copy of `$rhs` was already consumed by `DIV`, and
+it is not restored to the caller's frame pointer until the very end of
+the expansion) serves as scratch to swap AC0/AC1 into the assigned
+registers.
+
+**Wiring the combine in.** `ISD::UDIV`/`ISD::UREM` are now `Expand`
+instead of the default `Legal`, and `ISD::UDIVREM` is `Custom`
+(`LowerUDIVREM`, built directly as a machine node via
+`DAG.getMachineNode` — the same technique `LowerSTACKSAVE`/
+`LowerDYNAMIC_STACKALLOC` already use for their own multi-result
+pseudos, `STACKSAVE_PSEUDO`/`VLAALLOC` — rather than a TableGen `Pat`,
+since this codebase has no existing precedent for matching a 2-result
+generic SDNode straight to a 2-out instruction via `Pat`). This routes
+*every* `udiv`/`urem` — standalone or paired — through `UDIVREMrr`.
+Confirmed this costs nothing extra even for a standalone division (it
+is the same one hardware `DIV` either way): generated assembly for the
+3-division repro above shows exactly 3 `DIV` instructions, not 6 as it
+would from two independent `UDIVrr`+`UREMrr` calls.
+
+A genuine `udiv`+`urem` pair of the same operands collapses onto the
+same `UDIVREMrr` regardless of *how* the pairing is discovered — no
+fragile combine-ordering assumption needed: `DAGCombiner::useDivRem()`
+takes the earlier opportunity to fuse an explicit matching pair into
+one `ISD::UDIVREM` node before legalization ever runs; failing that,
+`TargetLowering::ExpandNode` (for a lone `udiv`) and
+`TargetLowering::expandREM` (for a lone `urem`) each independently
+convert their own node to `DAG.getNode(ISD::UDIVREM, dl, {VT,VT}, LHS,
+RHS)` during legalization — and since `SelectionDAG::getNode` CSEs on
+opcode+VTList+operands, two independent calls with identical operands
+produce the very same node either way. Signed `sdiv`/`srem`
+(`LowerSDIVREM`, decomposed into `abs`+`udiv`/`urem`+conditional
+negate) benefit for free from the same CSE, since a single call site
+needing both `a/b` and `a%b` for the same signed `a,b` calls
+`LowerSDIVREM` twice with identical `LHS`/`RHS`, and the two
+`AbsVal(LHS)`/`AbsVal(RHS)` subgraphs it independently builds are
+themselves CSE'd into the same nodes. `LowerShift`'s `SRA` path (`x >>s
+n` for non-power-of-2-shift-adjacent code) turns out to have had the
+identical latent bug all along — it directly builds `ISD::SDIV` and
+`ISD::SREM` of the same `X`/`Divisor` in one function, a same-operands-
+needed-simultaneously case never previously tested in isolation.
+
+`UDIVrr` is kept, pattern-less, for `EclipseHalve`'s own dedicated
+`Pat` (the internal GEP-offset-scaling divide-by-2 that never needs a
+remainder). `UREMrr` is kept defined and still handled by
+`expandPostRAPseudo`, but is no longer referenced by any pattern —
+left in place rather than deleted in case a remainder-only pseudo is
+useful again later.
+
+**Verified on real `eclipseemu`** (all previously wrong, now correct):
+
+- The repro above: `9285 5` / `14 2` / `21666 2`.
+- Signed division/remainder of shared operands (`int a = -17, b = 5;
+  printf("%d %d", a/b, a%b);` and permutations of operand signs):
+  `-3 -2`, `-3 2`, `14 -2`.
+- Div+rem of the same operands passed as function parameters, both
+  unsigned and signed.
+- Div+rem of the same operands read from array elements and from
+  global variables.
+- 32-bit `long`/`unsigned long` div+rem of shared operands
+  (`__udivsi3`/`__umodsi3`/`__divsi3`/`__modsi3` in `eclipse_rt.c`) —
+  these go through ordinary libcalls with the normal call/return
+  convention, not this pseudo, so were never actually exposed to this
+  bug; re-verified anyway (`613566742 1`, `-176366841 -3`) per the
+  task's own instruction to check the 32-bit path.
+- `LowerShift`'s `SRA` case (`int e = -12345; e >> 5;` and further
+  cases): `-13`, `-1`, `-386` — all correct.
+
+**Full regression, byte-identical to baseline**: `regress_hwstack.sh`'s
+15 examples — every `HALT` case's printed output textually unchanged
+from the pre-fix baseline (final PC values differ, as expected, since
+code layout shifted), and exactly the same 4 pre-existing `Step
+expired` cases as always (`isr_c_test`, `test_fps_add`, `test_fps_md`,
+`fps_dma_test` — unrelated FPU/device-polling limitations from earlier
+entries).
+
+c-testsuite: 197/220, re-measured immediately before this change and
+again after — the two full result files (`run_all_tests.sh`'s
+per-test PASS/MISMATCH/COMPILE_FAIL/TIMEOUT output, not just the
+197 count) are byte-identical (`diff` reports no differences at all).
+The 23 non-passing test IDs are unchanged: `00040`, `00041` (TIMEOUT),
+`00104`, `00174`, `00187`, `00189`, `00204`, `00220` (COMPILE_FAIL),
+`00157`, `00163`, `00166`, `00168`, `00175`, `00178`, `00179`, `00180`,
+`00195`, `00203`, `00205`, `00212`, `00217`, `00218` (MISMATCH),
+`00216` (TIMEOUT) — no regressions, no new passes (c-testsuite's own
+test set doesn't happen to exercise this specific shared-operands-
+live-simultaneously shape).
+
+**Page-zero cost**: none — `UDIVREMrr` reuses the exact same
+instruction sequence `UDIVrr`/`UREMrr` already emitted (same
+`ISZABS`/`STABSI`/`MOVrr`/`SUBrr`/`DIV`/`LDABSI`/`DSZABS` building
+blocks, same page-zero footprint), just with both real outputs
+declared instead of one hidden.

@@ -1973,10 +1973,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..72f5d3fcb
+index 000000000..ce31077b0
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1875 @@
+@@ -0,0 +1,1935 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2047,9 +2047,42 @@ index 000000000..72f5d3fcb
 +  setOperationAction(ISD::SRA, MVT::i16, Custom);
 +
 +  // See LowerSDIVREM: the hardware DIV instruction is only ever driven
-+  // unsigned (via UDIVrr/UREMrr); signed division is decomposed here.
++  // unsigned (via UDIVREMrr, below); signed division is decomposed here.
 +  setOperationAction(ISD::SDIV, MVT::i16, Custom);
 +  setOperationAction(ISD::SREM, MVT::i16, Custom);
++
++  // udiv/urem are deliberately Expand, not the default Legal: the real
++  // hardware DIV instruction always produces *both* quotient (AC1) and
++  // remainder (AC0) from a single execution, regardless of which one the
++  // IR asked for. Leaving udiv/urem individually Legal (matched straight
++  // to separate UDIVrr/UREMrr pseudos, as an earlier version of this
++  // backend did) meant each one's post-RA expansion ran that same full
++  // sequence and unconditionally destroyed AC0 *and* AC1 with no way to
++  // declare that to the register allocator (UDIVrr/UREMrr can only
++  // declare AC2 as clobbered -- see EclipseInstrInfo.td's MUL/DIV
++  // comment for why declaring AC0/AC1 too breaks allocation outright).
++  // Two separate calls computing div and rem of the *same* operands,
++  // needed live at the same time (e.g. both passed to one printf), would
++  // then silently corrupt whichever one's result was still sitting in
++  // AC0/AC1 when the other one ran -- a real, confirmed bug (see
++  // DEBUGGING_NOTES.md).
++  //
++  // Marking these Expand instead routes every udiv/urem -- standalone or
++  // paired -- through ISD::UDIVREM (Custom below, LowerUDIVREM) and a
++  // single combined UDIVREMrr pseudo that declares *both* real outputs.
++  // This costs nothing extra even for a standalone udiv/urem (it's the
++  // same one hardware DIV either way), and permanently removes the
++  // hidden clobber: TargetLowering::ExpandNode/expandREM convert a lone
++  // udiv/urem to UDIVREM once legality says to (LegalizeDAG.cpp), and
++  // DAGCombiner's useDivRem() additionally takes the earlier, better
++  // opportunity to fuse an explicit matching udiv+urem pair into one
++  // UDIVREM node before legalization ever runs -- either way, ordinary
++  // SelectionDAG CSE (same opcode/operands/VTList) guarantees a genuine
++  // matching pair collapses onto the very same UDIVREM node no matter
++  // which order the two get legalized in.
++  setOperationAction(ISD::UDIV, MVT::i16, Expand);
++  setOperationAction(ISD::UREM, MVT::i16, Expand);
++  setOperationAction(ISD::UDIVREM, MVT::i16, Custom);
 +
 +  setBooleanContents(ZeroOrOneBooleanContent);
 +  setStackPointerRegisterToSaveRestore(Register());
@@ -2384,6 +2417,8 @@ index 000000000..72f5d3fcb
 +  case ISD::SDIV:
 +  case ISD::SREM:
 +    return LowerSDIVREM(Op, DAG);
++  case ISD::UDIVREM:
++    return LowerUDIVREM(Op, DAG);
 +  case ISD::VASTART:
 +    return LowerVASTART(Op, DAG);
 +  case ISD::VAARG:
@@ -2914,6 +2949,31 @@ index 000000000..72f5d3fcb
 +  SDValue QuotNeg = DAG.getNode(ISD::XOR, dl, MVT::i16, LhsNeg, RhsNeg);
 +  return DAG.getNode(ISD::SELECT_CC, dl, MVT::i16, QuotNeg, Zero, NegQuot,
 +                      UQuot, DAG.getCondCode(ISD::SETNE));
++}
++
++// See the setOperationAction comment on ISD::UDIVREM in the constructor
++// and EclipseInstrInfo.td's UDIVREMrr comment for the full story. Built
++// directly as a machine node (DAG.getMachineNode), not matched via a
++// TableGen Pat: this codebase has no existing precedent for a plain Pat
++// matching a 2-result generic SDNode straight to a 2-out instruction,
++// whereas building the machine node directly during Custom-lowering
++// already does (LowerSTACKSAVE/LowerDYNAMIC_STACKALLOC's STACKSAVE_
++// PSEUDO/VLAALLOC nodes just below). Unlike those, this needs no chain
++// operand -- udiv/urem are pure arithmetic with no side effects -- so
++// there is no getMergeValues wrapper to build either: result 0 is the
++// quotient and result 1 the remainder (SDTIntBinHiLoOp's convention,
++// matching UDIVREMrr's own $quot/$rem operand order and
++// expandPostRAPseudo's UDIVREMrr case), and LegalizeDAG's Custom-action
++// handling for a multi-result node already walks Res.getValue(i) for
++// every one of the original node's results on its own.
++SDValue EclipseTargetLowering::LowerUDIVREM(SDValue Op, SelectionDAG &DAG) const {
++  SDLoc dl(Op);
++  SDValue LHS = Op.getOperand(0);
++  SDValue RHS = Op.getOperand(1);
++  SDVTList VTs = DAG.getVTList(MVT::i16, MVT::i16);
++  SDValue Ops[] = {LHS, RHS};
++  SDNode *DivRem = DAG.getMachineNode(Eclipse::UDIVREMrr, dl, VTs, Ops);
++  return SDValue(DivRem, 0);
 +}
 +
 +SDValue EclipseTargetLowering::LowerConstantPool(SDValue Op,
@@ -3854,10 +3914,10 @@ index 000000000..72f5d3fcb
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.h b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
 new file mode 100644
-index 000000000..ae857980e
+index 000000000..54b84ad76
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.h
-@@ -0,0 +1,364 @@
+@@ -0,0 +1,374 @@
 +//===-- EclipseISelLowering.h - Eclipse DAG Lowering Interface -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4173,6 +4233,16 @@ index 000000000..ae857980e
 +  // proven via comparisons/branches).
 +  SDValue LowerSDIVREM(SDValue Op, SelectionDAG &DAG) const;
 +
++  // Custom-lowers ISD::UDIVREM, produced by legalizing every plain
++  // udiv/urem (Expand, not Legal — see the setOperationAction comment in
++  // the constructor) and/or by DAGCombiner's own useDivRem() fusing an
++  // explicit matching udiv+urem pair, straight to a single UDIVREMrr
++  // machine node with both real outputs declared — see
++  // EclipseInstrInfo.td's UDIVREMrr comment for the full story (this is
++  // the fix for the "quotient and remainder of the same operands,
++  // needed live simultaneously, corrupt one of the two results" bug).
++  SDValue LowerUDIVREM(SDValue Op, SelectionDAG &DAG) const;
++
 +  SDValue LowerFormalArguments(SDValue Chain, CallingConv::ID CallConv,
 +                                bool IsVarArg,
 +                                const SmallVectorImpl<ISD::InputArg> &Ins,
@@ -4267,10 +4337,10 @@ index 000000000..c7b0873e1
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.cpp b/llvm/lib/Target/Eclipse/EclipseInstrInfo.cpp
 new file mode 100644
-index 000000000..00dd94ee4
+index 000000000..c06095bbe
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.cpp
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,308 @@
 +//===-- EclipseInstrInfo.cpp - Eclipse Instruction Information ----------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -4486,14 +4556,30 @@ index 000000000..00dd94ee4
 +  }
 +
 +  if (Opc != Eclipse::MULrr && Opc != Eclipse::UDIVrr &&
-+      Opc != Eclipse::UREMrr)
++      Opc != Eclipse::UREMrr && Opc != Eclipse::UDIVREMrr)
 +    return false;
 +
 +  MachineBasicBlock &MBB = *MI.getParent();
 +  DebugLoc DL = MI.getDebugLoc();
-+  Register Dst = MI.getOperand(0).getReg();
-+  Register LHS = MI.getOperand(1).getReg();
-+  Register RHS = MI.getOperand(2).getReg();
++
++  // UDIVREMrr has a different operand shape (two outputs, no single
++  // $dst) from MULrr/UDIVrr/UREMrr's one -- see EclipseInstrInfo.td's
++  // UDIVREMrr comment for why this exists at all (the real fix for the
++  // "quotient and remainder of the same operands, needed live
++  // simultaneously, corrupt one of the two results" bug).
++  bool IsDivRem = Opc == Eclipse::UDIVREMrr;
++  Register Dst, Quot, Rem;
++  Register LHS, RHS;
++  if (IsDivRem) {
++    Quot = MI.getOperand(0).getReg();
++    Rem = MI.getOperand(1).getReg();
++    LHS = MI.getOperand(2).getReg();
++    RHS = MI.getOperand(3).getReg();
++  } else {
++    Dst = MI.getOperand(0).getReg();
++    LHS = MI.getOperand(1).getReg();
++    RHS = MI.getOperand(2).getReg();
++  }
 +
 +  // Real SAVE grows this stack *upward* (increment-then-store) — see
 +  // EclipseInstrInfo.td's SAVE comment — so push here is ISZ-then-store
@@ -4526,6 +4612,29 @@ index 000000000..00dd94ee4
 +  if (Opc == Eclipse::MULrr) {
 +    BuildMI(MBB, MI, DL, get(Eclipse::MUL));
 +    BuildMI(MBB, MI, DL, get(Eclipse::MOVrr), Dst).addReg(Eclipse::AC1);
++  } else if (IsDivRem) {
++    BuildMI(MBB, MI, DL, get(Eclipse::DIV));
++    // DIV: AC0 := remainder, AC1 := quotient (docs/ECLIPSE_ISA_NOTES.md).
++    // Quot/Rem are two distinct physical registers the allocator drew
++    // from the same 2-register GPR pool as everything else here (see
++    // EclipseInstrInfo.td's Defs comment), so they are necessarily some
++    // permutation of exactly {AC0, AC1}.
++    if (Quot == Eclipse::AC1 && Rem == Eclipse::AC0) {
++      // Already exactly where DIV leaves them -- nothing to move.
++    } else {
++      assert(Quot == Eclipse::AC0 && Rem == Eclipse::AC1 &&
++             "UDIVREMrr's outputs must be {AC0, AC1} in some order");
++      // Swap via AC2 as scratch: AC2 is dead at this point (the RHS
++      // value saved into it above was already consumed by DIV) and
++      // is not restored to the caller's frame pointer until below, so
++      // it is safe to clobber here.
++      BuildMI(MBB, MI, DL, get(Eclipse::MOVrr), Eclipse::AC2)
++          .addReg(Eclipse::AC0);
++      BuildMI(MBB, MI, DL, get(Eclipse::MOVrr), Eclipse::AC0)
++          .addReg(Eclipse::AC1);
++      BuildMI(MBB, MI, DL, get(Eclipse::MOVrr), Eclipse::AC1)
++          .addReg(Eclipse::AC2);
++    }
 +  } else {
 +    BuildMI(MBB, MI, DL, get(Eclipse::DIV));
 +    // DIV: AC0 := remainder, AC1 := quotient (docs/ECLIPSE_ISA_NOTES.md).
@@ -4542,7 +4651,7 @@ index 000000000..00dd94ee4
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.h b/llvm/lib/Target/Eclipse/EclipseInstrInfo.h
 new file mode 100644
-index 000000000..4caee1b13
+index 000000000..9a6d041d3
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.h
 @@ -0,0 +1,72 @@
@@ -4609,8 +4718,8 @@ index 000000000..4caee1b13
 +  bool reverseBranchCondition(
 +      SmallVectorImpl<MachineOperand> &Cond) const override;
 +
-+  // Expands MULrr/UDIVrr/UREMrr — see EclipseInstrInfo.td's comment on
-+  // why this has to happen post-RA rather than via
++  // Expands MULrr/UDIVrr/UREMrr/UDIVREMrr — see EclipseInstrInfo.td's
++  // comment on why this has to happen post-RA rather than via
 +  // EmitInstrWithCustomInserter.
 +  bool expandPostRAPseudo(MachineInstr &MI) const override;
 +};
@@ -4620,10 +4729,10 @@ index 000000000..4caee1b13
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSEINSTRINFO_H
 diff --git a/llvm/lib/Target/Eclipse/EclipseInstrInfo.td b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
 new file mode 100644
-index 000000000..7841762d1
+index 000000000..0eb936b5a
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseInstrInfo.td
-@@ -0,0 +1,751 @@
+@@ -0,0 +1,796 @@
 +//===- EclipseInstrInfo.td - Eclipse Instruction defs ------*- tablegen -*-=//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -5329,13 +5438,56 @@ index 000000000..7841762d1
 +// impossible to allocate at all ("ran out of registers") — a second
 +// real, verified-the-hard-way bug found immediately after fixing the
 +// first one above.
++//
++// UDIVrr/UREMrr no longer carry `(set GPR:$dst, (udiv/urem ...))`
++// patterns: ISD::UDIV/UREM are now Expand (EclipseISelLowering.cpp's
++// constructor), not Legal, so no plain udiv/urem node ever survives to
++// reach these patterns — every udiv/urem, whether or not a matching
++// sibling is present, is legalized into ISD::UDIVREM and Custom-lowered
++// (LowerUDIVREM) straight to UDIVREMrr below instead. This is the real
++// fix for the DEBUGGING_NOTES.md-documented "quotient and remainder of
++// the same operands, needed live simultaneously, silently corrupt one
++// of the two results" bug: UDIVrr's and UREMrr's post-RA expansions each
++// unconditionally destroy AC0 *and* AC1 (priming/consuming the hardware
++// DIV operands) but only ever declared AC2 as clobbered — undeclared
++// because, per the comment above, declaring AC0/AC1 too made allocation
++// impossible outright. Two *separate* pseudo calls computing div and
++// rem of the same LHS/RHS each independently ran that full undeclared-
++// clobber sequence, so whichever ran second silently destroyed the
++// first's already-computed result sitting in AC0/AC1 with no way for
++// the register allocator to know to protect it. The real hardware DIV
++// instruction already produces *both* quotient (AC1) and remainder
++// (AC0) from a single execution regardless of which one the IR actually
++// asked for — UDIVrr/UREMrr individually ran that same full sequence
++// and simply discarded whichever half wasn't needed. UDIVREMrr below
++// runs it exactly once and declares *both* real outputs, so there's no
++// longer any undeclared clobber to hide: the register allocator sees
++// the true, complete register demand of a DIV up front. UDIVrr is kept
++// only for EclipseHalve's own dedicated Pat just below (an internal
++// GEP-offset-scaling divide-by-2 that never needs a remainder); UREMrr
++// is kept defined (still handled by expandPostRAPseudo) but is now
++// unreferenced by any pattern — left in place rather than deleted, in
++// case anything else ever needs a remainder-only pseudo again.
 +let Defs = [AC2] in {
 +def MULrr : EclipsePseudo<(outs GPR:$dst), (ins GPR:$lhs, GPR:$rhs), "# MUL",
 +                           [(set GPR:$dst, (mul GPR:$lhs, GPR:$rhs))]>;
-+def UDIVrr : EclipsePseudo<(outs GPR:$dst), (ins GPR:$lhs, GPR:$rhs), "# UDIV",
-+                            [(set GPR:$dst, (udiv GPR:$lhs, GPR:$rhs))]>;
-+def UREMrr : EclipsePseudo<(outs GPR:$dst), (ins GPR:$lhs, GPR:$rhs), "# UREM",
-+                            [(set GPR:$dst, (urem GPR:$lhs, GPR:$rhs))]>;
++def UDIVrr : EclipsePseudo<(outs GPR:$dst), (ins GPR:$lhs, GPR:$rhs), "# UDIV", []>;
++def UREMrr : EclipsePseudo<(outs GPR:$dst), (ins GPR:$lhs, GPR:$rhs), "# UREM", []>;
++
++// Combined quotient+remainder pseudo: see the long comment above. Built
++// directly as a machine node by EclipseISelLowering.cpp's LowerUDIVREM
++// (Custom-lowering ISD::UDIVREM), not matched here via a `(set ..., ...,
++// (udivrem ...))` Pat — this codebase has no existing precedent for
++// TableGen matching a 2-result generic SDNode straight to a 2-out
++// instruction, whereas the direct-DAG.getMachineNode approach already
++// has one (LowerSTACKSAVE/LowerDYNAMIC_STACKALLOC's VLAALLOC/
++// STACKSAVE_PSEUDO nodes). $quot/$rem's operand order matters: it must
++// match SDTIntBinHiLoOp's (and hence ISD::UDIVREM's) result order —
++// result 0 is the quotient, result 1 the remainder — which
++// expandPostRAPseudo's UDIVREMrr case (EclipseInstrInfo.cpp) also
++// assumes.
++def UDIVREMrr : EclipsePseudo<(outs GPR:$quot, GPR:$rem),
++                               (ins GPR:$lhs, GPR:$rhs), "# UDIVREM", []>;
 +}
 +// Pat (not itself an instruction) has no `Defs` field, so this must live
 +// outside the `let Defs = [AC2] in { ... }` block above.
@@ -5372,9 +5524,11 @@ index 000000000..7841762d1
 +// target legalizes to, so there's never a narrower legal type to extend
 +// *from* — see EclipseISelLowering.cpp / README.md.)
 +
-+// (udiv/urem have their own real UDIVrr/UREMrr patterns above now — see
-+// the AC0-priming comment there for why signed and unsigned division
-+// can't share one pseudo the way an earlier version of this file did.)
++// (udiv/urem are Expand, not Legal, and reach a real instruction only
++// via ISD::UDIVREM's Custom lowering to UDIVREMrr above — see that
++// pseudo's comment for why, and the AC0-priming comment there for why
++// signed and unsigned division can't share one pseudo the way an
++// earlier version of this file did.)
 diff --git a/llvm/lib/Target/Eclipse/EclipseMCInstLower.cpp b/llvm/lib/Target/Eclipse/EclipseMCInstLower.cpp
 new file mode 100644
 index 000000000..db157adc9
