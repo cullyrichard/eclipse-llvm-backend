@@ -31,6 +31,7 @@
  */
 
 #define FPU_DEV 054
+#define FPU_AP1 055
 
 #define fpu_out(cmd, value)                                                  \
     asm volatile(                                                            \
@@ -48,11 +49,64 @@
         _fpu_r;                                                              \
     })
 
+    #define adp_out(cmd, value)                                                  \
+    asm volatile(                                                            \
+        "DOA %0,055\n\t"                                                     \
+        "DOB %1,054\n\t"                                                     \
+        :: "r"((unsigned int)(cmd)), "r"((unsigned int)(value)))
+
+#define adp_in(cmd)                                                          \
+    __extension__({                                                          \
+        unsigned int _fpu_r;                                                 \
+        asm volatile(                                                        \
+            "DOA %1,055\n\t"                                                 \
+            "DIB %0,054\n\t"                                                 \
+            : "=r"(_fpu_r) : "r"((unsigned int)(cmd)));                      \
+        _fpu_r;                                                              \
+    })
+
+#define fpu_clr(void)                                                        \
+    asm volatile(                                                            \
+        "DOA %0,055\n\t"                                                     \
+        :: "r"((unsigned int)(0020200)))
+
+#define fpu_sta(void)                                                        \
+    __extension__({                                                          \
+        unsigned int _fpu_r;                                                 \
+        asm volatile(                                                        \
+            "DIC %0,054\n\t"                                                 \
+            : "=r"(_fpu_r));                                                 \
+        _fpu_r;                                                              \
+    })
+
+#define fpu_reg(void)                                                        \
+    __extension__({                                                          \
+        unsigned int _fpu_r;                                                 \
+        asm volatile(                                                        \
+            "DIA %0,054\n\t"                                                 \
+            : "=r"(_fpu_r));                                                 \
+        _fpu_r;                                                              \
+    })
+
+
     typedef struct{
     int exp;
     int mh;
     int ml;
 } fps_word_struct;
+
+typedef union{
+    unsigned int reg;
+    struct{
+    unsigned REGSELUSED:1;
+    unsigned :1;
+    unsigned REGSEL:5;
+    unsigned :1;
+    unsigned RDEC:5;
+    unsigned :2;
+    unsigned RW:1;
+    };
+} fps_reg;
 
 
 float scale_pow2(float x, int n);
@@ -68,7 +122,8 @@ void load_md(unsigned int md_addr,unsigned int md_len,const unsigned int md_arr[
  * what this function actually dereferences (a single *hma read) and
  * inconsistent with the actual definition in fps.c -- confirmed via a
  * real "conflicting types" compile error before this was fixed. */
-int fps_dma_host_out(const unsigned int * hma,unsigned int apdma,unsigned int wc);
+void host_dma_out(unsigned int data,unsigned int data_length, unsigned int results_addr);
+void host_dma_in(unsigned int data, unsigned int data_length, unsigned int results_addr);
 /* -- FPU commands (write to the switch/function register) -- */
 #define cmd_wtsr 0021031  /* write switch register */
 #define cmd_wtfn 0022031  /* write function register (act on switch reg) */
@@ -100,4 +155,34 @@ int fps_dma_host_out(const unsigned int * hma,unsigned int apdma,unsigned int wc
 #define fn_examine_regmd_o3 0002075
 #define fn_examine_regpsa   0002000
 #define fn_examine_regtma   0002003
+
+
+
+#define cmd_wr  0000001
+#define cmd_rsu 0100000
+#define cmd_pio_apdma 0000030
+#define cmd_pio_hmal  0001030
+#define cmd_pio_hmah  0002030
+#define cmd_pio_wc    0005030
+#define cmd_pio_ctl   0024030
+#define cmd_adp_hmal  0020010
+#define cmd_adp_wc2   0020020
+#define cmd_adp_wc5   0020050
+#define cmd_adp_ctl   0020060
+
+#define ctl_intrq_ap 0040000
+#define ctl_iapwc    0020000
+#define ctl_ihalt    0010000
+#define ctl_ihwc     0004000
+#define ctl_ihenb    0002000
+#define ctl_cc       0000200
+#define ctl_apdma    0000100
+#define ctl_wrthost  0000040
+#define ctl_decapma  0000020
+#define ctl_fmt_1    0000002
+#define ctl_fmt_2    0000004
+#define ctl_fmt_3    0000006
+#define ctl_hdma     0000001
+
+
 #endif

@@ -86,3 +86,41 @@ fps_word_struct read_md(unsigned int results_addr) {
     return read_internal_struct;
 
 }
+
+
+void host_dma_out(unsigned int data,unsigned int data_length,unsigned int results_addr)
+{
+    adp_out(cmd_adp_hmal|cmd_wr,data);
+    adp_out(cmd_adp_wc2|cmd_wr,data_length);
+    adp_out(cmd_adp_ctl|cmd_wr,ctl_apdma | ctl_cc | ctl_hdma);
+
+    fpu_clr();
+
+    fpu_out(cmd_pio_hmah|cmd_wr,00);
+    fpu_out(cmd_pio_hmal|cmd_wr,data);
+    fpu_out(cmd_pio_wc|cmd_wr,data_length);
+    fpu_out(cmd_pio_apdma|cmd_wr,results_addr);
+    fpu_out(cmd_pio_ctl|cmd_wr,ctl_apdma | ctl_cc);
+
+    fpu_clr();
+
+    adp_out(cmd_adp_wc5|cmd_wr|cmd_rsu,data_length);
+}
+
+void host_dma_in(unsigned int data, unsigned int data_length,unsigned int results_addr)
+
+{
+    adp_out(cmd_adp_hmal|cmd_wr,data);
+    adp_out(cmd_adp_wc2|cmd_wr,data_length);
+    adp_out(cmd_adp_ctl|cmd_wr,ctl_wrthost|ctl_apdma | ctl_cc | ctl_hdma);
+    fpu_clr();
+
+    fpu_out(cmd_pio_hmah|cmd_wr,00);
+    fpu_out(cmd_pio_hmal|cmd_wr,data);
+    fpu_out(cmd_pio_wc|cmd_wr,data_length);
+    fpu_out(cmd_pio_apdma|cmd_wr,results_addr);
+    fpu_out(cmd_pio_ctl|cmd_wr,ctl_wrthost | ctl_apdma | ctl_cc);
+    fpu_clr();
+
+    adp_out(cmd_adp_wc5|cmd_wr|cmd_rsu,data_length);
+}
