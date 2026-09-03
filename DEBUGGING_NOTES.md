@@ -3015,3 +3015,57 @@ instruction sequence `UDIVrr`/`UREMrr` already emitted (same
 `ISZABS`/`STABSI`/`MOVrr`/`SUBrr`/`DIV`/`LDABSI`/`DSZABS` building
 blocks, same page-zero footprint), just with both real outputs
 declared instead of one hidden.
+
+### 29. print_dg_float(hi, lo): print a real-hardware DG hex-float value given as two 16-bit words
+
+A user has separate hardware that returns 32-bit DG/IBM-style hex-format
+floats as a pair of 16-bit words (the same number format entry #27's
+`--hwfloat` real Eclipse FAD/FAS/etc. instructions use -- see the main
+backend README.md's Floating Point Instructions section). Wanted: a way
+to print such a value as an ordinary decimal float.
+
+**No new conversion logic needed.** Entry #27 already built and verified
+(bit-exact against real `eclipseemu` FAS/FSS results) an
+`ieee754_to_hexfloat32`/`hexfloat32_to_ieee754` bridge, since `--hwfloat`
+itself needs to convert between this target's ordinary IEEE-754 ABI
+representation and the real hardware's native hex-float format around
+every `FAS`/`FSS` call. `print_dg_float` (`eclipse_rt.c`, declared in
+`stdio.h` right after `print_float`) is a thin wrapper: pack the two
+16-bit words into one `u32`, run it through the existing
+`hexfloat32_to_ieee754`, reinterpret the result as a `float` via the
+existing `sf_from_bits`, and hand it to the existing `print_float`. No
+new bit-level mantissa/exponent code at all -- this is exactly the
+conversion problem `--hwfloat`'s own bridge already solves, just fed
+from a caller-supplied word pair instead of a real hardware instruction
+result.
+
+```c
+void print_dg_float(unsigned int hi, unsigned int lo) {
+  u32 hexbits = ((u32)hi << 16) | (u32)(lo & 0xFFFFUL);
+  u32 ieee_bits = hexfloat32_to_ieee754(hexbits);
+  print_float(sf_from_bits(ieee_bits));
+}
+```
+
+`hi` holds bits 31-16 (sign, 7-bit excess-64 exponent, and the top two
+hex digits of the mantissa); `lo` holds bits 15-0 (the remaining four
+hex digits) -- swap the two arguments at the call site if a particular
+source hands them back the other way around.
+
+**Verified**: seven hand-picked DG hex-float bit patterns (1.0, 2.0,
+4.0, 8.0, 0.5, -1.0, 3.0), each independently computed and cross-checked
+against the format's own definition
+(`mantissa_int * 2^(4*(exponent_field-64)-24)`) with a standalone Python
+script before use, not just eyeballed -- confirms an earlier hand-typed
+draft of these test values actually had three of the seven wrong
+(arithmetic slips in the exponent field), caught by that independent
+check rather than by a wrong printed result. All seven print correctly
+on real `eclipseemu`
+(`1.000000`/`2.000000`/`4.000000`/`8.000000`/`0.500000`/`-1.000000`/`3.000000`).
+Full existing regression suite (`regress_hwstack.sh`) re-run and
+confirmed byte-identical to baseline.
+
+`eclipse-toolchain/rt/eclipse_rt.c` and
+`eclipse-package/eclipse-toolchain/rt/eclipse_rt.c` (and both copies'
+`rt/include/stdio.h`) kept byte-identical, per this project's standing
+convention.

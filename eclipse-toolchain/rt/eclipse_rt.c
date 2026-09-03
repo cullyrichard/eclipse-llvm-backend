@@ -1711,6 +1711,34 @@ u32 hexfloat32_to_ieee754(u32 bits) {
   return sign | ((u32)exp8 << SF_EXP_SHIFT) | (hexmant24 & SF_MANT_MASK);
 }
 
+/* Prints a 32-bit DG/IBM-style hex-format float given as the two
+ * 16-bit words real hardware naturally hands it back in -- e.g. any
+ * device or interface that returns a hex float as a high/low register
+ * pair rather than one combined 32-bit value. This is the exact same
+ * number format --hwfloat's own real Eclipse FAD/FAS/etc. instructions
+ * use (sign + 7-bit excess-64 exponent over powers of 16, in the top
+ * byte; 24-bit hex-normalized mantissa filling the rest -- see
+ * README.md's Floating Point Instructions section and
+ * DEBUGGING_NOTES.md entry #27 for how this was reverse-engineered and
+ * verified). `hi` holds bits 31-16 (sign, exponent, and the top two hex
+ * digits of the mantissa); `lo` holds bits 15-0 (the remaining four hex
+ * digits) -- swap the two arguments at the call site if a particular
+ * source hands them back the other way around.
+ *
+ * Routes through the existing hexfloat32_to_ieee754 conversion just
+ * above (already verified bit-exact against real eclipseemu FAS/FSS
+ * results -- see that function's own comment) and the existing
+ * print_float, rather than a fresh decimal-printing implementation:
+ * this is exactly the conversion problem --hwfloat's own IEEE<->
+ * hex-float bridge already solves, just fed from a caller-supplied
+ * word pair instead of a real hardware FAD/FAS result.
+ */
+void print_dg_float(unsigned int hi, unsigned int lo) {
+  u32 hexbits = ((u32)hi << 16) | (u32)(lo & 0xFFFFUL);
+  u32 ieee_bits = hexfloat32_to_ieee754(hexbits);
+  print_float(sf_from_bits(ieee_bits));
+}
+
 /* --- 32-bit integer division/remainder (RTLIB::UDIV_I32/SDIV_I32/
  * UREM_I32/SREM_I32, i.e. __udivsi3/__divsi3/__umodsi3/__modsi3) ---
  *

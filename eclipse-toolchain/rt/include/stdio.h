@@ -81,4 +81,17 @@ int scanf(const char *fmt, ...);
  */
 void print_float(float f);
 
+/* Prints a 32-bit DG/IBM-style hex-format float given as the two
+ * 16-bit words real hardware naturally hands it back in — the same
+ * number format --hwfloat's own real Eclipse FAD/FAS/etc. instructions
+ * use. `hi` holds bits 31-16 (sign, exponent, and the top two hex
+ * digits of the mantissa); `lo` holds bits 15-0 (the remaining four hex
+ * digits) — swap the two arguments at the call site if a particular
+ * source hands them back the other way around. Same output shape as
+ * print_float (fixed-point, 6 digits after the point, no trailing
+ * newline). See print_dg_float's own comment in eclipse_rt.c for the
+ * full reasoning.
+ */
+void print_dg_float(unsigned int hi, unsigned int lo);
+
 #endif
