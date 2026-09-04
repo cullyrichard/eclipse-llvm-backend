@@ -3016,34 +3016,68 @@ instruction sequence `UDIVrr`/`UREMrr` already emitted (same
 blocks, same page-zero footprint), just with both real outputs
 declared instead of one hidden.
 
-### 29. print_dg_float(hi, lo): print a real-hardware DG hex-float value given as two 16-bit words
+### 29. print_dg_float(hi, lo): print a real-hardware DG hex-float value given as two 16-bit words, decoded DIRECTLY (no IEEE-754 conversion)
 
 A user has separate hardware that returns 32-bit DG/IBM-style hex-format
 floats as a pair of 16-bit words (the same number format entry #27's
 `--hwfloat` real Eclipse FAD/FAS/etc. instructions use -- see the main
-backend README.md's Floating Point Instructions section). Wanted: a way
-to print such a value as an ordinary decimal float.
+backend README.md's Floating Point Instructions section), calling this
+from debug-heavy code (so call-site instruction cost genuinely matters,
+not just a one-off diagnostic).
 
-**No new conversion logic needed.** Entry #27 already built and verified
-(bit-exact against real `eclipseemu` FAS/FSS results) an
-`ieee754_to_hexfloat32`/`hexfloat32_to_ieee754` bridge, since `--hwfloat`
-itself needs to convert between this target's ordinary IEEE-754 ABI
-representation and the real hardware's native hex-float format around
-every `FAS`/`FSS` call. `print_dg_float` (`eclipse_rt.c`, declared in
-`stdio.h` right after `print_float`) is a thin wrapper: pack the two
-16-bit words into one `u32`, run it through the existing
-`hexfloat32_to_ieee754`, reinterpret the result as a `float` via the
-existing `sf_from_bits`, and hand it to the existing `print_float`. No
-new bit-level mantissa/exponent code at all -- this is exactly the
-conversion problem `--hwfloat`'s own bridge already solves, just fed
-from a caller-supplied word pair instead of a real hardware instruction
-result.
+**First version** (superseded, described here only because the design
+choice is worth recording): a thin wrapper reusing entry #27's already-
+verified `hexfloat32_to_ieee754` bridge plus the existing `print_float`
+-- pack the two words, convert to this target's IEEE-754 ABI
+representation, print normally. Correct and simple, but pays for a real
+conversion (normalize, re-bias, round) on every call that a direct
+decoder doesn't need to.
+
+**Final version: decode the hex-float bits directly, no IEEE-754
+step at all.** Both formats reduce to the same shape once you strip the
+format-specific packaging -- a plain integer significand times a power
+of two (`value = mant * 2^shift`, with `shift = 4*(exponent_field-64) -
+24` for a hex float; no separate "hidden bit" trick needed the way
+IEEE-754 has one, since a hex-float mantissa's own leading nonzero hex
+digit already IS what IEEE-754 keeps implicit). `print_float`'s existing
+`print_float_frac` (the decimal-digit-extraction loop) only ever
+consumes `pf_frac_bits`/`pf_fbits_n` -- genuinely agnostic to which
+float format they came from -- so it's reused completely unchanged. The
+only new code is deriving (integer part, `pf_frac_bits`, `pf_fbits_n`)
+from the hex-float's own fields directly, the equivalent of what
+`print_float_extract`/`__fixsfsi` do for IEEE-754's fields (`__fixsfsi`
+itself can't be reused -- it's IEEE-754-bit-pattern-specific).
 
 ```c
 void print_dg_float(unsigned int hi, unsigned int lo) {
-  u32 hexbits = ((u32)hi << 16) | (u32)(lo & 0xFFFFUL);
-  u32 ieee_bits = hexfloat32_to_ieee754(hexbits);
-  print_float(sf_from_bits(ieee_bits));
+  u32 bits = ((u32)hi << 16) | (u32)(lo & 0xFFFFUL);
+  if (u32_and_nz(bits, 0x80000000UL)) {
+    putchar('-');
+  }
+  u32 mant = bits & 0x00FFFFFFUL;
+  pf_frac_bits = 0;
+  pf_fbits_n = 0;
+  if (u32_eq(mant, 0)) {
+    print_uint32(0);
+    putchar('.');
+    print_float_frac();
+    return;
+  }
+  int exp_field = (int)((bits >> 24) & 0x7FUL);
+  int shift = 4 * (exp_field - 64) - 24;
+
+  u32 uip;
+  if (shift >= 0) {
+    uip = sf_shl(mant, shift);
+  } else {
+    int nshift = -shift;
+    uip = sf_shr(mant, nshift);
+    pf_fbits_n = nshift;
+    pf_frac_bits = mant & (sf_shl(1UL, nshift) - 1UL);
+  }
+  print_uint32(uip);
+  putchar('.');
+  print_float_frac();
 }
 ```
 
@@ -3052,20 +3086,50 @@ hex digits of the mantissa); `lo` holds bits 15-0 (the remaining four
 hex digits) -- swap the two arguments at the call site if a particular
 source hands them back the other way around.
 
-**Verified**: seven hand-picked DG hex-float bit patterns (1.0, 2.0,
-4.0, 8.0, 0.5, -1.0, 3.0), each independently computed and cross-checked
-against the format's own definition
-(`mantissa_int * 2^(4*(exponent_field-64)-24)`) with a standalone Python
-script before use, not just eyeballed -- confirms an earlier hand-typed
-draft of these test values actually had three of the seven wrong
-(arithmetic slips in the exponent field), caught by that independent
-check rather than by a wrong printed result. All seven print correctly
-on real `eclipseemu`
-(`1.000000`/`2.000000`/`4.000000`/`8.000000`/`0.500000`/`-1.000000`/`3.000000`).
-Full existing regression suite (`regress_hwstack.sh`) re-run and
-confirmed byte-identical to baseline.
+**On the wider shift range, and why no new bounds/saturation logic was
+needed**: `sf_shl`/`sf_shr` (used here exactly as `print_float_extract`
+already uses them) shift one bit at a time in a loop and are safe for
+*any* shift amount, not just IEEE-754's usual range -- confirmed by
+reading their own implementation before relying on this, not assumed.
+Hex float's wider exponent field means `shift` can run roughly ±280 here
+versus IEEE-754's ~±150, correspondingly more loop iterations for an
+extreme-magnitude value, but no new special-casing was needed: an
+oversized rightward shift converges to 0 (both for the integer part and,
+later, every decimal digit `print_float_frac` extracts) exactly like a
+genuinely tiny value should print as all zeros at 6-decimal-place
+precision, and an oversized leftward shift saturates the same way a
+very large IEEE-754 magnitude already does through `__fixsfsi`'s own
+existing behavior.
+
+**Verified**: the same seven hand-picked DG hex-float bit patterns as
+the first version (1.0, 2.0, 4.0, 8.0, 0.5, -1.0, 3.0 -- each
+independently computed and cross-checked against the format's own
+definition, `mantissa_int * 2^(4*(exponent_field-64)-24)`, with a
+standalone Python script before use, not just eyeballed) still print
+correctly after the rewrite, byte-for-byte identical output to the
+first version. Additionally verified: `+0.0`/`-0.0` (prints
+`0.000000`/`-0.000000`, sign preserved), and two values landing in the
+`shift >= 0` pure-integer branch specifically (16.0, 256.0) plus one
+small fraction (0.0625) -- all correct on real `eclipseemu`. Full
+existing regression suite (`regress_hwstack.sh`) re-run and confirmed
+byte-identical to baseline after the rewrite.
+
+**Measured cost**: a single call, isolated (binary-searched exact
+`eclipseemu` instruction count to `HALT`) -- 40,338 instructions via the
+first (conversion-based) version, 36,723 via the direct version: roughly
+3,600 instructions saved per call (~9%), not the order-of-magnitude
+difference that might be guessed from "skips an entire conversion
+function" -- both versions share the same underlying fixed cost
+(`print_uint32` for the integer part, `print_float_frac`'s decimal
+loop), so the saving is bounded to what `hexfloat32_to_ieee754`'s own
+normalize/re-bias/round work actually cost, not the whole call. Real
+and worth it for debug-heavy call sites, as confirmed directly rather
+than assumed from an "obviously faster" intuition.
 
 `eclipse-toolchain/rt/eclipse_rt.c` and
 `eclipse-package/eclipse-toolchain/rt/eclipse_rt.c` (and both copies'
 `rt/include/stdio.h`) kept byte-identical, per this project's standing
-convention.
+convention. `hexfloat32_to_ieee754`/`ieee754_to_hexfloat32` themselves
+are untouched -- still exactly what entry #27's `--hwfloat` machinery
+uses; only this file's own `print_dg_float` stopped routing through
+them.
