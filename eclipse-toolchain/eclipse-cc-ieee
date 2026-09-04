@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Thin wrapper: eclipse-cc --ieee, for scripts that just want to append
+# args (run_all_tests.sh / run_one_test.sh's CC_SCRIPT convention).
+# DEBUGGING_NOTES.md entry #30 -- see eclipse-cc's own header comment.
+exec bash "$(dirname "${BASH_SOURCE[0]}")/eclipse-cc" --ieee "$@"

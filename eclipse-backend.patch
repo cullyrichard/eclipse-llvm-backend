@@ -674,10 +674,10 @@ index 000000000..252505f6d
 +#endif // LLVM_LIB_TARGET_ECLIPSE_ECLIPSE_H
 diff --git a/llvm/lib/Target/Eclipse/Eclipse.td b/llvm/lib/Target/Eclipse/Eclipse.td
 new file mode 100644
-index 000000000..2c816e802
+index 000000000..a0154fe9c
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/Eclipse.td
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,105 @@
 +//===- Eclipse.td - Describe the Eclipse Target Machine ---*- tablegen -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -695,25 +695,82 @@ index 000000000..2c816e802
 +
 +def EclipseInstrInfo : InstrInfo;
 +
-+// Opt-in use of the real Eclipse S/140 hardware FPU (FAS/FSS -- add and
-+// subtract on the CPU-native IBM-360-style hex-float FPAC registers)
-+// instead of this target's default, always-available software float
-+// implementation (__addsf3/__subsf3 etc. in eclipse_rt.c). OFF by
-+// default: every existing invocation of this toolchain gets exactly
-+// today's soft-float codegen, unchanged, unless a caller explicitly
-+// requests `-mattr=+hwfloat` (llc) / `--hwfloat` (eclipse-cc). See
++// Real Eclipse S/140 hardware FPU (FAS/FSS -- add and subtract on the
++// CPU-native IBM-360-style hex-float FPAC registers) instead of this
++// target's original, always-available software float implementation
++// (__addsf3/__subsf3 etc. in eclipse_rt.c). See
 +// EclipseSubtarget.cpp's initLibcallLoweringInfo and
 +// EclipseISelLowering.cpp's constructor for where this actually changes
 +// which libcall implementation gets selected, and DEBUGGING_NOTES.md in
 +// the eclipse-package repo for the reverse-engineered hardware format
-+// and the eclipseemu verification this feature is based on. Multiply/
-+// divide (FMS/FDS) and int<->float conversion (FLAS/FFAS) were probed
-+// too but found unreliable/unimplemented on eclipseemu -- not covered
-+// by this feature; software libcalls remain the only path for those
-+// regardless of this feature's setting.
++// and the eclipseemu verification this feature is based on.
++//
++// As of DEBUGGING_NOTES.md entry #30, hardware add/subtract is this
++// target's DEFAULT (see FeatureIEEEFloat below for the opt-out) --
++// FeatureHWFloat itself is unchanged (still just "select the hardware
++// FAS/FSS-based ADD_F32/SUB_F32 impl instead of the software one") and
++// stays available as a direct `-mattr=+hwfloat` lever, but the only
++// caller that still needs to pass it explicitly is eclipse-cc's
++// `--hwfloat` flag preserving *its* own pre-entry-#30 meaning exactly
++// (see FeatureIEEEFloat) -- see EclipseSubtarget.cpp for the exact
++// UseHW = !HasIEEEFloat || HasHWFloat selection logic this feeds.
++//
++// Multiply/divide (FMS/FDS) were re-probed fresh for entry #30 with a
++// clean, assumption-free harness and reconfirmed genuinely broken on
++// eclipseemu: both operand orderings, several operand-register
++// combinations, always leave the destination FPAC at exactly zero --
++// not covered by this feature; software libcalls remain the only path
++// for MUL_F32/DIV_F32 regardless of this feature's setting.
++//
++// int<->float conversion (FLAS/FFAS), by contrast, turned out to be
++// reliable on eclipseemu once probed with the right operand-order
++// hypothesis (FLAS srcAC,dstFPAC; FFAS dstAC,srcFPAC -- confirmed
++// across every AC/FPAC register combination tried) -- entry #27's
++// original "operand-encoding-dependent, inconsistent" verdict was a
++// probing mistake (loading the wrong AC register), not a real hardware
++// limitation; see entry #30 for the full re-derivation. Left unused
++// here anyway: FLAS/FFAS only convert a single 16-bit AC, and this
++// target's SINTTOFP_I32_F32/FPTOSINT_F32_I32 libcalls need a genuine
++// 32-bit `long`, which would need extra (unverified, and multiply/
++// divide-adjacent, given FMS/FDS's own state) logic to combine two
++// 16-bit halves -- flagged as a real, well-scoped follow-up opportunity
++// rather than forced into this entry.
 +def FeatureHWFloat : SubtargetFeature<"hwfloat", "HasHWFloat", "true",
 +  "Use real Eclipse S/140 hardware FPU instructions (FAS/FSS) for "
 +  "float add/subtract instead of software libcalls">;
++
++// Opt OUT of this target's default (DEBUGGING_NOTES.md entry #30) DG
++// hardware-float behavior and get this target's *original* behavior
++// back instead: pure IEEE-754 float everywhere (software arithmetic
++// unless FeatureHWFloat is *also* set, in which case it's exactly
++// today's pre-entry-#30 `--hwfloat`: IEEE-754 ABI/storage with only
++// add/subtract hardware-accelerated), including the pre-existing,
++// unrelated bug where a file-scope/`static` `float`/`double` global
++// initializer silently materializes as 0 (EclipseAsmPrinter.cpp's
++// emitGlobalVariable has no ConstantFP case at all -- see entry #27
++// point 9 and entry #30's own fix, gated to apply only when this
++// feature is OFF, specifically so `+ieee` stays byte-for-byte identical
++// to every pre-entry-#30 build). `eclipse-cc --hwfloat` sets both
++// `+hwfloat` and `+ieee` together for exactly this reason -- see that
++// script's own comment. OFF by default, i.e. the DEFAULT behavior with
++// NO flags at all is now hardware-accelerated add/subtract (see
++// FeatureHWFloat above) plus the global-initializer fix; passing
++// `-mattr=+ieee` (llc) / `--ieee` (eclipse-cc) restores this target's
++// entire original, pre-entry-#30 default exactly -- see
++// EclipseSubtarget.cpp's initLibcallLoweringInfo and
++// EclipseAsmPrinter.cpp's emitGlobalVariable for where this is actually
++// read, and DEBUGGING_NOTES.md entry #30 for the full design rationale
++// (in particular: why a truly native, end-to-end DG hex-float *ABI* --
++// the original ask this entry set out to build -- turned out to be
++// infeasible without patching common, target-agnostic LLVM
++// infrastructure, LegalizeFloatTypes.cpp's SoftenFloatRes_ConstantFP
++// specifically, and why this feature's actual scope is narrower than
++// that as a result).
++def FeatureIEEEFloat : SubtargetFeature<"ieee", "HasIEEEFloat", "true",
++  "Opt out of this target's default DG-hardware-accelerated float "
++  "behavior and restore its original pure-IEEE-754 behavior (software "
++  "arithmetic, or FeatureHWFloat's narrower hardware add/subtract if "
++  "also set)">;
 +
 +def : ProcessorModel<"generic", NoSchedModel, []>;
 +
@@ -728,10 +785,10 @@ index 000000000..2c816e802
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
 new file mode 100644
-index 000000000..896e22dfd
+index 000000000..5d48a48cb
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
-@@ -0,0 +1,713 @@
+@@ -0,0 +1,785 @@
 +//===-- EclipseAsmPrinter.cpp - Eclipse LLVM assembly writer ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -743,9 +800,12 @@ index 000000000..896e22dfd
 +#include "EclipseAsmPrinter.h"
 +#include "Eclipse.h"
 +#include "EclipseMCInstLower.h"
++#include "EclipseSubtarget.h"
++#include "EclipseTargetMachine.h"
 +#include "MCTargetDesc/EclipseInstPrinter.h"
 +#include "MCTargetDesc/EclipseMCTargetDesc.h"
 +#include "TargetInfo/EclipseTargetInfo.h"
++#include "llvm/ADT/APFloat.h"
 +#include "llvm/ADT/STLFunctionalExtras.h"
 +#include "llvm/ADT/SmallVector.h"
 +#include "llvm/CodeGen/MachineConstantPool.h"
@@ -794,6 +854,16 @@ index 000000000..896e22dfd
 +    }
 +  }
 +  return Out;
++}
++
++// This target's `float`/`double` are both 32 bits wide (double aliased
++// to float -- see README.md/SOFT_FLOAT_NOTES.md), so getValueAPF()'s
++// bitcastToAPInt() is always exactly 32 bits here; DEBUGGING_NOTES.md
++// entry #30 (see Eclipse.td's FeatureIEEEFloat) is what makes this
++// path reachable at all -- see emitGlobalVariable/flattenConstant's own
++// callers for why this is gated on !STI.hasIEEEFloat().
++static uint32_t constantFPBits32(const ConstantFP *CFP) {
++  return static_cast<uint32_t>(CFP->getValueAPF().bitcastToAPInt().getZExtValue());
 +}
 +
 +bool EclipseAsmPrinter::doInitialization(Module &M) {
@@ -963,6 +1033,44 @@ index 000000000..896e22dfd
 +                               Twine(getSymbol(GVInit)->getName()))
 +                                  .str());
 +    return;
++  }
++
++  // A scalar `float`/`double` initializer (e.g. `static float ga = 12.5f;`)
++  // -- DEBUGGING_NOTES.md entry #30. Pre-entry-#30 (and still, with
++  // `+ieee` set -- see Eclipse.td's FeatureIEEEFloat), this fell all the
++  // way through to the generic "unsupported leaf constant" fallback at
++  // the end of this function and silently materialized as a single zero
++  // word -- a real, confirmed, pre-existing bug (entry #27 point 9),
++  // *not* fixed unconditionally here since doing so would make `+ieee`
++  // fail its own "byte-for-byte identical to every pre-entry-#30 build"
++  // requirement. Emits the constant's real IEEE-754 bit pattern (not
++  // DG hex-float -- entry #30's own design-rationale comment on
++  // Eclipse.td's FeatureIEEEFloat explains why a true native hex-float
++  // ABI wasn't pursued end-to-end) as two words, most-significant first,
++  // using the exact same "`_word1`, decimal, most-significant-first"
++  // convention the >16-bit ConstantInt case just below already
++  // establishes -- so this target's existing "access word N of a bulk
++  // global" addressing (LEAGA/ELDA/ESTA, EclipseISelLowering.cpp's
++  // PerformDAGCombine) finds it correctly with no further backend
++  // support needed.
++  if (const auto *CFP = dyn_cast<ConstantFP>(Init)) {
++    const EclipseSubtarget &STI =
++        static_cast<const EclipseTargetMachine &>(TM).getSubtarget();
++    if (!STI.hasIEEEFloat()) {
++      uint32_t Bits = constantFPBits32(CFP);
++      OutStreamer->emitRawText(
++          ("var " + Twine(Sym->getName()) + " = " +
++           Twine(static_cast<int64_t>(static_cast<int16_t>(Bits >> 16))))
++              .str());
++      OutStreamer->emitRawText(
++          ("var " + Twine(Sym->getName()) + "_word1 = " +
++           Twine(static_cast<int64_t>(static_cast<int16_t>(Bits & 0xFFFFu))))
++              .str());
++      return;
++    }
++    // +ieee: fall through to the "unsupported leaf constant" case at the
++    // end of this function, preserving this target's original behavior
++    // (silently materializes as 0) exactly.
 +  }
 +
 +  if (const auto *CI = dyn_cast<ConstantInt>(Init)) {
@@ -1135,6 +1243,27 @@ index 000000000..896e22dfd
 +        if (const auto *GVLeaf = dyn_cast_or_null<GlobalValue>(C)) {
 +          Out.push_back(getSymbol(GVLeaf)->getName().str());
 +          return;
++        }
++        // A `float`/`double` struct field -- same DEBUGGING_NOTES.md
++        // entry #30 handling as the top-level scalar case above (see its
++        // own comment), just emitting into this lambda's flattened word
++        // list instead of directly to a `var` line. `+ieee` deliberately
++        // falls through to the "unsupported leaf constant" case at the
++        // bottom of this lambda, preserving the original single-zero-word
++        // behavior exactly.
++        if (const auto *CFP = dyn_cast_or_null<ConstantFP>(C)) {
++          const EclipseSubtarget &STI =
++              static_cast<const EclipseTargetMachine &>(TM).getSubtarget();
++          if (!STI.hasIEEEFloat()) {
++            uint32_t Bits = constantFPBits32(CFP);
++            Out.push_back(
++                Twine(static_cast<int64_t>(static_cast<int16_t>(Bits >> 16)))
++                    .str());
++            Out.push_back(Twine(static_cast<int64_t>(
++                                     static_cast<int16_t>(Bits & 0xFFFFu)))
++                              .str());
++            return;
++          }
 +        }
 +        if (const auto *CI = dyn_cast_or_null<ConstantInt>(C)) {
 +          unsigned BitWidth = CI->getBitWidth();
@@ -1973,10 +2102,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..ce31077b0
+index 000000000..c9a0c4406
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1935 @@
+@@ -0,0 +1,1942 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2224,28 +2353,35 @@ index 000000000..ce31077b0
 +  // library" limitation: f64 softening would need genuine i64 support
 +  // this backend doesn't have).
 +  //
-+  // ADD_F32/SUB_F32 alone are conditioned on the optional `+hwfloat`
-+  // SubtargetFeature (Eclipse.td's FeatureHWFloat, default off): when
-+  // set, real Eclipse S/140 hardware FPU instructions (FAS/FSS, run
-+  // through a hand-written assembly wrapper matching this target's
-+  // ordinary calling convention — see rt/eclipse_hwfloat.s in the
-+  // eclipse-package repo) replace the software __addsf3/__subsf3 this
-+  // target otherwise always uses. Every other float libcall below stays
-+  // on its software implementation unconditionally, hwfloat or not —
-+  // FMS/FDS (hardware multiply/divide) and FLAS/FFAS (hardware
-+  // int<->float conversion) were both probed on eclipseemu and found
-+  // unreliable/unimplemented there (FMS/FDS silently zero their
-+  // destination instead of computing a product/quotient; FFAS's operand
-+  // semantics didn't behave consistently across otherwise-equivalent
-+  // encodings) — see DEBUGGING_NOTES.md for the full probe methodology
-+  // and results. This exact ADD_F32/SUB_F32 choice is duplicated in
++  // ADD_F32/SUB_F32 alone are conditioned on STI.useHardwareFloat()
++  // (EclipseSubtarget.h): true by default (DEBUGGING_NOTES.md entry
++  // #30) or with `+hwfloat` set regardless — see Eclipse.td's
++  // FeatureIEEEFloat/FeatureHWFloat. When true, real Eclipse S/140
++  // hardware FPU instructions (FAS/FSS, run through a hand-written
++  // assembly wrapper matching this target's ordinary calling convention
++  // — see rt/eclipse_hwfloat.s in the eclipse-package repo) replace the
++  // software __addsf3/__subsf3 this target otherwise uses. Every other
++  // float libcall below stays on its software implementation
++  // unconditionally either way — FMS/FDS (hardware multiply/divide)
++  // were re-probed fresh at entry #30 and reconfirmed genuinely broken
++  // on eclipseemu (both operand orderings, several operand-register
++  // combinations, always silently zero the destination instead of
++  // computing a product/quotient). FLAS/FFAS (hardware int<->float
++  // conversion), by contrast, turned out reliable once probed with the
++  // right operand-order hypothesis — entry #27's original "inconsistent"
++  // verdict was a probing mistake, not a real limitation — but are left
++  // unused regardless: they only convert a single 16-bit AC, not this
++  // target's 32-bit `long` (SINTTOFP_I32_F32/FPTOSINT_F32_I32). See
++  // DEBUGGING_NOTES.md entry #30 for the full re-probe methodology and
++  // results, and entry #27 for FAS/FSS's own original verification.
++  // This exact ADD_F32/SUB_F32 choice is duplicated in
 +  // EclipseSubtarget::initLibcallLoweringInfo — see that method's own
 +  // comment for why both copies are needed.
-+  bool HWFloat = STI.hasHWFloat();
++  bool UseHW = STI.useHardwareFloat();
 +  setLibcallImpl(RTLIB::ADD_F32,
-+                 HWFloat ? RTLIB::impl___addsf3_hw : RTLIB::impl___addsf3);
++                 UseHW ? RTLIB::impl___addsf3_hw : RTLIB::impl___addsf3);
 +  setLibcallImpl(RTLIB::SUB_F32,
-+                 HWFloat ? RTLIB::impl___subsf3_hw : RTLIB::impl___subsf3);
++                 UseHW ? RTLIB::impl___subsf3_hw : RTLIB::impl___subsf3);
 +  setLibcallImpl(RTLIB::MUL_F32, RTLIB::impl___mulsf3);
 +  setLibcallImpl(RTLIB::DIV_F32, RTLIB::impl___divsf3);
 +  // NOTE: these are the *three-way* (-1/0/1) compare libcalls -- the
@@ -6033,10 +6169,10 @@ index 000000000..fb7731dbb
 +def GPR : RegisterClass<"Eclipse", [i16], 16, (add AC0, AC1, AC2, AC3)>;
 diff --git a/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp b/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp
 new file mode 100644
-index 000000000..e1a4b1bbd
+index 000000000..67f9fdb2d
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp
-@@ -0,0 +1,88 @@
+@@ -0,0 +1,95 @@
 +//===-- EclipseSubtarget.cpp - Eclipse Subtarget Information -------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -6084,19 +6220,26 @@ index 000000000..e1a4b1bbd
 +// softening. Only f32 (`float`) is wired; `double` stays unimplemented
 +// (see eclipse_rt.c's soft-float section).
 +void EclipseSubtarget::initLibcallLoweringInfo(LibcallLoweringInfo &Info) const {
-+  // `+hwfloat` (see Eclipse.td's FeatureHWFloat) swaps ADD_F32/SUB_F32
-+  // to the real-hardware-FPU implementations instead of the default
-+  // software ones -- everything else here is unconditional and
-+  // identical either way, matching EclipseISelLowering.cpp's own copy
-+  // of this same choice (see this class's declaration for why both
-+  // copies need it). MUL_F32/DIV_F32 and int<->float conversion have no
-+  // hardware path on this target (FMS/FDS were probed and found
-+  // unreliable on eclipseemu -- see DEBUGGING_NOTES.md), so they stay
-+  // on the software libcalls unconditionally, even with hwfloat on.
-+  Info.setLibcallImpl(RTLIB::ADD_F32, HasHWFloat ? RTLIB::impl___addsf3_hw
-+                                                  : RTLIB::impl___addsf3);
-+  Info.setLibcallImpl(RTLIB::SUB_F32, HasHWFloat ? RTLIB::impl___subsf3_hw
-+                                                  : RTLIB::impl___subsf3);
++  // useHardwareFloat() (see EclipseSubtarget.h) swaps ADD_F32/SUB_F32 to
++  // the real-hardware-FPU implementations instead of the default
++  // software ones -- true unless `+ieee` opts back out to this target's
++  // original pure-IEEE-754 behavior (DEBUGGING_NOTES.md entry #30;
++  // `+hwfloat` alone, without `+ieee`, is equivalent to the new default
++  // -- see Eclipse.td's FeatureIEEEFloat). Everything else here is
++  // unconditional and identical regardless, matching
++  // EclipseISelLowering.cpp's own copy of this same choice (see this
++  // class's declaration for why both copies need it). MUL_F32/DIV_F32
++  // and int<->float conversion have no hardware path wired up on this
++  // target (FMS/FDS reconfirmed genuinely broken on eclipseemu at
++  // entry #30; FLAS/FFAS turned out reliable but only convert a single
++  // 16-bit AC, not this target's 32-bit `long` -- see Eclipse.td's
++  // FeatureHWFloat comment), so they stay on the software libcalls
++  // unconditionally, regardless of this setting.
++  bool UseHW = useHardwareFloat();
++  Info.setLibcallImpl(RTLIB::ADD_F32, UseHW ? RTLIB::impl___addsf3_hw
++                                             : RTLIB::impl___addsf3);
++  Info.setLibcallImpl(RTLIB::SUB_F32, UseHW ? RTLIB::impl___subsf3_hw
++                                             : RTLIB::impl___subsf3);
 +  Info.setLibcallImpl(RTLIB::MUL_F32, RTLIB::impl___mulsf3);
 +  Info.setLibcallImpl(RTLIB::DIV_F32, RTLIB::impl___divsf3);
 +  // See the matching setLibcallImpl block in EclipseISelLowering.cpp's
@@ -6127,10 +6270,10 @@ index 000000000..e1a4b1bbd
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseSubtarget.h b/llvm/lib/Target/Eclipse/EclipseSubtarget.h
 new file mode 100644
-index 000000000..f9db85bda
+index 000000000..081e5ffe4
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseSubtarget.h
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,142 @@
 +//===-- EclipseSubtarget.h - Define Subtarget for the Eclipse -*- C++ -*-===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -6155,31 +6298,64 @@ index 000000000..f9db85bda
 +namespace llvm {
 +
 +class EclipseSubtarget : public EclipseGenSubtargetInfo {
++  // IMPORTANT — declaration order matters here, and it must stay above
++  // InstrInfo/FrameLowering/TLInfo/TSInfo below: C++ initializes data
++  // members in DECLARATION order regardless of the constructor's own
++  // initializer-list order or of which member's initializer happens to
++  // run ParseSubtargetFeatures as a side effect (see
++  // initializeSubtargetDependencies below). These two bools have no
++  // explicit mention in EclipseSubtarget's own constructor initializer
++  // list, so whatever value ParseSubtargetFeatures gave them gets
++  // silently overwritten right back to their in-class default (`=
++  // false`) the moment the initializer reaches *their own* declaration
++  // position — if that position were *after* InstrInfo/TLInfo/etc (as it
++  // was until this was found and fixed here), every reader of
++  // hasHWFloat()/hasIEEEFloat()/useHardwareFloat() that runs *after* the
++  // constructor body finishes (i.e. essentially every real caller —
++  // EclipseSubtarget::initLibcallLoweringInfo and
++  // EclipseAsmPrinter::emitGlobalVariable both included, since both are
++  // ordinary post-construction method calls) would see the reset `false`
++  // regardless of what `-mattr=` actually requested. Confirmed
++  // empirically, not just reasoned about: a debug build with instance-
++  // address-tagged `errs()` prints in both EclipseSubtarget's own
++  // constructor body and EclipseAsmPrinter::emitGlobalVariable showed
++  // the exact same `this` pointer but HasIEEEFloat having reverted from
++  // true (implicitly, per EclipseTargetLowering's constructor picking
++  // the correct software `__addsf3` under `+ieee` — that read happens
++  // *during* construction, before the reset) back to false by the time
++  // the outer constructor body's own print ran. This was a real,
++  // pre-existing latent bug (present for HasHWFloat since entry #27,
++  // just never previously observed because *every* existing reader of
++  // hasHWFloat() happened to run during construction, not after) — not
++  // something newly introduced by DEBUGGING_NOTES.md entry #30, just
++  // newly exposed by it (emitGlobalVariable's ConstantFP handling is
++  // this file's first-ever post-construction consumer). Fixed here by
++  // reordering, not by touching the (already-correct, and already the
++  // standard LLVM idiom for this exact class of problem)
++  // initializeSubtargetDependencies mechanism itself.
++  bool HasHWFloat = false;
++  bool HasIEEEFloat = false;
++
 +  EclipseInstrInfo InstrInfo;
 +  EclipseFrameLowering FrameLowering;
 +  EclipseTargetLowering TLInfo;
 +  SelectionDAGTargetInfo TSInfo;
 +
-+  // Set by ParseSubtargetFeatures (auto-generated by GET_SUBTARGETINFO_CTOR
-+  // from Eclipse.td's FeatureHWFloat -- the field name here must match
-+  // that SubtargetFeature's second argument exactly) when `+hwfloat` is
-+  // requested via `-mattr=`/`-target-feature`. Defaults to false, i.e.
-+  // every existing invocation with no such flag behaves exactly as
-+  // before this feature existed. See Eclipse.td's FeatureHWFloat comment
-+  // for the full story.
-+  bool HasHWFloat = false;
-+
 +  // Called from the very first member initializer below (InstrInfo's),
 +  // *before* TLInfo (EclipseTargetLowering) is constructed -- its
-+  // constructor reads hasHWFloat() to decide which ADD_F32/SUB_F32
-+  // libcall implementation to wire up, so ParseSubtargetFeatures (which
-+  // sets HasHWFloat) has to have already run by then. Plain field
-+  // initializers can't guarantee that ordering against another member's
-+  // constructor (C++ initializes members in declaration order regardless
-+  // of initializer-list order, and ParseSubtargetFeatures itself was
-+  // previously only called from the constructor *body*, which always
-+  // runs after every member is already constructed) -- this is the
-+  // standard fix other LLVM subtargets use for the same problem.
++  // constructor reads hasHWFloat()/hasIEEEFloat() to decide which
++  // ADD_F32/SUB_F32 libcall implementation to wire up, so
++  // ParseSubtargetFeatures (which sets HasHWFloat/HasIEEEFloat) has to
++  // have already run by then. Plain field initializers can't guarantee
++  // that ordering against another member's constructor (C++ initializes
++  // members in declaration order regardless of initializer-list order,
++  // and ParseSubtargetFeatures itself was previously only called from
++  // the constructor *body*, which always runs after every member is
++  // already constructed) -- this is the standard fix other LLVM
++  // subtargets use for the same problem. See HasHWFloat/HasIEEEFloat's
++  // own comment above for the *other*, separate ordering gotcha this
++  // class had (their declaration position relative to InstrInfo et al.,
++  // not relative to this method).
 +  const EclipseSubtarget &initializeSubtargetDependencies(StringRef CPU,
 +                                                            StringRef FS);
 +
@@ -6190,6 +6366,19 @@ index 000000000..f9db85bda
 +  void ParseSubtargetFeatures(StringRef CPU, StringRef TuneCPU, StringRef FS);
 +
 +  bool hasHWFloat() const { return HasHWFloat; }
++  bool hasIEEEFloat() const { return HasIEEEFloat; }
++
++  // Whether ADD_F32/SUB_F32 (and, per entry #30, global float-constant
++  // materialization) should use this target's DG hardware-accelerated
++  // path rather than the original pure-software/IEEE-754-only one --
++  // the single predicate both EclipseSubtarget.cpp's
++  // initLibcallLoweringInfo and EclipseISelLowering.cpp's constructor
++  // key their float-related choices on, kept here so the two copies
++  // (see this class's own comment on why both are needed) can't drift
++  // apart. True whenever `+ieee` was NOT requested (the new default),
++  // or when `+hwfloat` was requested regardless of `+ieee` (preserves
++  // the original, narrower `--hwfloat` meaning exactly).
++  bool useHardwareFloat() const { return !HasIEEEFloat || HasHWFloat; }
 +
 +  const EclipseInstrInfo *getInstrInfo() const override { return &InstrInfo; }
 +  const TargetFrameLowering *getFrameLowering() const override {
@@ -6334,10 +6523,10 @@ index 000000000..ea2bc5d2c
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseTargetMachine.h b/llvm/lib/Target/Eclipse/EclipseTargetMachine.h
 new file mode 100644
-index 000000000..d9958b5ad
+index 000000000..2d85b2960
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseTargetMachine.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,57 @@
 +//===-- EclipseTargetMachine.h - Define TargetMachine for Eclipse -*- C++ -*-//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -6369,6 +6558,17 @@ index 000000000..d9958b5ad
 +  const EclipseSubtarget *getSubtargetImpl(const Function &) const override {
 +    return &Subtarget;
 +  }
++
++  // This target has exactly one EclipseSubtarget for the whole
++  // TargetMachine (no per-function CPU/target-feature-string variation
++  // -- see the Subtarget member above), so a Function-less accessor is
++  // always safe/correct here, unlike most other targets' getSubtargetImpl
++  // overload set. Used by EclipseAsmPrinter::emitGlobalVariable
++  // (DEBUGGING_NOTES.md entry #30), which needs to read
++  // hasIEEEFloat() at module-level global-initializer emission time,
++  // well before/after any specific Function's own instructions are
++  // being emitted.
++  const EclipseSubtarget &getSubtarget() const { return Subtarget; }
 +
 +  TargetPassConfig *createPassConfig(PassManagerBase &PM) override;
 +

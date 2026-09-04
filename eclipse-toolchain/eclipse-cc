@@ -2,16 +2,35 @@
 # eclipse-cc: compile one or more C source files to a runnable dgasm/
 # eclipseemu program for the Data General Nova/Eclipse LLVM backend.
 #
-# Usage: eclipse-cc [-o out.simh] [--hwfloat] file.c [file.c ...]
+# Usage: eclipse-cc [-o out.simh] [--ieee] [--hwfloat] file.c [file.c ...]
 #
-# --hwfloat: opt-in, additive real-hardware-FPU float add/subtract (see
-# the LLVM backend's Eclipse.td FeatureHWFloat and rt/eclipse_hwfloat.s
-# in this directory). Every invocation *without* this flag -- which is
-# every existing use of this script -- is completely unaffected: same
-# `-mattr=` (none), same runtime sources, same generated code, byte for
-# byte. See rt/eclipse_hwfloat.s's own header comment for the full
-# design and DEBUGGING_NOTES.md for the reverse-engineering/verification
-# behind it.
+# As of DEBUGGING_NOTES.md entry #30, this target's DEFAULT (no flags at
+# all) is DG hardware-accelerated float: real Eclipse S/140 FPU
+# instructions (FAS/FSS) for add/subtract instead of the software
+# __addsf3/__subsf3, plus a fix for a pre-existing bug where a file-
+# scope/`static` float global's initializer silently materialized as 0
+# (EclipseAsmPrinter.cpp had no ConstantFP case at all -- see entry #27
+# point 9). Multiply/divide and int<->float conversion stay on their
+# original software implementations either way (entry #30 re-probed
+# FMS/FDS/FLAS/FFAS fresh on eclipseemu and found no safe additional
+# hardware path for those -- see that entry for the full story).
+#
+# --ieee: opt OUT of the above and restore this target's *original*,
+# pre-entry-#30 default: pure IEEE-754 float, software arithmetic,
+# including the pre-existing global-float-initializer bug preserved
+# exactly (verified byte-for-byte identical to every pre-entry-#30
+# build -- see DEBUGGING_NOTES.md entry #30's own verification section).
+#
+# --hwfloat: this flag's OWN meaning is unchanged since it was
+# introduced (entry #27) -- real-hardware-FPU float add/subtract only,
+# nothing else. Since that's now also what happens with no flags at
+# all, this script sets `--ieee` together with `--hwfloat` automatically
+# whenever `--hwfloat` is passed, so `eclipse-cc --hwfloat` alone still
+# reproduces its own pre-entry-#30 behavior exactly (IEEE-754 ABI/
+# storage, hardware add/subtract only, global-float-initializer bug
+# still present) -- see rt/eclipse_hwfloat.s's own header comment for
+# the hardware-FPU design itself and DEBUGGING_NOTES.md for the
+# reverse-engineering/verification behind it.
 #
 # Pipeline: clang -cc1 (one .ll per source, incl. the runtime library) ->
 # llvm-link (merge into one module) -> opt -internalize,globaldce (strip
@@ -39,25 +58,52 @@ RESOURCE_DIR="$("$CLANG" -print-resource-dir)"
 
 out="a.simh"
 hwfloat=0
+ieee=0
 sources=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     --hwfloat) hwfloat=1; shift ;;
+    --ieee) ieee=1; shift ;;
     *) sources+=("$1"); shift ;;
   esac
 done
 
-# clang-side flags, only meaningful for future Clang-level uses of this
-# feature (nothing in the current implementation reads it there -- the
-# actual libcall-selection decision is entirely llc/subtarget-side, see
-# EclipseSubtarget.cpp/EclipseISelLowering.cpp) -- passed anyway so
-# `-target-feature` and `-mattr` never drift out of sync with each other.
-cc1_hwfloat_flags=()
-llc_hwfloat_flags=()
+# --hwfloat implies --ieee -- see this script's own header comment on
+# why: preserves --hwfloat's own pre-entry-#30 meaning (IEEE-754 ABI/
+# storage, hardware add/subtract only) exactly, now that hardware
+# add/subtract alone is also what the bare default does.
 if [ "$hwfloat" -eq 1 ]; then
-  cc1_hwfloat_flags=(-target-feature +hwfloat)
-  llc_hwfloat_flags=(-mattr=+hwfloat)
+  ieee=1
+fi
+
+# clang-side flags, only meaningful for future Clang-level uses of these
+# features (nothing in the current implementation reads them there -- the
+# actual libcall-selection/constant-emission decisions are entirely
+# llc/subtarget-side, see EclipseSubtarget.cpp/EclipseISelLowering.cpp/
+# EclipseAsmPrinter.cpp) -- passed anyway so `-target-feature` and
+# `-mattr` never drift out of sync with each other.
+cc1_float_flags=()
+mattr_list=()
+if [ "$hwfloat" -eq 1 ]; then
+  cc1_float_flags+=(-target-feature +hwfloat)
+  mattr_list+=("+hwfloat")
+fi
+if [ "$ieee" -eq 1 ]; then
+  cc1_float_flags+=(-target-feature +ieee)
+  mattr_list+=("+ieee")
+fi
+# Single comma-joined -mattr= (not one per feature) -- confirmed this
+# matters: llc's cl::list<std::string> -mattr accumulates multiple
+# occurrences as separate *entries*, each independently comma-split, so
+# two separate `-mattr=+hwfloat -mattr=+ieee` args do work the same as
+# one `-mattr=+hwfloat,+ieee` -- but joining them explicitly here avoids
+# ever depending on that accumulation behavior.
+llc_float_flags=()
+if [ "${#mattr_list[@]}" -gt 0 ]; then
+  IFS=,
+  llc_float_flags=("-mattr=${mattr_list[*]}")
+  unset IFS
 fi
 
 if [ ${#sources[@]} -eq 0 ]; then
@@ -88,7 +134,7 @@ compile_one() {
   "$CLANG" -cc1 -triple "$TRIPLE" -nostdsysteminc \
     -isystem "$RESOURCE_DIR/include" \
     -I "$SCRIPT_DIR/rt/include" -I "$SCRIPT_DIR/rt" \
-    "${cc1_hwfloat_flags[@]}" \
+    "${cc1_float_flags[@]}" \
     -emit-llvm "$src" -o "$ll"
   ll_files+=("$ll")
 }
@@ -148,17 +194,24 @@ build_and_assemble() {
     "$merged" -o "$stripped"
 
   local asm="$work/out.s"
-  "$LLC" -mtriple="$TRIPLE" "${llc_hwfloat_flags[@]}" -filetype=asm "$stripped" -o "$asm"
+  "$LLC" -mtriple="$TRIPLE" "${llc_float_flags[@]}" -filetype=asm "$stripped" -o "$asm"
 
-  # --hwfloat: append the hand-written __addsf3_hw/__subsf3_hw assembly
-  # (see rt/eclipse_hwfloat.s's own header comment) onto llc's own
-  # output before reorder_asm.py runs, so its `var` lines get hoisted
-  # to page-zero exactly like every compiler-emitted one -- reorder_asm.py
+  # Append the hand-written __addsf3_hw/__subsf3_hw assembly (see
+  # rt/eclipse_hwfloat.s's own header comment) onto llc's own output
+  # before reorder_asm.py runs, so its `var` lines get hoisted to
+  # page-zero exactly like every compiler-emitted one -- reorder_asm.py
   # is pure line-oriented text manipulation with no dependency on where a
-  # line originally came from (see its own header comment). Only ever
-  # applies to programs actually built with --hwfloat; every other build
-  # never touches $asm here at all.
-  if [ "$hwfloat" -eq 1 ]; then
+  # line originally came from (see its own header comment). Needed
+  # whenever llc's own ADD_F32/SUB_F32 choice (EclipseSubtarget.cpp's
+  # useHardwareFloat(), mirrored here) actually resolved to
+  # __addsf3_hw/__subsf3_hw -- as of DEBUGGING_NOTES.md entry #30 that's
+  # the DEFAULT (no flags at all), not just `--hwfloat` -- get this
+  # condition wrong in either direction and dgasm either reports
+  # "Undefined symbol: __addsf3_hw" (llc referenced it, this script
+  # didn't provide it) or wastes page-zero budget providing a function
+  # nothing calls. `--ieee` (without `--hwfloat`) is the only combination
+  # that does NOT need it.
+  if [ "$ieee" -eq 0 ] || [ "$hwfloat" -eq 1 ]; then
     cat "$HWFLOAT_SRC" >> "$asm"
   fi
 

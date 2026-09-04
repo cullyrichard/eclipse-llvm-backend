@@ -3133,3 +3133,286 @@ convention. `hexfloat32_to_ieee754`/`ieee754_to_hexfloat32` themselves
 are untouched -- still exactly what entry #27's `--hwfloat` machinery
 uses; only this file's own `print_dg_float` stopped routing through
 them.
+
+### 30. DG hardware-accelerated float becomes the DEFAULT (`--ieee` opts out), plus a real global-float-initializer bug fixed — and why a true native hex-float ABI was scoped back out
+
+The task going in: make native DG hex-float the toolchain's *default*
+for `float`/`double` — constant emission, ABI representation, arithmetic,
+comparison, int↔float conversion, and printing all genuinely hex-float,
+end to end — with today's IEEE-754 behavior (including the narrower
+existing `--hwfloat`) demoted to an explicit opt-in, and re-verifying
+`FMS`/`FDS`/`FLAS`/`FFAS`/`FCMP` fresh rather than trusting entry #27's
+"unreliable" verdict. What actually shipped is narrower than that, for a
+concrete, verified reason found partway through (see part 3) — this
+entry is written to be honest about exactly where the line landed and
+why, not to overstate it.
+
+**1. Fresh re-verification of `FMS`/`FDS`/`FLAS`/`FFAS`/`FCMP` on
+`eclipseemu`.** Built a clean, assumption-free hand-assembled harness
+(`org 050`, `FLDS`-loaded known-good hex-float operands — `2.0 =
+0x41200000`, `3.0 = 0x41300000`, `4.0 = 0x41400000`, same constants
+entry #27 already verified — single-stepped, registers inspected via `e
+FPAC0`-`e FPAC3`/`e AC0`-`e AC3`), independent of the original entry #27
+probe.
+
+- **`FMS`/`FDS` (multiply/divide): reconfirmed genuinely broken.**
+  `FMS 0,1` (2.0×3.0) and the reversed `FMS 1,0` (3.0×2.0) both leave the
+  *destination* `FPAC` at exactly zero while the source operand's `FPAC`
+  is untouched — confirmed with both operand orderings. Same result for
+  `FDS` (4.0÷2.0, both orderings). This matches entry #27's original
+  finding exactly, now independently re-derived rather than assumed.
+  Not used.
+- **`FLAS`/`FFAS` (int↔float conversion): entry #27's "operand-encoding-
+  dependent, inconsistent" verdict was a probing mistake, not a real
+  hardware limitation.** First reproduced the original confusion
+  directly: `LDA 1,int5` (`AC1=5`) followed by `FLAS 0,1` produced
+  nothing in `FPAC0` *or* `FPAC1`. But `FLAS 1,1` (loading the *same*
+  register number that's mentioned in the second operand slot) worked —
+  `AC1`'s `5` correctly became `FPAC1`'s `5.0`. That pattern (only
+  "matching-numbered" operands worked) is what looked like
+  "inconsistent" the first time around. Redone with the actual right
+  hypothesis — `FLAS srcAC,dstFPAC` (first operand is the source AC,
+  *not* tied to the destination FPAC number at all) — and it is
+  completely reliable: `LDA 1,int5; FLAS 1,0` → `FPAC0 = 5.0`; `LDA
+  0,int5; FLAS 0,1` → `FPAC1 = 5.0`; `LDA 2,int5; FLAS 2,0` → `FPAC0 =
+  5.0`; `LDA 3,int7; FLAS 3,1` → `FPAC1 = 7.0` — four different
+  register-number combinations, all correct. (One real quirk, harmless:
+  `FLAS`'s output mantissa isn't always in canonical normalized form —
+  e.g. `5` came back as hex-float bits decoding to hi-word `0x4205`
+  (exponent one too high, leading mantissa nibble `0`) instead of the
+  canonical `0x4150`/`0x4205`-equivalent form a real `FAS`/`FSS` result
+  would use — but both encode the exact same value, `5.0`, and
+  `hexfloat32_to_ieee754`'s own normalize loop already tolerates any
+  number of leading zero bits, not just the ≤3 a canonical hex-float
+  needs, so this wouldn't break anything that used it.) `FFAS` likewise
+  reliable once its own (different, and this time already-correctly-used
+  in the original probe) operand order — `FFAS dstAC,srcFPAC` — is
+  understood: `FFAS 0,0`/`FFAS 0,1`/`FFAS 1,0`/`FFAS 2,0`, `FPAC` holding
+  `3.0` each time, all correctly produced `3` in the named destination
+  AC. Not used regardless (see part 3) — both instructions only convert
+  a single 16-bit AC, and this target's `SINTTOFP_I32_F32`/
+  `FPTOSINT_F32_I32` libcalls need a genuine 32-bit `long`; combining two
+  16-bit halves into one 32-bit hardware-assisted conversion would need
+  new, unverified logic (and, given `FMS`/`FDS`'s state, almost certainly
+  *not* a hardware multiply to do the high-word scaling) — flagged as a
+  real, well-scoped follow-up, not forced into this entry.
+- **`FCMP`**: executes without error and leaves both `FPAC` operands
+  unmodified (checked `2.0` vs `3.0`, `3.0` vs `2.0`, `2.0` vs `2.0`).
+  Deliberately not characterized further (the `FSEQ`/`FSGT`/... skip-
+  instruction family was not probed) — see part 3: comparison already
+  has a proven, format-agnostic software path this entry doesn't need to
+  replace.
+
+**2. Why a true native, end-to-end DG hex-float ABI is not reachable
+without patching common LLVM infrastructure.** This target's `float` has
+no register class and no Custom lowering (entry #27 point 4) — every
+float value is generically "softened" by LLVM's own target-independent
+type legalizer before this backend's code ever sees it. For a *constant*
+specifically, that softening is
+`DAGTypeLegalizer::SoftenFloatRes_ConstantFP`
+(`llvm/lib/CodeGen/SelectionDAG/LegalizeFloatTypes.cpp`), and reading it
+directly (not assumed from memory) confirms it unconditionally does
+`CN->getValueAPF().bitcastToAPInt()` — the plain IEEE-754 bit pattern —
+with no target-overridable hook of any kind. That function runs for
+*every* local float constant/temporary materialized inside a function
+body (e.g. `float x = 12.5f;`), regardless of any `SubtargetFeature`.
+There is no lever this backend can pull to make a local float constant
+carry a different (hex-float) bit pattern short of patching that shared,
+target-agnostic function — real surgery affecting every LLVM target that
+uses generic float softening, explicitly the same class of out-of-scope
+change as touching `APFloat` itself (which the original task already
+ruled out for the same reason).
+
+Consequence: if `float` values flowing through registers/stack/locals
+stayed IEEE-754 (unavoidable) while global storage were converted to
+genuine hex-float bits, the two would silently disagree the moment a
+global and a local met in the same expression (`g + x`) — a real,
+serious correctness landmine, not a cosmetic gap. So this entry does
+*not* attempt a native hex-float ABI. The design instead keeps the ABI
+IEEE-754 *everywhere*, exactly as before, and narrows "DG-native by
+default" down to what's actually safely reachable:
+
+- **`ADD_F32`/`SUB_F32` default to real hardware** (`FAS`/`FSS`, via the
+  exact same, already-verified `__addsf3_hw`/`__subsf3_hw` bridge entry
+  #27 built — reused verbatim, not reimplemented) — same
+  convert-in/compute/convert-out shape as today's `--hwfloat`, just made
+  the default instead of opt-in. `MUL_F32`/`DIV_F32`/int↔float conversion
+  stay on their original software implementations unconditionally either
+  way (part 1's `FMS`/`FDS` findings, and `FLAS`/`FFAS`'s 16-bit-only
+  limitation).
+- **A real, independent, pre-existing bug fixed for the new default**:
+  `EclipseAsmPrinter::emitGlobalVariable` had no `ConstantFP` case at all
+  before this entry — a file-scope/`static` `float`/`double` global's
+  initializer fell through to the generic "unsupported leaf constant"
+  fallback and silently materialized as a single zero word (entry #27
+  point 9's "known gap, pre-existing and unrelated"). Fixed for the new
+  default only: emits the constant's real IEEE-754 bit pattern (*not*
+  hex-float, per the ABI decision above) as two words, high-then-low,
+  using the exact same `_word1`-suffix/most-significant-first convention
+  the existing >16-bit `ConstantInt` case already establishes (so
+  existing "access word N of a bulk global" addressing finds it with no
+  further backend support needed). Same handling added to the struct-
+  field-flattening path (`flattenConstant`) for a `float`/`double` struct
+  field. Deliberately gated OFF (falls through to the original
+  "unsupported → 0" behavior) when `+ieee` is set — see part 4.
+- **Comparison libcalls need no change at all, in either mode.**
+  `eclipse_rt.c`'s `sf_cmp` (backing `__eqsf2`/`__ltsf2`/etc.) works by
+  masking off the sign bit and comparing the remaining bits as a plain
+  unsigned integer — it never decomposes into separate exponent/mantissa
+  fields with hardcoded masks. That's format-agnostic: it would have
+  worked unchanged even for a genuine hex-float ABI (same "exponent then
+  mantissa, MSB-first" packing property IEEE-754's own bit-comparison
+  trick relies on), so with the IEEE-754-everywhere design actually
+  shipped here, it's simply unaffected. Not touched.
+
+**3. A genuine, pre-existing latent bug found and fixed along the way:
+member declaration order silently reset `HasHWFloat`/`HasIEEEFloat` back
+to `false` after `ParseSubtargetFeatures` had already set them.**
+`EclipseSubtarget.h` declared `HasHWFloat` (and, until this was found,
+the new `HasIEEEFloat`) *after* `InstrInfo`/`FrameLowering`/`TLInfo`/
+`TSInfo`. C++ initializes data members in declaration order regardless
+of the constructor's own initializer-list order, and `HasHWFloat`/
+`HasIEEEFloat` have no explicit mention in `EclipseSubtarget`'s
+constructor initializer list — so even though `ParseSubtargetFeatures`
+(run as a side effect of `InstrInfo`'s own initializer, via
+`initializeSubtargetDependencies` — see that method's comment) correctly
+set them earlier in the *same* construction sequence, the compiler still
+applies their in-class default member initializer (`= false`) when
+construction reaches *their own* declaration position — which, being
+declared after `InstrInfo` et al., happens *later*, silently
+overwriting the correct value right back to `false`.
+
+Found empirically, not just reasoned about: an instance-address-tagged
+`errs()` print in both `EclipseSubtarget`'s constructor body and (the
+new) `EclipseAsmPrinter::emitGlobalVariable` showed the identical `this`
+pointer but `HasIEEEFloat` reading `false` at both points — while the
+*generated code* for that exact same build correctly used the software
+`__addsf3` under `+ieee` (`EclipseTargetLowering`'s constructor reads
+`useHardwareFloat()` *during* `EclipseSubtarget` construction, i.e.
+before the reset). That contradiction (same object, same field, correct
+transient value seen mid-construction vs. `false` seen immediately after
+and forever after) was the tell. This is a real, pre-existing bug that
+has been present for `HasHWFloat` since entry #27 — it was invisible
+until now purely because every existing reader of `hasHWFloat()`
+happened to run *during* construction (`EclipseISelLowering.cpp`'s
+constructor, `EclipseSubtarget::initLibcallLoweringInfo`'s own
+`ADD_F32`/`SUB_F32` entries feeding `DAG.getLibcalls()`, which per that
+method's own comment is consulted only by the comparison-libcall-
+selection path, not real `ADD_F32` codegen) rather than after it. This
+entry's `emitGlobalVariable` fix is the first-ever genuinely
+*post-construction* consumer, which is what exposed it. Fixed by moving
+`HasHWFloat`/`HasIEEEFloat`'s declarations to *before*
+`InstrInfo`/`FrameLowering`/`TLInfo`/`TSInfo` in the class body — no
+change to `initializeSubtargetDependencies`/`ParseSubtargetFeatures`
+themselves, which were already correct.
+
+**4. Design: `FeatureIEEEFloat` (`Eclipse.td`, opt-out, off by
+default).** `useHardwareFloat() = !HasIEEEFloat || HasHWFloat` (new
+method on `EclipseSubtarget`, single source of truth consulted by both
+`EclipseSubtarget::initLibcallLoweringInfo` and
+`EclipseISelLowering.cpp`'s constructor — mirroring how `HasHWFloat`
+alone was already consulted in two places, see that class's own
+comment). No flags at all → `HasIEEEFloat=false`, `HasHWFloat=false` →
+`useHardwareFloat()=true` → the new default (hardware add/subtract,
+fixed globals). `+ieee` → `HasIEEEFloat=true` → `useHardwareFloat()`
+false unless `+hwfloat` is *also* set → this target's entire original,
+pre-entry-#30 default (software arithmetic, buggy globals preserved).
+`+hwfloat` alone (direct `-mattr=`, not through `eclipse-cc`) is
+equivalent to the new default (`useHardwareFloat()=true` either way) —
+harmless, just redundant. `eclipse-cc`'s own `--hwfloat` flag sets
+*both* `+hwfloat` and `+ieee` together (its existing header comment
+explains why), so `eclipse-cc --hwfloat` alone continues to reproduce
+its own pre-entry-#30 meaning exactly: IEEE-754 ABI/storage, hardware
+add/subtract only, global-initializer bug still present. New
+`eclipse-cc --ieee` flag, and a thin `eclipse-cc-ieee` wrapper script
+(same directory) for tooling that wants a single `CC_SCRIPT`-shaped
+invocation (`run_all_tests.sh`'s own convention). `eclipse-cc` also had
+to stop gating the textual append of `rt/eclipse_hwfloat.s` on
+`$hwfloat` alone — it now has to happen whenever
+`useHardwareFloat()`-equivalent logic (`ieee=0` OR `hwfloat=1`) is true,
+since the new default needs `__addsf3_hw`/`__subsf3_hw` linked in too;
+got this wrong on the first pass (dgasm correctly reported "Undefined
+symbol: `__addsf3_hw`" for the new default before this was fixed —
+exactly the kind of loud, unambiguous failure this project's own
+"dgasm's exit code isn't trustworthy, but undefined-symbol errors are"
+observation already covers).
+
+**5. Verification.**
+
+*`--ieee` (the real regression safety net now — must reproduce every
+pre-entry-#30 build byte-for-byte):*
+- `regress_hwstack.sh`'s full suite (15 examples), run with `--ieee`
+  added to every invocation: every example clean-HALTs with correct
+  output, plus exactly the 4 known/expected "Step expired" cases
+  (`isr_c_test`, `test_fps_add`, `test_fps_md`, `fps_dma_test`) —
+  unchanged from baseline.
+- Full c-testsuite (`eclipse-cc-ieee` as the `CC_SCRIPT`): **197/220**,
+  and the exact same 220-test pass/fail *set* as the documented baseline
+  (diffed test-by-test, not just the aggregate count).
+- `examples/test_hwfloat.c` compiled with `--ieee --hwfloat`: reproduces
+  entry #27's own 11 expected values exactly (`16.750000`, `8.250000`,
+  `-1.500000`, `-5.500000`, `-899.000000`, `0.000000`, `0.000000`,
+  `0.125000`, `0.125000`, `16.750000`, `8.250000`).
+- A dedicated new test (`static`/global `float` and `double`
+  initializers, arithmetic, comparisons — see below) compiled with
+  `--ieee`: every global reads back as `0.000000`, and every value
+  derived from one is consistent with that (`0+0=0.000000`,
+  `0-0=-0.000000`, comparisons against a `0`-valued global all `0`/false)
+  — the pre-existing bug reproduced exactly, confirming `+ieee` really
+  does take the untouched original code path, not a coincidentally-
+  similar new one.
+
+*Default (no flags at all):*
+- Same `regress_hwstack.sh` suite, no flags: identical structure (11
+  clean HALTs, the same 4 "Step expired" cases) *and* identical output
+  values to the `--ieee` run, line for line — diffed directly, zero
+  differences anywhere in the suite.
+- Full c-testsuite, no flags: **197/220**, and — diffed test-by-test
+  against the `--ieee` run — the *exact same* pass/fail set, not just
+  the same count. Zero observed regressions, and (perhaps notable) zero
+  observed hex-float-"wobble"-driven output differences either — this
+  particular suite doesn't happen to exercise a case where hardware
+  add/subtract's extra IEEE↔hex-float rounding step changes a printed
+  digit.
+- `examples/test_hwfloat.c`, no flags: identical output to the `--ieee
+  --hwfloat` run above, value for value (expected — same
+  `__addsf3_hw`/`__subsf3_hw` bridge either way).
+- The dedicated new test, no flags: `static float g_pos = 12.5f;
+  g_neg = -7.25f; g_frac = 0.0625f; g_zero = 0.0f; static double g_dbl =
+  100.75; g_big = 12345.0f;`, printed directly, added/subtracted
+  together, compared with `>`/`==`, and mixed with a local — every value
+  correct and matching independently-computed (small standalone Python
+  check, not hand-typed) expected results: `12.500000`, `-7.250000`,
+  `0.062500`, `0.000000`, `100.750000`, `12345.000000`, `5.250000`
+  (`g_pos+g_neg`), `19.750000` (`g_pos-g_neg`), `1`/`0`/`1`
+  (`g_pos>g_neg`/`g_neg>g_pos`/`g_pos==12.5f`), `15.000000`
+  (`g_pos+local`), `-10.000000` (`local-g_pos`) — confirming both the
+  global-initializer fix and hardware add/subtract are correct together,
+  including a `double` global (this target aliases `double` to the same
+  32-bit `float` representation) and a global mixed with a local in the
+  same expression.
+
+**6. Known gap, honestly scoped, not forced.** `MUL_F32`/`DIV_F32` and
+int↔float conversion stay on their original software implementations in
+*every* mode — no hardware acceleration for those, by design (part 1's
+findings). A genuinely native, end-to-end DG hex-float ABI (constants,
+storage, and every arithmetic op all natively hex-float, eliminating the
+IEEE↔hex-float conversion cost even for add/subtract) remains
+infeasible without patching common LLVM infrastructure (part 2) — not
+attempted, and not expected to become attempted without that
+infrastructure change happening first. Extending `FLAS`/`FFAS`'s now-
+confirmed-reliable single-16-bit-AC conversion into this target's actual
+32-bit `SINTTOFP_I32_F32`/`FPTOSINT_F32_I32` libcalls is a real,
+bounded, well-scoped follow-up opportunity this entry did not pursue.
+
+`eclipse-cc` (new `--ieee` flag, `--hwfloat` now implies it, the
+`eclipse_hwfloat.s`-inclusion condition fix) and the new `eclipse-cc-
+ieee` wrapper kept byte-identical between
+`eclipse-toolchain/eclipse-cc`(`-ieee`) and
+`eclipse-package/eclipse-toolchain/eclipse-cc`(`-ieee`), per this
+project's standing convention. `eclipse_rt.c`/`eclipse_hwfloat.s`
+themselves are untouched by this entry (confirmed identical between both
+copies) — every change here lives in the LLVM backend
+(`Eclipse.td`/`EclipseSubtarget.{h,cpp}`/`EclipseISelLowering.cpp`/
+`EclipseAsmPrinter.cpp`/`EclipseTargetMachine.h`) and in `eclipse-cc`
+itself.
