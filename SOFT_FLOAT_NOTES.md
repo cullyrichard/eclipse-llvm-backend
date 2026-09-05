@@ -28,34 +28,58 @@ Printing a `float` is `print_float(f)` (declared in `stdio.h`), **not**
 for why that's a deliberate, budget-driven design choice, not a missing
 feature.
 
-## Optional hardware-accelerated path (`--hwfloat`)
+## Hardware-accelerated path (default; `--ieee` opts out)
 
-Everything above is the **unconditional default** — it's what every
-existing invocation of this toolchain gets, unchanged, whether or not
-you've read this section. Separately, this target's Eclipse S/140 CPU
-turns out to have a genuine hardware FPU (distinct from, and much more
-usable than, the external FPS100 I/O-device coprocessor documented in
-`DEBUGGING_NOTES.md`'s Background section — `eclipseemu` cannot
-simulate the FPS100 at all, but does simulate the CPU-native FPU).
-Passing `--hwfloat` to `eclipse-cc` (or `-mattr=+hwfloat` to `llc`
-directly) swaps `float` `+`/`-` specifically over to real `FAS`/`FSS`
-hardware instructions instead of the software `__addsf3`/`__subsf3`
-above — see `rt/eclipse_hwfloat.s` and `DEBUGGING_NOTES.md`'s entry on
-this feature for the full design, the reverse-engineered hardware
-number format (IBM System/360-style hex float, *not* IEEE — bridged
-transparently at the `__addsf3_hw`/`__subsf3_hw` boundary, so `float`'s
-storage format/ABI stays IEEE-754 everywhere else regardless of this
-flag), and the calling-convention gotchas found getting it right.
+This target's Eclipse S/140 CPU turns out to have a genuine hardware
+FPU (distinct from, and much more usable than, the external FPS100
+I/O-device coprocessor documented in `DEBUGGING_NOTES.md`'s Background
+section — `eclipseemu` cannot simulate the FPS100 at all, but does
+simulate the CPU-native FPU). As of `DEBUGGING_NOTES.md` entry #30, real
+hardware FPU instructions for `float` add/subtract/comparison and
+int↔float conversion are the **default** — every existing invocation of
+this toolchain that doesn't pass `--ieee` gets them, not just ones that
+opt in. `--ieee` restores this target's *original*, fully-software
+behavior byte-for-byte (the safety-net fallback everything above
+describes); `--hwfloat` is an older, narrower flag kept for its own
+meaning (see `eclipse-cc`'s own header comment) that now implies
+`--ieee` too, so it reproduces its own pre-entry-#30 behavior exactly.
 
-`*`, `/`, comparisons, and int↔float conversion are **not** covered by
-`--hwfloat` — this target's real hardware multiply/divide instructions
-(`FMS`/`FDS`) were probed and found not correctly simulated by
-`eclipseemu` (they execute without error but always zero their
-destination), and hardware int↔float conversion (`FLAS`/`FFAS`) showed
-unreliable, operand-encoding-dependent behavior. Those five operations
-keep using the software implementation above unconditionally, with or
-without `--hwfloat` — a documented, deliberate scope limit, not an
-oversight.
+Covered by the hardware path (default, or `--hwfloat`):
+- `+`/`-` (`FAS`/`FSS`, entry #27) — real hardware add/subtract.
+- `==`/`!=`/`<`/`<=`/`>`/`>=` (entry #31) — real hardware compare, via a
+  genuine `FSS` subtraction (`a - b`) whose sign is then read with
+  `FCMP`+a skip instruction (`FSEQ`/`FSGT`/etc.) — not a direct
+  two-operand `FCMP`, which turned out (entry #31) to only test its
+  *second* operand's own sign against zero on `eclipseemu`, ignoring the
+  first entirely.
+- `(float)int`/`(float)unsigned`/`(int)float`/`(unsigned)float`
+  (entry #31) — real hardware int↔float conversion (`FLAS`/`FFAS`), but
+  only for a value the hardware is actually reliable for: `FLAS`
+  (int→float) turned out reliable only for `[0,32767]` (every negative
+  value tried came back wildly wrong — an asymmetry entry #30's own,
+  positive-integers-only re-probe didn't catch), while `FFAS`
+  (float→int) is reliable across the full signed 16-bit range including
+  negative values and the `-32768` boundary, just not once the true
+  magnitude reaches 32768. Every conversion outside its own safe range
+  falls back to calling the exact original software implementation, so
+  every input is still correct — just not always hardware-accelerated.
+
+**Not** covered, in any mode: `*`/`/`. This target's real hardware
+multiply/divide instructions (`FMS`/`FDS`, and the FPAC-by-memory
+`FMMS`/`FDMS` forms) were probed across three independent sessions now
+(entries #27, #30, #31 — the last specifically trying non-adjacent
+register pairs, self-operand multiply/divide, and the memory-by-FPAC
+forms, not just repeating the first two attempts) and found not
+correctly simulated by `eclipseemu`: they execute without error but
+always leave the destination `FPAC` at exactly zero. `*`/`/` keep using
+the software implementation above unconditionally in every mode — a
+documented, deliberate scope limit, not an oversight. See
+`rt/eclipse_hwfloat.s` and `DEBUGGING_NOTES.md` entries #27/#30/#31 for
+the full design, the reverse-engineered hardware number format (IBM
+System/360-style hex float, *not* IEEE — bridged transparently at each
+`_hw` function's own boundary, so `float`'s storage format/ABI stays
+IEEE-754 everywhere else regardless of this path), and the calling-
+convention gotchas found getting it right.
 
 ## Known limit: the shared page-zero budget
 

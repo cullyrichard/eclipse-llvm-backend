@@ -549,10 +549,10 @@ index 000000000..ab7966cb0
 +
 +} // namespace clang
 diff --git a/llvm/include/llvm/IR/RuntimeLibcalls.td b/llvm/include/llvm/IR/RuntimeLibcalls.td
-index b0d9663cc..f51360255 100644
+index b0d9663cc..7f33aa798 100644
 --- a/llvm/include/llvm/IR/RuntimeLibcalls.td
 +++ b/llvm/include/llvm/IR/RuntimeLibcalls.td
-@@ -1097,6 +1097,18 @@ def __addxf3 : RuntimeLibcallImpl<ADD_F80>;
+@@ -1097,6 +1097,39 @@ def __addxf3 : RuntimeLibcallImpl<ADD_F80>;
  def __addtf3 : RuntimeLibcallImpl<ADD_F128>;
  def __gcc_qadd : RuntimeLibcallImpl<ADD_PPCF128>;
  
@@ -567,6 +567,27 @@ index b0d9663cc..f51360255 100644
 +// this target already wires up every other libcall it uses.
 +def __addsf3_hw : RuntimeLibcallImpl<ADD_F32>;
 +def __subsf3_hw : RuntimeLibcallImpl<SUB_F32>;
++
++// Further Eclipse hardware-FPU alternates, same pattern as
++// __addsf3_hw/__subsf3_hw above: comparison (via FCMP + skip-family,
++// wrapping a real FSS subtraction so it's a genuine two-operand
++// compare, not just FCMP's own single-operand-vs-zero hardware
++// semantics -- see rt/eclipse_hwfloat.s's own header comment) and
++// int<->float conversion (via FLAS/FFAS, guarded to only the
++// magnitude range those two instructions are confirmed reliable for --
++// again see that file's header comment). Selected the same way as
++// __addsf3_hw/__subsf3_hw: via setLibcallImpl based on
++// STI.useHardwareFloat(), not any triple-keyed table.
++def __eqsf2_hw : RuntimeLibcallImpl<FCMP3_PRED_OEQ_F32>;
++def __nesf2_hw : RuntimeLibcallImpl<FCMP3_PRED_UNE_F32>;
++def __ltsf2_hw : RuntimeLibcallImpl<FCMP3_PRED_OLT_F32>;
++def __lesf2_hw : RuntimeLibcallImpl<FCMP3_PRED_OLE_F32>;
++def __gtsf2_hw : RuntimeLibcallImpl<FCMP3_PRED_OGT_F32>;
++def __gesf2_hw : RuntimeLibcallImpl<FCMP3_PRED_OGE_F32>;
++def __floatsisf_hw : RuntimeLibcallImpl<SINTTOFP_I32_F32>;
++def __floatunsisf_hw : RuntimeLibcallImpl<UINTTOFP_I32_F32>;
++def __fixsfsi_hw : RuntimeLibcallImpl<FPTOSINT_F32_I32>;
++def __fixunssfsi_hw : RuntimeLibcallImpl<FPTOUINT_F32_I32>;
 +
  def __subsf3 : RuntimeLibcallImpl<SUB_F32>;
  def __subdf3 : RuntimeLibcallImpl<SUB_F64>;
@@ -2102,10 +2123,10 @@ index 000000000..a4880e3ab
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
 new file mode 100644
-index 000000000..c9a0c4406
+index 000000000..2cf47e4a5
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseISelLowering.cpp
-@@ -0,0 +1,1942 @@
+@@ -0,0 +1,1989 @@
 +//===-- EclipseISelLowering.cpp - Eclipse DAG Lowering Implementation ---===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -2360,23 +2381,26 @@ index 000000000..c9a0c4406
 +  // hardware FPU instructions (FAS/FSS, run through a hand-written
 +  // assembly wrapper matching this target's ordinary calling convention
 +  // — see rt/eclipse_hwfloat.s in the eclipse-package repo) replace the
-+  // software __addsf3/__subsf3 this target otherwise uses. Every other
-+  // float libcall below stays on its software implementation
-+  // unconditionally either way — FMS/FDS (hardware multiply/divide)
-+  // were re-probed fresh at entry #30 and reconfirmed genuinely broken
-+  // on eclipseemu (both operand orderings, several operand-register
-+  // combinations, always silently zero the destination instead of
-+  // computing a product/quotient). FLAS/FFAS (hardware int<->float
-+  // conversion), by contrast, turned out reliable once probed with the
-+  // right operand-order hypothesis — entry #27's original "inconsistent"
-+  // verdict was a probing mistake, not a real limitation — but are left
-+  // unused regardless: they only convert a single 16-bit AC, not this
-+  // target's 32-bit `long` (SINTTOFP_I32_F32/FPTOSINT_F32_I32). See
-+  // DEBUGGING_NOTES.md entry #30 for the full re-probe methodology and
-+  // results, and entry #27 for FAS/FSS's own original verification.
-+  // This exact ADD_F32/SUB_F32 choice is duplicated in
-+  // EclipseSubtarget::initLibcallLoweringInfo — see that method's own
-+  // comment for why both copies are needed.
++  // software __addsf3/__subsf3 this target otherwise uses. MUL_F32/
++  // DIV_F32 stay on their software implementation unconditionally
++  // either way — FMS/FDS (hardware multiply/divide) were re-probed
++  // fresh at entry #30 (both operand orderings, several
++  // operand-register combinations) and again in the follow-up entry
++  // that added the rest of this block below (non-adjacent register
++  // pairs, self-multiply/divide with src==dst, and the FPAC-by-memory
++  // FMMS/FDMS forms — a genuinely broader sweep than either prior
++  // attempt) — every single angle, across three independent sessions
++  // now, reconfirms the exact same result: the destination FPAC always
++  // ends up exactly zero, regardless of operands or register choice.
++  // Comparison and int<->float conversion, below, DO get a genuine
++  // hardware path — FCMP/FSEQ/FSGT/etc. and FLAS/FFAS were
++  // characterized properly (not just re-probed) in that same follow-up
++  // entry. See DEBUGGING_NOTES.md entry #30 for the FMS/FDS re-probe
++  // methodology, entry #27 for FAS/FSS's own original verification, and
++  // the newest entry for the full characterization of FCMP/FLAS/FFAS
++  // and the design built on them. This exact ADD_F32/SUB_F32 choice is
++  // duplicated in EclipseSubtarget::initLibcallLoweringInfo — see that
++  // method's own comment for why both copies are needed.
 +  bool UseHW = STI.useHardwareFloat();
 +  setLibcallImpl(RTLIB::ADD_F32,
 +                 UseHW ? RTLIB::impl___addsf3_hw : RTLIB::impl___addsf3);
@@ -2395,20 +2419,64 @@ index 000000000..c9a0c4406
 +  // with SETNE for every predicate (nonzero-means-true), which only
 +  // happens to agree with the tri-state convention for UNE (and for the
 +  // single true case of OGT/OLT where the result is +1/-1) -- every
-+  // other predicate silently gets the wrong condition code.
-+  setLibcallImpl(RTLIB::FCMP3_PRED_OEQ_F32, RTLIB::impl___eqsf2);
-+  setLibcallImpl(RTLIB::FCMP3_PRED_UNE_F32, RTLIB::impl___nesf2);
-+  setLibcallImpl(RTLIB::FCMP3_PRED_OLT_F32, RTLIB::impl___ltsf2);
-+  setLibcallImpl(RTLIB::FCMP3_PRED_OLE_F32, RTLIB::impl___lesf2);
-+  setLibcallImpl(RTLIB::FCMP3_PRED_OGT_F32, RTLIB::impl___gtsf2);
-+  setLibcallImpl(RTLIB::FCMP3_PRED_OGE_F32, RTLIB::impl___gesf2);
++  // other predicate silently gets the wrong condition code. The `_hw`
++  // alternates (rt/eclipse_hwfloat.s) return the exact same tri-state
++  // convention, computed via a real hardware FSS subtraction (a-b) fed
++  // into FCMP+skip -- see that file's header comment for why: FCMP
++  // itself, characterized empirically here for the first time, does
++  // NOT genuinely compare its two operands against each other on
++  // eclipseemu -- it only tests its *second* operand's sign/zero
++  // against zero, completely ignoring the first. That's still exactly
++  // what's needed for a two-operand compare once the operands are
++  // first combined by a real (already-verified) subtraction.
++  setLibcallImpl(RTLIB::FCMP3_PRED_OEQ_F32,
++                 UseHW ? RTLIB::impl___eqsf2_hw : RTLIB::impl___eqsf2);
++  setLibcallImpl(RTLIB::FCMP3_PRED_UNE_F32,
++                 UseHW ? RTLIB::impl___nesf2_hw : RTLIB::impl___nesf2);
++  setLibcallImpl(RTLIB::FCMP3_PRED_OLT_F32,
++                 UseHW ? RTLIB::impl___ltsf2_hw : RTLIB::impl___ltsf2);
++  setLibcallImpl(RTLIB::FCMP3_PRED_OLE_F32,
++                 UseHW ? RTLIB::impl___lesf2_hw : RTLIB::impl___lesf2);
++  setLibcallImpl(RTLIB::FCMP3_PRED_OGT_F32,
++                 UseHW ? RTLIB::impl___gtsf2_hw : RTLIB::impl___gtsf2);
++  setLibcallImpl(RTLIB::FCMP3_PRED_OGE_F32,
++                 UseHW ? RTLIB::impl___gesf2_hw : RTLIB::impl___gesf2);
 +  // Ordered-comparison softening pairs each predicate with this — see
-+  // eclipse_rt.c's __unordsf2 comment.
++  // eclipse_rt.c's __unordsf2 comment. No hardware alternate: it's a
++  // pure IEEE-754 bit-pattern NaN check, needs no FPU involvement
++  // either way, and this implementation doesn't represent NaN specially
++  // regardless of mode.
 +  setLibcallImpl(RTLIB::UO_F32, RTLIB::impl___unordsf2);
-+  setLibcallImpl(RTLIB::SINTTOFP_I32_F32, RTLIB::impl___floatsisf);
-+  setLibcallImpl(RTLIB::UINTTOFP_I32_F32, RTLIB::impl___floatunsisf);
-+  setLibcallImpl(RTLIB::FPTOSINT_F32_I32, RTLIB::impl___fixsfsi);
-+  setLibcallImpl(RTLIB::FPTOUINT_F32_I32, RTLIB::impl___fixunssfsi);
++  // Int<->float conversion `_hw` alternates use FLAS/FFAS, which are
++  // only reliable for values representable in FLAS/FFAS's own native
++  // 16-bit accumulator (confirmed empirically: FFAS silently returns 0
++  // instead of the true low-order bits for a magnitude at or above
++  // 32768, the same "executes without error but silently wrong" failure
++  // class as FMS/FDS above, just narrower). Since this target's `int`
++  // is genuinely 16-bit (IntWidth=16, Eclipse.h) while these RTLIB
++  // libcalls are always the 32-bit "I32" variant (LLVM has no narrower
++  // int<->float libcall convention -- a `sitofp i16` is legalized by
++  // sign-extending to i32 *before* this libcall runs, and a `fptosi
++  // float to i16` result is legalized by truncating this libcall's i32
++  // result *after* it runs), a plain `(float)some_int`/`(int)some_float`
++  // always arrives here as a value that already safely fits in FLAS/
++  // FFAS's native range -- but the same libcall symbol is also reached
++  // for genuine 32-bit `long` conversions, which may not fit. So each
++  // `_hw` alternate below checks the actual value's range first (an
++  // exact, non-heuristic check -- see rt/eclipse_hwfloat.s) and only
++  // uses hardware when it's provably safe, falling back to calling the
++  // exact same software implementation otherwise -- correct for every
++  // input, faster for the common (genuine 16-bit `int`) case.
++  setLibcallImpl(RTLIB::SINTTOFP_I32_F32, UseHW ? RTLIB::impl___floatsisf_hw
++                                                 : RTLIB::impl___floatsisf);
++  setLibcallImpl(RTLIB::UINTTOFP_I32_F32,
++                 UseHW ? RTLIB::impl___floatunsisf_hw
++                       : RTLIB::impl___floatunsisf);
++  setLibcallImpl(RTLIB::FPTOSINT_F32_I32,
++                 UseHW ? RTLIB::impl___fixsfsi_hw : RTLIB::impl___fixsfsi);
++  setLibcallImpl(RTLIB::FPTOUINT_F32_I32,
++                 UseHW ? RTLIB::impl___fixunssfsi_hw
++                       : RTLIB::impl___fixunssfsi);
 +
 +  // Same "Unsupported means empty symbol name, not a graceful error"
 +  // trap as the float libcalls above, hit via a completely different
@@ -6169,10 +6237,10 @@ index 000000000..fb7731dbb
 +def GPR : RegisterClass<"Eclipse", [i16], 16, (add AC0, AC1, AC2, AC3)>;
 diff --git a/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp b/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp
 new file mode 100644
-index 000000000..67f9fdb2d
+index 000000000..dfc9f5802
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseSubtarget.cpp
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,113 @@
 +//===-- EclipseSubtarget.cpp - Eclipse Subtarget Information -------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -6229,12 +6297,19 @@ index 000000000..67f9fdb2d
 +  // unconditional and identical regardless, matching
 +  // EclipseISelLowering.cpp's own copy of this same choice (see this
 +  // class's declaration for why both copies need it). MUL_F32/DIV_F32
-+  // and int<->float conversion have no hardware path wired up on this
-+  // target (FMS/FDS reconfirmed genuinely broken on eclipseemu at
-+  // entry #30; FLAS/FFAS turned out reliable but only convert a single
-+  // 16-bit AC, not this target's 32-bit `long` -- see Eclipse.td's
-+  // FeatureHWFloat comment), so they stay on the software libcalls
-+  // unconditionally, regardless of this setting.
++  // have no hardware path wired up on this target (FMS/FDS
++  // reconfirmed genuinely broken on eclipseemu across three
++  // independent probing sessions now -- entry #27, entry #30, and the
++  // follow-up entry that added the rest of this block, which retried
++  // with several new register-pairing/self-operand/memory-form angles
++  // and reproduced the exact same "destination FPAC always ends up
++  // zero" result every time), so they stay on the software libcalls
++  // unconditionally, regardless of this setting. Comparison and
++  // int<->float conversion, by contrast, DO get a genuine hardware
++  // path below -- see the matching setLibcallImpl block in
++  // EclipseISelLowering.cpp's constructor for the full story on both,
++  // including why the FCMP3_PRED_* (three-way -1/0/1) family is used
++  // rather than the plain OEQ_F32/UNE_F32/... boolean family.
 +  bool UseHW = useHardwareFloat();
 +  Info.setLibcallImpl(RTLIB::ADD_F32, UseHW ? RTLIB::impl___addsf3_hw
 +                                             : RTLIB::impl___addsf3);
@@ -6242,20 +6317,31 @@ index 000000000..67f9fdb2d
 +                                             : RTLIB::impl___subsf3);
 +  Info.setLibcallImpl(RTLIB::MUL_F32, RTLIB::impl___mulsf3);
 +  Info.setLibcallImpl(RTLIB::DIV_F32, RTLIB::impl___divsf3);
-+  // See the matching setLibcallImpl block in EclipseISelLowering.cpp's
-+  // constructor for why these use the FCMP3_PRED_* (three-way -1/0/1)
-+  // family rather than the plain OEQ_F32/UNE_F32/... boolean family.
-+  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OEQ_F32, RTLIB::impl___eqsf2);
-+  Info.setLibcallImpl(RTLIB::FCMP3_PRED_UNE_F32, RTLIB::impl___nesf2);
-+  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OLT_F32, RTLIB::impl___ltsf2);
-+  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OLE_F32, RTLIB::impl___lesf2);
-+  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OGT_F32, RTLIB::impl___gtsf2);
-+  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OGE_F32, RTLIB::impl___gesf2);
++  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OEQ_F32,
++                       UseHW ? RTLIB::impl___eqsf2_hw : RTLIB::impl___eqsf2);
++  Info.setLibcallImpl(RTLIB::FCMP3_PRED_UNE_F32,
++                       UseHW ? RTLIB::impl___nesf2_hw : RTLIB::impl___nesf2);
++  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OLT_F32,
++                       UseHW ? RTLIB::impl___ltsf2_hw : RTLIB::impl___ltsf2);
++  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OLE_F32,
++                       UseHW ? RTLIB::impl___lesf2_hw : RTLIB::impl___lesf2);
++  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OGT_F32,
++                       UseHW ? RTLIB::impl___gtsf2_hw : RTLIB::impl___gtsf2);
++  Info.setLibcallImpl(RTLIB::FCMP3_PRED_OGE_F32,
++                       UseHW ? RTLIB::impl___gesf2_hw : RTLIB::impl___gesf2);
 +  Info.setLibcallImpl(RTLIB::UO_F32, RTLIB::impl___unordsf2);
-+  Info.setLibcallImpl(RTLIB::SINTTOFP_I32_F32, RTLIB::impl___floatsisf);
-+  Info.setLibcallImpl(RTLIB::UINTTOFP_I32_F32, RTLIB::impl___floatunsisf);
-+  Info.setLibcallImpl(RTLIB::FPTOSINT_F32_I32, RTLIB::impl___fixsfsi);
-+  Info.setLibcallImpl(RTLIB::FPTOUINT_F32_I32, RTLIB::impl___fixunssfsi);
++  Info.setLibcallImpl(RTLIB::SINTTOFP_I32_F32,
++                       UseHW ? RTLIB::impl___floatsisf_hw
++                             : RTLIB::impl___floatsisf);
++  Info.setLibcallImpl(RTLIB::UINTTOFP_I32_F32,
++                       UseHW ? RTLIB::impl___floatunsisf_hw
++                             : RTLIB::impl___floatunsisf);
++  Info.setLibcallImpl(RTLIB::FPTOSINT_F32_I32,
++                       UseHW ? RTLIB::impl___fixsfsi_hw
++                             : RTLIB::impl___fixsfsi);
++  Info.setLibcallImpl(RTLIB::FPTOUINT_F32_I32,
++                       UseHW ? RTLIB::impl___fixunssfsi_hw
++                             : RTLIB::impl___fixunssfsi);
 +
 +  // See the matching setLibcallImpl block in EclipseISelLowering.cpp's
 +  // constructor for the full story: an initialized local aggregate

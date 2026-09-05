@@ -1711,6 +1711,63 @@ u32 hexfloat32_to_ieee754(u32 bits) {
   return sign | ((u32)exp8 << SF_EXP_SHIFT) | (hexmant24 & SF_MANT_MASK);
 }
 
+/* --- Hardware-FPU-path range guards for int<->float conversion, used
+ * from rt/eclipse_hwfloat.s's hand-written __floatsisf_hw/
+ * __floatunsisf_hw/__fixsfsi_hw/__fixunssfsi_hw (see that file's own
+ * header comment for the full design). Ordinary compiled C, not hand-
+ * written assembly, on purpose: this is plain 32-bit integer/exponent
+ * range logic that the compiler already handles correctly everywhere
+ * else in this file, so there's no reason to hand-roll it in assembly
+ * and take on that risk for no benefit -- hand-written assembly here
+ * is reserved for what genuinely has no other path (driving FLAS/FFAS/
+ * FCMP/FSS themselves).
+ *
+ * __hwf_fits_pos16 backs BOTH __floatsisf_hw and __floatunsisf_hw.
+ * FLAS (int->float) was confirmed EMPIRICALLY reliable only for a
+ * value in [0,32767] -- NOT the full 16-bit signed range one might
+ * expect: every negative value probed (-1, -2, -5, -100, -32767,
+ * -32768) came back as a wildly wrong huge-magnitude float (e.g. the
+ * bit pattern for int -5 decoded to roughly -16744453.0, not -5.0),
+ * while every nonnegative value probed (0, 1, 2, 5, 100, 32767) came
+ * back exactly correct. So the *same* [0,32767] guard is the correct,
+ * safe range for both the signed and unsigned direction -- there is no
+ * wider safe range for the signed case the way there might naively be
+ * expected, and checking the raw bit pattern against 32768 this way
+ * correctly rejects a negative `long` (whose bit pattern reinterpreted
+ * as unsigned is far above 32768) exactly as it should.
+ */
+int __hwf_fits_pos16(unsigned long v) { return u32_lt(v, 32768UL); }
+
+/* __hwf_fits_i16f/__hwf_fits_u16f back __fixsfsi_hw/__fixunssfsi_hw
+ * (float->int, via FFAS). FFAS turned out to behave the OPPOSITE way
+ * from FLAS: confirmed empirically reliable across the full signed
+ * 16-bit range INCLUDING negative values and the -32768 boundary
+ * (-1.0, -100.0, -16384.0, -32768.0 all truncated exactly correctly),
+ * but confirmed unreliable once the true magnitude reaches 32768 or
+ * beyond (silently returns 0 instead of the true low-order bits, the
+ * same "executes without error but silently wrong" failure class as
+ * FMS/FDS, just narrower) -- so these only need to bound magnitude via
+ * the IEEE-754 exponent field, not sign. `SF_EXP_BIAS + 14` is exactly
+ * the largest biased exponent guaranteeing |f| < 32768 (2^15): a
+ * *biased* exponent of `SF_EXP_BIAS + 15` (unbiased 15) already means
+ * |f| is in [32768,65536) -- unsafe -- so this threshold is exact, not
+ * a heuristic margin.
+ */
+int __hwf_fits_i16f(float f) {
+  u32 a = sf_bits(f);
+  int aexp = (int)((a & SF_EXP_MASK) >> SF_EXP_SHIFT);
+  return aexp <= (SF_EXP_BIAS + 14);
+}
+
+int __hwf_fits_u16f(float f) {
+  u32 a = sf_bits(f);
+  if (u32_and_nz(a, SF_SIGN_MASK)) {
+    return 0; /* negative -> unsigned conversion is never safe */
+  }
+  int aexp = (int)((a & SF_EXP_MASK) >> SF_EXP_SHIFT);
+  return aexp <= (SF_EXP_BIAS + 14);
+}
+
 /* --- 32-bit integer division/remainder (RTLIB::UDIV_I32/SDIV_I32/
  * UREM_I32/SREM_I32, i.e. __udivsi3/__divsi3/__umodsi3/__modsi3) ---
  *

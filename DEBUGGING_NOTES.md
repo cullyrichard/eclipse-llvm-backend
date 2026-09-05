@@ -3416,3 +3416,256 @@ copies) — every change here lives in the LLVM backend
 (`Eclipse.td`/`EclipseSubtarget.{h,cpp}`/`EclipseISelLowering.cpp`/
 `EclipseAsmPrinter.cpp`/`EclipseTargetMachine.h`) and in `eclipse-cc`
 itself.
+
+### 31. Hardware-backed float comparison and int<->float conversion (default mode) -- extending entry #30's scope, plus a fresh, wider-angle FMS/FDS re-probe that changes nothing
+
+Follow-up to entry #30's own explicitly-scoped-back "known gap": with
+add/subtract now hardware-accelerated by default, this entry asks
+whether comparison and int<->float conversion can join them, and gives
+FMS/FDS (hardware multiply/divide) one more genuinely different-angle
+attempt given today's real urgency. Comparison: yes, fully. Conversion:
+yes, but over a real, honestly-narrower-than-hoped range with a
+software fallback for everything else. Multiply/divide: no, reconfirmed
+broken a third time, from new angles this time, not just repeated ones.
+
+**1. `FCMP` characterized for the first time -- and it does NOT do what
+entries #27/#30 assumed was merely unconfirmed.** Both prior entries
+only checked that `FCMP` "executes without error, leaves both `FPAC`
+operands unmodified" -- never what its condition flags actually reflect.
+A dedicated probe (hand-assembled, `org 050`, `FLDS`-loaded known hex-
+float operands, `FCMP src,dst` followed immediately by one of `FSEQ`/
+`FSNE`/`FSLT`/`FSLE`/`FSGT`/`FSGE` -- all six confirmed to assemble as
+bare, zero-operand skip-if-condition instructions -- then a marker `LDA`
+either side of a `JMP` to detect whether the skip happened) against five
+operand pairs (2.0 vs 3.0, 3.0 vs 2.0, 2.0 vs 2.0, 0.0 vs 0.0, -2.0 vs
+2.0) at first looked like `FCMP` might be testing the *first* operand
+against zero, or comparing them properly, or doing nothing at all --
+three of the five pairs (all with a positive nonzero first operand)
+produced an *identical* "greater than zero" flag pattern regardless of
+which operand was actually bigger (or equal!), while the 0.0/0.0 pair
+alone produced the correct-looking "equal" pattern. A follow-up probe
+pinned it down conclusively: `FCMP 0,1` with AC0=5.0,AC1=0.0 and
+AC0=3.0,AC1=0.0 -- genuinely different first operands -- gave the
+identical "equal" result both times (because AC1==0.0 in both), and
+`FCMP 0,1` with AC0=2.0,AC1=-5.0 gave "less than zero" (matching AC1's
+own sign, not any relationship to AC0). Swapping which operand is
+textually first (`FCMP 1,0`) correctly switched which physical register
+got tested. **Conclusion: `FCMP A,B` on this eclipseemu build tests
+only B's own sign/zero state against zero -- A is read but has no
+effect on the result.** This is a real, confirmed eclipseemu-simulation
+limitation, not a misunderstanding of the ISA -- and it does NOT block a
+real two-operand compare: computing diff = a - b first via the
+already-verified FSS hardware subtraction (exactly __subsf3_hw's own
+load order) and then testing diff's sign via `FCMP <anything>,diff-
+register` is both correct and strictly *cheaper* than add/subtract's
+own hardware path, since the reverse hexfloat-to-IEEE754 conversion
+isn't needed at all -- only diff's sign matters, never its value.
+
+Negative-zero edge case checked and found not to apply: `FCMP`/`FSEQ`
+does *not* treat the raw hex-float bit pattern for negative zero (sign
+bit set, all-else zero) as equal to positive zero when that pattern is
+loaded directly (confirmed with a dedicated probe: FLDS a register with
+hi=32768,lo=0 then `FCMP 0,1`/`FSEQ` does not skip). But this design
+never loads that pattern directly -- only the output of a genuine FSS
+subtraction, which was separately confirmed (both FSS 2.0-2.0 and FSS
+0.0-0.0) to always produce the canonical all-zero-bits result for a
+truly-zero difference, so the edge case never actually arises here.
+
+**2. Design: __eqsf2_hw/__nesf2_hw/__ltsf2_hw/__lesf2_hw/__gtsf2_hw/
+__gesf2_hw, one real body plus five jumps into it.** Mirrors
+eclipse_rt.c's own sf_cmp() sharing (SOFT_FLOAT_NOTES.md already
+documents all six software libcalls as thin aliases of one function):
+__eqsf2_hw computes diff = a - b (via FSS, same operand-load order as
+__subsf3_hw) and returns the libgcc/compiler-rt tri-state -1/0/1 via
+FCMP+FSEQ (test equal first) then FCMP+FSGT (test greater) -- FCMP is
+reissued before each skip test rather than trusting flags to survive
+across two different skip instructions, since that was never itself
+probed and costs nothing to avoid relying on. The other five libcall
+symbols are a single `JMP __eqsf2_hw` each -- safe because the calling
+convention places every argument in the same frame-relative slots
+regardless of which symbol name the caller actually invoked, exactly
+the property that makes the software version's sharing safe too.
+Registered under the same RTLIB::FCMP3_PRED_*_F32 three-way family the
+software versions already use (the SOFT_FLOAT_NOTES.md-documented
+convention this whole target depends on getting right) -- gated on
+STI.useHardwareFloat(), same as ADD_F32/SUB_F32, in both
+EclipseISelLowering.cpp's constructor and
+EclipseSubtarget::initLibcallLoweringInfo. RTLIB::UO_F32 (__unordsf2)
+gets no hardware alternate -- it's a pure IEEE-754 bit-pattern NaN
+check needing no FPU involvement either way.
+
+**3. FLAS/FFAS re-probed with actual negative operands for the first
+time -- and they turn out asymmetric, not just narrower than 32-bit.**
+Entry #30's own re-probe of FLAS/FFAS used only small positive integers
+(5, 7) and concluded the *only* limitation was "convert a single 16-bit
+AC, not this target's 32-bit long" -- implicitly assuming the full
+16-bit *signed* range (including negatives) was safe once that width
+limitation was accounted for. This entry checked that assumption
+directly, since the task's own framing (investigate whether the 32-bit
+int legalization width is a red herring) specifically invited
+re-examining it: confirmed via `clang -S -emit-llvm` on a minimal test
+that this target's genuine `int` (IntWidth=16,
+clang/lib/Basic/Targets/Eclipse.h) really does reach
+SINTTOFP_I32_F32/FPTOSINT_F32_I32 as a sign-extended-to-32-bit value
+(LLVM has no narrower int<->float libcall convention -- a `sitofp i16`
+is legalized by sign-extending to i32 *before* the libcall runs; a
+`fptosi float to i16` result is legalized by truncating this libcall's
+i32 result *after* it runs) -- so a plain `(float)an_int`/`(int)a_float`
+always arrives at these libcalls as a value already safely within
+*some* 16-bit-representable range, while the same symbols are also
+reached for genuine 32-bit `long` conversions that may not be.
+
+Probing FLAS (int->float) with actual negative integers -- not just
+values *outside* 16-bit range -- surfaced something entry #30 never
+saw: `LDA 0,-5` / `FLAS 0,0` produces a FPAC0 bit pattern that decodes
+(via the exact same hexfloat32_to_ieee754 algorithm already used in
+production, run independently in Python against the raw memory words
+FSTS'd out) to roughly **-16744453.0**, not -5.0 -- confirmed across
+five more negative values (-1, -2, -100, -32767, -32768), every one
+wildly wrong the same way, while six nonnegative values (0, 1, 2, 5,
+100, 32767) all decoded exactly correct. **FLAS is reliable only for a
+value in [0,32767] -- not the full 16-bit signed range -- for either
+the signed or unsigned conversion direction.** FFAS (float->int),
+probed the other way for the first time with genuine negative floats,
+turned out to behave *oppositely*: -1.0, -100.0, -16384.0, and the
+-32768.0 boundary itself all truncated exactly correctly (confirmed via
+the AC1 register read after each probe), consistent with entry #30's
+own separate finding that values *above* 32767 in magnitude (40000.0)
+silently return 0 instead of the true low-order bits. **FFAS is
+reliable across the full signed 16-bit range including negative values
+and the -32768 boundary, but only below a magnitude of 32768.**
+
+**4. Design: guarded hardware fast path, software fallback for
+everything else -- __floatsisf_hw/__floatunsisf_hw/__fixsfsi_hw/
+__fixunssfsi_hw.** Given point 3's findings, each function checks the
+actual value's safe range *before* touching FLAS/FFAS, and calls the
+exact, completely unmodified original software implementation
+(__floatsisf/__floatunsisf/__fixsfsi/__fixunssfsi) when the guard
+fails -- correct for every input this libcall could ever receive
+(including genuine 32-bit `long` conversions), faster only for the
+common (small nonnegative int, or any-sign small-magnitude float) case.
+The guards themselves are ordinary compiled C (__hwf_fits_pos16/
+__hwf_fits_i16f/__hwf_fits_u16f, eclipse_rt.c) rather than hand-written
+assembly -- deliberately: this is plain 32-bit range/exponent logic the
+compiler already gets right everywhere else in this file, so there's no
+reason to hand-roll it in assembly and take on that risk for zero
+benefit; hand-written assembly stays reserved for what genuinely has no
+other path (driving FLAS/FFAS/FCMP/FSS themselves). __hwf_fits_pos16(v)
+is `u32_lt(v, 32768UL)` on the raw 32-bit bit pattern -- a single check
+that correctly serves *both* __floatsisf_hw (a negative long's bit
+pattern reinterpreted unsigned is far above 32768, correctly excluded)
+and __floatunsisf_hw. __hwf_fits_i16f/__hwf_fits_u16f check the
+IEEE-754 biased exponent against SF_EXP_BIAS + 14 (the exact threshold
+for |f| < 32768, not a heuristic margin) -- the latter also rejects a
+negative sign bit outright, matching __fixunssfsi's own "negative -> 0"
+convention without even needing to reach FFAS.
+
+__fixsfsi_hw needs one step the other three don't: FFAS's 16-bit signed
+AC result has to be sign-extended into the function's real 32-bit long
+return. AC3 is used as disposable scratch for the sign test (`AND
+acS,acD,SZR` overwrites acD, so it can't run directly on AC1 without
+destroying the very result being tested) -- AC1 itself is never written
+again after FFAS, so it still holds the correct low word throughout.
+__fixunssfsi_hw needs no such step: its guard already guarantees a
+nonnegative result under 32768, so the high word is unconditionally
+zero.
+
+A real, narrow bug found and fixed *while verifying this design*, not
+after: the first version of these four functions used a plain LDA to
+load the three-way-tri-state constants (__hwf_cmp_zero/_plus1/_minus1)
+and the conversion helpers' small integer constants (__hwf_mask8000/
+_zero/_allones/_zerou) -- but those vars are "bulk" (not page-zero)
+data, the exact same class of mistake entry #27 already documented and
+fixed for __addsf3_hw/__subsf3_hw's own scratch, re-introduced here
+because it's easy to reach for a plain LDA for what looks like "just a
+small constant." dgasm caught it immediately and loudly ("Address out
+of range. Got 10525, should be 0 - 255") the first time the new
+functions were actually assembled into a real (non-trivial-sized)
+program -- fixed by using ELDA for every one of these accesses, like
+every other __hwf_* access in this file already does.
+
+**5. FMS/FDS given one more, genuinely wider-angle attempt --
+reconfirmed broken a third time, not just repeated.** Given today's
+explicit urgency, re-probed with angles neither entry #27 nor entry #30
+tried: non-adjacent register pairs (FMS 2,3/FDS 2,3, not just 0,1/1,0),
+self-operand multiply/divide (FMS 0,0/FMS 1,1/FDS 1,1, source and
+destination the same register), and the FPAC-by-memory forms (FMMS/
+FDMS -- FMMS 0,two_hi assembled and executed without error; FDMS 0,1
+assembled too, though it turned out to be a genuine silent no-op, the
+same class of finding as entry #27's own DLSH discovery). Every single
+one of these -- five new angles, not a repeat of the original two --
+reproduces the exact same result: FMS's/FDS's destination FPAC (or, for
+FMMS, the single operand FPAC) always ends up exactly zero, source
+untouched. Single-stepped one case instruction-by-instruction to rule
+out a "needs another instruction to actually land, and reading it too
+early shows a false zero" theory (the destination FPAC still held its
+pre-multiply value immediately after the step that reportedly executed
+FMS, and only became zero on the *next* step -- initially looked like
+it might support a latency theory, until re-examining eclipseemu's own
+`step N`/`e` semantics made clear this is just how `step` reports "the
+instruction about to run next," not evidence of a multi-cycle result --
+the original "reads as zero once you actually check after it runs"
+finding stands). Given three independent sessions (entries #27, #30,
+this one) now agree, with this entry's sweep specifically broader than
+either prior one, this is accepted as a genuine, permanent eclipseemu
+simulation limitation for FMS/FDS/FMMS, not pursued further.
+MUL_F32/DIV_F32 remain on their unmodified software implementation in
+every mode.
+
+**6. Verification.**
+
+*Default (no flags) and `--ieee`, zero regressions required:*
+- regress_hwstack.sh's full 15-example suite, both modes: every example
+  clean-HALTs with correct, byte-identical output, plus exactly the 4
+  known/expected "Step expired" cases (isr_c_test, test_fps_add,
+  test_fps_md, fps_dma_test) in both -- the PC value each gets stuck at
+  legitimately differs between the two modes (the hardware-accelerated
+  build's code layout differs from the software build's), but that's
+  expected and unrelated to correctness; the actual program *output* is
+  identical.
+- Full c-testsuite, both eclipse-cc and eclipse-cc-ieee: **197/220**
+  each, and -- diffed test-by-test, not just the aggregate count -- the
+  *exact same* pass/fail set in both, matching the documented baseline.
+- examples/test_hwfloat.c, both `--ieee --hwfloat` and default (no
+  flags): reproduces entry #27's own 11 expected values exactly
+  (16.750000, 8.250000, -1.500000, -5.500000, -899.000000, 0.000000,
+  0.000000, 0.125000, 0.125000, 16.750000, 8.250000), byte-identical
+  between the two modes.
+
+*New hardware-backed operations, dedicated correctness test
+(examples/test_hwfloat_ext.c, independently-computed expected values,
+not eyeballed):*
+- All six comparison operators (>, <, ==, !=, >=, <=) across
+  representative pairs -- equal, less, greater, negative-vs-zero,
+  fractional, and a repeated-equal-value case -- 15 checks total, every
+  one correct in both modes.
+- Signed and unsigned int->float, both a value that fits the hardware
+  fast path (42, 100, 0, -17) and a long/unsigned long value that
+  doesn't (100000, -100000, 70000) to exercise the software fallback
+  within the same run -- 7 checks, all correct in both modes.
+- Signed and unsigned float->int, values that fit (42.9->42,
+  -17.9->-17, 100.9->100 unsigned, 0.0->0, the exact -32768.0 boundary,
+  32767.9->32767) and long values that don't (100000.5, -100000.5) to
+  exercise the fallback -- 8 checks, all correct in both modes.
+- Default and --ieee builds of this new test produce byte-identical
+  output for all 30 checks -- confirms the hardware path and the
+  software fallback path agree exactly, not just that each is
+  individually plausible.
+
+**7. Known gap, honestly scoped, not forced.** MUL_F32/DIV_F32 stay
+software-only in every mode (point 5) -- a real, permanent limitation
+of this eclipseemu build, not a missing implementation. Int<->float
+conversion's hardware fast path covers [0,32767] only (point 3) --
+narrower than a first guess might expect (no hardware acceleration for
+negative-int-to-float, specifically, given FLAS's asymmetric failure),
+correct regardless via the software fallback, and this scope was chosen
+deliberately once the asymmetry was confirmed empirically rather than
+assumed away. EclipseSubtarget.cpp/EclipseISelLowering.cpp/
+RuntimeLibcalls.td are the only backend files touched; eclipse_rt.c/
+eclipse_hwfloat.s/eclipse-cc (this entry's four new guard helpers, ten
+new hand-written functions, and an updated header comment, respectively)
+are kept byte-identical between eclipse-toolchain and
+eclipse-package/eclipse-toolchain, per this project's standing
+convention -- including a re-applied executable bit on eclipse-cc after
+this session's own comment-only edit silently stripped it (see this
+project's own standing "lost executable bit" gotcha).

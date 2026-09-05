@@ -10,10 +10,18 @@
 # __addsf3/__subsf3, plus a fix for a pre-existing bug where a file-
 # scope/`static` float global's initializer silently materialized as 0
 # (EclipseAsmPrinter.cpp had no ConstantFP case at all -- see entry #27
-# point 9). Multiply/divide and int<->float conversion stay on their
-# original software implementations either way (entry #30 re-probed
-# FMS/FDS/FLAS/FFAS fresh on eclipseemu and found no safe additional
-# hardware path for those -- see that entry for the full story).
+# point 9). As of entry #31, the default ALSO hardware-accelerates the
+# six comparison libcalls (via FCMP + a real FSS subtraction) and all
+# four int<->float conversion libcalls (via FLAS/FFAS, each guarded to
+# only the value range those two instructions are actually reliable
+# for, falling back to the unmodified original software implementation
+# otherwise -- see entry #31 for the full story, including why FLAS and
+# FFAS turned out to have two DIFFERENT safe ranges). Multiply/divide
+# stay on their original software implementation either way -- entry
+# #31 gave FMS/FDS one more genuinely different-angle re-probe (non-
+# adjacent register pairs, self-multiply, the FMMS/FDMS memory-form
+# variants) and reconfirmed the same "destination always ends up zero"
+# result from entries #27/#30, now across three independent sessions.
 #
 # --ieee: opt OUT of the above and restore this target's *original*,
 # pre-entry-#30 default: pure IEEE-754 float, software arithmetic,

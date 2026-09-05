@@ -252,6 +252,368 @@ __subsf3_hw:
 	STA 1,-3,2
 	RTN
 
+// __eqsf2_hw/__nesf2_hw/__ltsf2_hw/__lesf2_hw/__gtsf2_hw/__gesf2_hw --
+// hardware-backed alternates for the six three-way (-1/0/1) comparison
+// libcalls (see eclipse_rt.c's sf_cmp comment for the convention: all
+// six are thin aliases of ONE shared -1/0/1 result, tested afterward by
+// the generic softenSetCCOperands with a per-predicate CondCode against
+// 0 -- so all six genuinely need only one real body here too;
+// __eqsf2_hw is the only one with real code, the other five are plain
+// unconditional jumps into it, safe because the calling convention puts
+// every argument in the exact same frame-relative slots no matter which
+// symbol name the caller actually invoked).
+//
+// Design: compute diff = a - b using the SAME real hardware FSS
+// subtraction __subsf3_hw above already uses (already verified
+// correct), then use FCMP plus a skip-family instruction (FSEQ/FSGT) to
+// read diff's sign/zero state. NOT a direct two-operand float compare
+// -- FCMP was characterized here for the first time (DEBUGGING_NOTES.md
+// entry #27/#30 only confirmed it "executes without error", never what
+// it actually does), and it turns out to NOT genuinely compare its two
+// operands against each other on eclipseemu at all: probing several
+// independent pairs (2.0 vs 3.0, 3.0 vs 2.0, 2.0 vs 2.0, 0.0 vs 0.0,
+// -2.0 vs 2.0, 5.0 vs 0.0, 2.0 vs -5.0, 0.0 vs 5.0) showed FCMP's
+// condition flags depend ONLY on its SECOND operand's own sign/zero
+// state -- the first operand is read but has zero effect on the
+// result. (Confirmed directly and unambiguously: `FCMP 0,1` with
+// AC0=2.0,AC1=0.0 and AC0=3.0,AC1=0.0 -- genuinely different first
+// operands -- produced the identical "equal" result both times, purely
+// because AC1==0.0 in both; `FCMP 1,0` with the operand *positions*
+// swapped correctly switched to testing AC0 instead, confirming it's
+// positional -- whichever operand is written second -- not tied to a
+// specific register number.) That's still exactly what a real
+// two-operand compare needs once the operands are first combined by a
+// genuine subtraction -- which this design has to do anyway to get
+// their sign/magnitude relationship, so it costs nothing extra over a
+// direct (nonexistent) two-operand compare. The reverse
+// hexfloat32_to_ieee754 conversion __addsf3_hw/__subsf3_hw need for
+// their own result is NOT needed here -- only the SIGN of the diff
+// matters, never its numeric value, so this is actually cheaper than
+// add/subtract's own hardware path.
+//
+// Negative-zero caveat, checked and found not to apply here: FCMP/FSEQ
+// does NOT treat the raw hex-float bit pattern for negative zero (sign
+// bit set, all-else zero) as equal to positive zero when that pattern
+// is loaded directly (confirmed with a dedicated probe). But this
+// design never loads that pattern directly -- it only ever tests the
+// output of a genuine FSS subtraction, which (confirmed directly: FSS
+// 2.0-2.0 and FSS 0.0-0.0 both) always produces the canonical
+// all-zero-bits result for a truly-zero difference, so the raw-
+// negative-zero edge case never actually arises here. (One narrow
+// residual gap, honestly noted: comparing two floats that are each
+// already exactly +0.0/-0.0 *by construction* rather than by
+// subtracting to zero is covered by this same argument -- FSS's own
+// zero output is canonical regardless of its two input signs -- but
+// wasn't separately reprobed with a *negative*-zero operand feeding the
+// subtraction; not expected to differ, since FSS's zero-producing path
+// doesn't depend on which operand signs produced the zero, only that
+// the true mathematical difference is zero.)
+__eqsf2_hw:
+	SAVE 4
+	MOV 3,2
+	LDA 0,-8,2
+	ESTA 0,__hwf_cmp_b_lo
+	LDA 0,-7,2
+	ESTA 0,__hwf_cmp_b_hi
+	LDA 0,-6,2
+	ESTA 0,__hwf_cmp_a_lo
+	LDA 0,-5,2
+	ESTA 0,__hwf_cmp_a_hi
+	ELDA 0,__hwf_cmp_a_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cmp_a_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR ieee754_to_hexfloat32,0
+	DSZ 040,0
+	DSZ 040,0
+	ESTA 0,__hwf_cmp_a_hi
+	ESTA 1,__hwf_cmp_a_lo
+	ELDA 0,__hwf_cmp_b_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cmp_b_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR ieee754_to_hexfloat32,0
+	DSZ 040,0
+	DSZ 040,0
+	ESTA 0,__hwf_cmp_b_hi
+	ESTA 1,__hwf_cmp_b_lo
+	FLDS 0,__hwf_cmp_b_hi
+	FLDS 1,__hwf_cmp_a_hi
+	FSS 0,1
+	FCMP 0,1
+	FSEQ
+	JMP __hwf_cmp_ne
+	ELDA 0,__hwf_cmp_zero
+	JMP __hwf_cmp_done
+__hwf_cmp_ne:
+	FCMP 0,1
+	FSGT
+	JMP __hwf_cmp_notgt
+	ELDA 0,__hwf_cmp_plus1
+	JMP __hwf_cmp_done
+__hwf_cmp_notgt:
+	ELDA 0,__hwf_cmp_minus1
+__hwf_cmp_done:
+	STA 0,-4,2
+	STA 0,-3,2
+	RTN
+
+__nesf2_hw:
+	JMP __eqsf2_hw
+__ltsf2_hw:
+	JMP __eqsf2_hw
+__lesf2_hw:
+	JMP __eqsf2_hw
+__gtsf2_hw:
+	JMP __eqsf2_hw
+__gesf2_hw:
+	JMP __eqsf2_hw
+
+// __floatsisf_hw(i)/__floatunsisf_hw(mag) -- hardware-backed alternates
+// for int->float conversion, via FLAS. Guarded by __hwf_fits_pos16
+// (eclipse_rt.c -- see its own comment for the full empirical story:
+// FLAS turned out reliable ONLY for a value in [0,32767], including for
+// the *signed* direction -- every negative value tried came back
+// wildly wrong, not just the ones outside 16-bit range) and falling
+// back to the exact original software implementation (__floatsisf/
+// __floatunsisf, both completely unmodified) whenever the guard fails,
+// so these are correct for every input, faster only for the common
+// (small nonnegative) case. Both functions are otherwise identical
+// except which software fallback they call -- not merged into one
+// shared body the way the six comparisons above are, since unlike
+// those, __floatsisf_hw/__floatunsisf_hw are NOT interchangeable (their
+// fallback path genuinely differs).
+__floatsisf_hw:
+	SAVE 4
+	MOV 3,2
+	LDA 0,-6,2
+	ESTA 0,__hwf_cvi_lo
+	LDA 0,-5,2
+	ESTA 0,__hwf_cvi_hi
+	ELDA 0,__hwf_cvi_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvi_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR __hwf_fits_pos16,0
+	DSZ 040,0
+	DSZ 040,0
+	MOV 0,0,SZR
+	JMP __hwf_fsi_fast
+	JMP __hwf_fsi_soft
+__hwf_fsi_fast:
+	ELDA 0,__hwf_cvi_lo
+	FLAS 0,0
+	FSTS 0,__hwf_cvi_rhi
+	ELDA 0,__hwf_cvi_rlo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvi_rhi
+	ISZ 040,0
+	STA 0,@040
+	EJSR hexfloat32_to_ieee754,0
+	DSZ 040,0
+	DSZ 040,0
+	STA 0,-4,2
+	STA 1,-3,2
+	RTN
+__hwf_fsi_soft:
+	ELDA 0,__hwf_cvi_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvi_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR __floatsisf,0
+	DSZ 040,0
+	DSZ 040,0
+	STA 0,-4,2
+	STA 1,-3,2
+	RTN
+
+__floatunsisf_hw:
+	SAVE 4
+	MOV 3,2
+	LDA 0,-6,2
+	ESTA 0,__hwf_cvu_lo
+	LDA 0,-5,2
+	ESTA 0,__hwf_cvu_hi
+	ELDA 0,__hwf_cvu_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvu_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR __hwf_fits_pos16,0
+	DSZ 040,0
+	DSZ 040,0
+	MOV 0,0,SZR
+	JMP __hwf_fui_fast
+	JMP __hwf_fui_soft
+__hwf_fui_fast:
+	ELDA 0,__hwf_cvu_lo
+	FLAS 0,0
+	FSTS 0,__hwf_cvu_rhi
+	ELDA 0,__hwf_cvu_rlo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvu_rhi
+	ISZ 040,0
+	STA 0,@040
+	EJSR hexfloat32_to_ieee754,0
+	DSZ 040,0
+	DSZ 040,0
+	STA 0,-4,2
+	STA 1,-3,2
+	RTN
+__hwf_fui_soft:
+	ELDA 0,__hwf_cvu_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvu_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR __floatunsisf,0
+	DSZ 040,0
+	DSZ 040,0
+	STA 0,-4,2
+	STA 1,-3,2
+	RTN
+
+// __fixsfsi_hw(f)/__fixunssfsi_hw(f) -- hardware-backed alternates for
+// float->int conversion, via FFAS. Guarded by __hwf_fits_i16f/
+// __hwf_fits_u16f (eclipse_rt.c -- see its own comment: FFAS turned out
+// reliable across the FULL signed 16-bit range, including negative
+// values and the -32768 boundary -- unlike FLAS's asymmetric failure
+// above -- but unreliable once the true magnitude reaches 32768 or
+// beyond), falling back to the exact original software implementation
+// (__fixsfsi/__fixunssfsi, both completely unmodified) whenever the
+// guard fails.
+//
+// __fixsfsi_hw needs one extra step __fixunssfsi_hw doesn't: FFAS's
+// 16-bit signed AC result has to be sign-extended into this function's
+// real 32-bit `long` return. AC3 is used as disposable scratch for the
+// sign test (`AND acS,acD,SZR` overwrites acD, so the sign test can't
+// run directly on AC1 without destroying the very result it's testing)
+// -- AC1 itself is never written again after FFAS, so it still holds
+// the correct low word throughout. __fixunssfsi_hw needs no such step:
+// its guard already guarantees a nonnegative result under 32768, so the
+// high word is unconditionally 0 (plain zero-extension).
+__fixsfsi_hw:
+	SAVE 4
+	MOV 3,2
+	LDA 0,-6,2
+	ESTA 0,__hwf_cvf_lo
+	LDA 0,-5,2
+	ESTA 0,__hwf_cvf_hi
+	ELDA 0,__hwf_cvf_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvf_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR __hwf_fits_i16f,0
+	DSZ 040,0
+	DSZ 040,0
+	MOV 0,0,SZR
+	JMP __hwf_fsf_fast
+	JMP __hwf_fsf_soft
+__hwf_fsf_fast:
+	ELDA 0,__hwf_cvf_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvf_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR ieee754_to_hexfloat32,0
+	DSZ 040,0
+	DSZ 040,0
+	ESTA 0,__hwf_cvf_hi
+	ESTA 1,__hwf_cvf_lo
+	FLDS 0,__hwf_cvf_hi
+	FFAS 1,0
+	MOV 1,3
+	ELDA 0,__hwf_mask8000
+	AND 0,3,SZR
+	JMP __hwf_fsf_neg
+	ELDA 0,__hwf_zero
+	JMP __hwf_fsf_setlo
+__hwf_fsf_neg:
+	ELDA 0,__hwf_allones
+__hwf_fsf_setlo:
+	STA 0,-4,2
+	STA 1,-3,2
+	RTN
+__hwf_fsf_soft:
+	ELDA 0,__hwf_cvf_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvf_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR __fixsfsi,0
+	DSZ 040,0
+	DSZ 040,0
+	STA 0,-4,2
+	STA 1,-3,2
+	RTN
+
+__fixunssfsi_hw:
+	SAVE 4
+	MOV 3,2
+	LDA 0,-6,2
+	ESTA 0,__hwf_cvfu_lo
+	LDA 0,-5,2
+	ESTA 0,__hwf_cvfu_hi
+	ELDA 0,__hwf_cvfu_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvfu_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR __hwf_fits_u16f,0
+	DSZ 040,0
+	DSZ 040,0
+	MOV 0,0,SZR
+	JMP __hwf_fuf_fast
+	JMP __hwf_fuf_soft
+__hwf_fuf_fast:
+	ELDA 0,__hwf_cvfu_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvfu_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR ieee754_to_hexfloat32,0
+	DSZ 040,0
+	DSZ 040,0
+	ESTA 0,__hwf_cvfu_hi
+	ESTA 1,__hwf_cvfu_lo
+	FLDS 0,__hwf_cvfu_hi
+	FFAS 1,0
+	ELDA 0,__hwf_zerou
+	STA 0,-4,2
+	STA 1,-3,2
+	RTN
+__hwf_fuf_soft:
+	ELDA 0,__hwf_cvfu_lo
+	ISZ 040,0
+	STA 0,@040
+	ELDA 0,__hwf_cvfu_hi
+	ISZ 040,0
+	STA 0,@040
+	EJSR __fixunssfsi,0
+	DSZ 040,0
+	DSZ 040,0
+	STA 0,-4,2
+	STA 1,-3,2
+	RTN
+
 // Shared scratch. Deliberately "bulk" (not page-zero -- see this file's
 // header comment above), unlike most of this backend's own compiler-
 // emitted scratch cells: nothing here needs the 8-bit-displacement
@@ -272,3 +634,38 @@ var __hwf_b_hi = 0
 var __hwf_b_lo = 0
 var __hwf_r_hi = 0
 var __hwf_r_lo = 0
+
+// Scratch for __eqsf2_hw (and the five plain-jump aliases into it) and
+// the four int<->float conversion functions above -- same "bulk, safe
+// to share, never reentrant/concurrent" reasoning as __hwf_a_hi etc.
+// above, just split into separate names per function group rather than
+// reused, purely so each new function's own code stays self-contained
+// and easy to review (there is no page-zero budget cost either way --
+// see this file's header comment on why "bulk" placement is free here).
+var __hwf_cmp_a_hi = 0
+var __hwf_cmp_a_lo = 0
+var __hwf_cmp_b_hi = 0
+var __hwf_cmp_b_lo = 0
+var __hwf_cmp_zero = 0
+var __hwf_cmp_plus1 = 1
+var __hwf_cmp_minus1 = -1
+
+var __hwf_cvi_hi = 0
+var __hwf_cvi_lo = 0
+var __hwf_cvi_rhi = 0
+var __hwf_cvi_rlo = 0
+
+var __hwf_cvu_hi = 0
+var __hwf_cvu_lo = 0
+var __hwf_cvu_rhi = 0
+var __hwf_cvu_rlo = 0
+
+var __hwf_cvf_hi = 0
+var __hwf_cvf_lo = 0
+var __hwf_mask8000 = 32768
+var __hwf_zero = 0
+var __hwf_allones = -1
+
+var __hwf_cvfu_hi = 0
+var __hwf_cvfu_lo = 0
+var __hwf_zerou = 0
