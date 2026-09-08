@@ -3878,3 +3878,79 @@ covers for pointer-offset byte access, until Gap 1 is actually fixed.
 plus the one-line call-site change in `emitGlobalVariable`'s
 `ConstantAggregateZero`+`ArrayType` case). No other backend file was
 touched.
+
+### 33. `eclipse-compile.sh` (the real-hardware `-f ab` pipeline) never
+picked up any of entry #30/#31's hardware-float-default wiring --
+"Undefined symbol: __fixsfsi_hw" on any program doing a float->int
+conversion, real hardware only
+
+While debugging the MANDEL240/FPS-100 real-hardware driver (a series of
+`mandel240_diagN.c` probes reading DMA'd escape-count pixels back from
+the AP-120B and decoding them), a new diagnostic (`mandel240_diag4.c`,
+the first in the series to actually do `(int)v` on a decoded `float`)
+compiled cleanly via `eclipse-cc` (the emulator/`-f simh` pipeline) but
+failed via `eclipse-compile.sh` (the real-hardware/`-f ab` pipeline)
+with:
+
+```
+eclipse-compile.sh: retrying with __fixsfsi_hw protected (needed by this program)
+eclipse-compile.sh: dgasm failed:
+Undefined symbol: __fixsfsi_hw
+```
+
+i.e. the protect-and-retry loop correctly identified the missing symbol
+and added it to dgasm's public-API allowlist, and dgasm *still* reported
+it undefined on the next pass -- meaning the symbol wasn't merely
+getting stripped, it was never *defined* anywhere in this pipeline's
+input at all.
+
+Root cause: entry #30 made this target's DEFAULT (no flags at all)
+hardware-accelerated float, with the actual `__addsf3_hw`/`__fixsfsi_hw`/
+etc. implementations living in a hand-written assembly file,
+`rt/eclipse_hwfloat.s`, that `eclipse-cc`'s own `build_and_assemble`
+appends onto `llc`'s text output before `reorder_asm.py`/`dgasm` run
+(see that script's own comment: "Append the hand-written
+__addsf3_hw/__subsf3_hw assembly ... onto llc's own output ... Needed
+whenever llc's own ADD_F32/SUB_F32 choice ... actually resolved to
+__addsf3_hw/__subsf3_hw -- as of entry #30 that's the DEFAULT"). Nobody
+had ever ported this step into `eclipse-compile.sh` when entry #30
+landed -- that script had no `HWFLOAT_SRC` variable, no `--ieee`/
+`--hwfloat` flags at all, and never appended `eclipse_hwfloat.s`
+anywhere. Since `eclipse-compile.sh`'s default is the *same*
+no-flags-means-hardware-float default (it shares `EclipseSubtarget.cpp`/
+`EclipseISelLowering.cpp` with `eclipse-cc` -- the divergence was purely
+in these two build *scripts*, not the compiler), `llc` was correctly
+emitting calls to the `_hw` libcalls, but nothing in this pipeline ever
+supplied their definitions. Every earlier diagnostic in the same series
+(`mandel240_diag.c`, `_diag2.c`, `_diag3.c`) had compiled fine through
+this exact same broken script, purely because none of them happened to
+need a float->int *conversion* specifically (`_diag3.c`'s `bits_to_float`
+is a plain union bit-reinterpret, no arithmetic) -- so this had been
+silently wrong for as long as entry #30 has existed and simply hadn't
+been exercised.
+
+**Fix**: ported `eclipse-cc`'s `--ieee`/`--hwfloat` flag parsing,
+`cc1_float_flags`/`mattr_list`/`llc_float_flags` construction, and the
+`HWFLOAT_SRC` append step (`cat "$HWFLOAT_SRC" >> "$work/prog.s"` before
+`reorder_asm.py`, gated on the identical `[ "$ieee" -eq 0 ] ||
+[ "$hwfloat" -eq 1 ]` condition) into `eclipse-compile.sh`, matching
+`eclipse-cc` line for line where the two scripts' logic needs to be
+identical. Verified: `mandel240_diag4.c` now compiles via
+`eclipse-compile.sh` (needing the same protected-symbol set `eclipse-cc`
+needed: `ieee754_to_hexfloat32`, `hexfloat32_to_ieee754`,
+`__hwf_fits_pos16`, `__floatsisf`, `__floatunsisf`, `__hwf_fits_i16f`,
+`__hwf_fits_u16f`, `__fixunssfsi` -- no more `__fixsfsi_hw` failure).
+Regression-checked all four pre-existing MANDEL240 programs
+(`mandel240_diag.c`, `_diag2.c`, `_diag3.c`, `mandel240_view.c`) still
+compile cleanly through the now-fixed `eclipse-compile.sh`, and
+`mandel240_diag4.c` still compiles cleanly through `eclipse-cc`
+unchanged (this was never broken on that side) -- no regressions either
+direction.
+
+**Files changed**: `eclipse-compile.sh` only (synced to
+`eclipse-package/eclipse-toolchain/eclipse-compile.sh` per this
+project's usual dual-copy convention -- that copy was additionally
+stale on an unrelated point, entry #31's broadened undefined-symbol
+regex, now also picked up by the sync). No compiler/backend file was
+touched; this was purely a build-script gap between the two sibling
+scripts, not a code-generation bug.

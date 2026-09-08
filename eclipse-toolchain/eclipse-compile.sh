@@ -29,24 +29,64 @@
 # of accepting the output as a second bare argument -- with multiple
 # sources, "the last argument that isn't a source" would be ambiguous.
 #
-# Usage: eclipse-compile.sh [-o output.eclipse] input.c [input2.c ...]
+# --ieee/--hwfloat: same meaning and same --hwfloat-implies--ieee behavior
+# as eclipse-cc (see that script's own header comment for the full
+# rationale) -- added here after discovering this script had NONE of
+# eclipse-cc's entry #30/#31 hardware-float-default wiring at all: it
+# never appended rt/eclipse_hwfloat.s (where __addsf3_hw/__fixsfsi_hw/etc.
+# are actually defined) onto llc's output, and never passed any -mattr to
+# llc either. Since this script's default (no flags) is the same
+# no-flags-means-hardware-float default as eclipse-cc/EclipseSubtarget.cpp,
+# llc was emitting calls to the _hw libcalls with nothing here ever
+# defining them -- confirmed via "Undefined symbol: __fixsfsi_hw" on
+# mandel240_diag4.c (the first diagnostic in that series to need a
+# float->int conversion at all; diag/diag2/diag3 never happened to need
+# one, which is why this went unnoticed through all of them).
+#
+# Usage: eclipse-compile.sh [-o output.eclipse] [--ieee] [--hwfloat] input.c [input2.c ...]
 
 set -euo pipefail
 
 out=""
+hwfloat=0
+ieee=0
 sources=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
+    --hwfloat) hwfloat=1; shift ;;
+    --ieee) ieee=1; shift ;;
     *) sources+=("$1"); shift ;;
   esac
 done
 
 if [ ${#sources[@]} -eq 0 ]; then
-  echo "usage: eclipse-compile.sh [-o output.eclipse] input.c [input2.c ...]" >&2
+  echo "usage: eclipse-compile.sh [-o output.eclipse] [--ieee] [--hwfloat] input.c [input2.c ...]" >&2
   exit 1
 fi
 out="${out:-${sources[0]%.*}.eclipse}"
+
+# --hwfloat implies --ieee -- see eclipse-cc's own header comment.
+if [ "$hwfloat" -eq 1 ]; then
+  ieee=1
+fi
+
+cc1_float_flags=()
+mattr_list=()
+if [ "$hwfloat" -eq 1 ]; then
+  cc1_float_flags+=(-target-feature +hwfloat)
+  mattr_list+=("+hwfloat")
+fi
+if [ "$ieee" -eq 1 ]; then
+  cc1_float_flags+=(-target-feature +ieee)
+  mattr_list+=("+ieee")
+fi
+llc_float_flags=()
+if [ "${#mattr_list[@]}" -gt 0 ]; then
+  IFS=,
+  llc_float_flags=("-mattr=${mattr_list[*]}")
+  unset IFS
+fi
 
 LLVM_BUILD="${LLVM_BUILD:-$HOME/dev/llvm-build}"
 TOOLCHAIN="${TOOLCHAIN:-$HOME/dev/eclipse-toolchain}"
@@ -56,6 +96,7 @@ LLVM_LINK="$LLVM_BUILD/bin/llvm-link"
 OPT="$LLVM_BUILD/bin/opt"
 REORDER="$TOOLCHAIN/reorder_asm.py"
 RT_SRC="$TOOLCHAIN/rt/eclipse_rt.c"
+HWFLOAT_SRC="$TOOLCHAIN/rt/eclipse_hwfloat.s"
 TRIPLE="eclipse-dg-none"
 
 for tool in "$CLANG" "$LLC" "$LLVM_LINK" "$OPT"; do
@@ -89,12 +130,12 @@ for src in "${sources[@]}"; do
   n=$((n + 1))
   echo "[1/7] clang -cc1: $src -> IR"
   ll="$work/src$n.ll"
-  "$CLANG" "${CC1_FLAGS[@]}" -emit-llvm "$src" -o "$ll"
+  "$CLANG" "${CC1_FLAGS[@]}" "${cc1_float_flags[@]}" -emit-llvm "$src" -o "$ll"
   ll_files+=("$ll")
 done
 
 echo "[2/7] clang -cc1: runtime library -> IR"
-"$CLANG" "${CC1_FLAGS[@]}" -emit-llvm "$RT_SRC" -o "$work/rt.ll"
+"$CLANG" "${CC1_FLAGS[@]}" "${cc1_float_flags[@]}" -emit-llvm "$RT_SRC" -o "$work/rt.ll"
 ll_files+=("$work/rt.ll")
 
 echo "[3/7] llvm-link: merge"
@@ -106,7 +147,18 @@ echo "[4-7/7] opt/llc/reorder/dgasm: assemble to DG object/loader format"
 # libcalls during instruction selection) *after* the opt pass below has
 # already run, so they look unreferenced to globaldce and get stripped
 # even on programs that need them — confirmed empirically ("Undefined
-# symbol: __fixsfsi" at the dgasm step) before this was handled.
+# symbol: __fixsfsi" at the dgasm step) before this was handled. The
+# same thing happens for memcpy/memmove/memset/memcmp once those are
+# wired up as RTLIB::MEMCPY/etc. implementations
+# (EclipseISelLowering.cpp): an initialized local aggregate (e.g. `int
+# Array[10] = {...};`) can make llc's own lowering insert a call to
+# memcpy that likewise doesn't exist as a visible IR call before this
+# opt pass runs. The retry regex below originally only matched `__`-
+# prefixed names (every soft-float symbol happens to be one), so
+# "Undefined symbol: memcpy" silently fell through as a hard failure
+# with no retry at all — broadened to match any C identifier so this
+# same protect-and-retry loop covers both symbol families (matching the
+# identical fix already applied to eclipse-cc's own copy of this loop).
 # Protecting all of them unconditionally, always, costs real page-zero
 # budget even for a program using just one float op (see eclipse_rt.c's
 # soft-float section and README.md's "Known limitations" for the shared
@@ -120,7 +172,19 @@ build_and_assemble() {
   "$OPT" -S -passes="internalize,globaldce" \
     -internalize-public-api-list="$pub_api" \
     "$work/merged.ll" -o "$work/stripped.ll"
-  "$LLC" -mtriple="$TRIPLE" -filetype=asm "$work/stripped.ll" -o "$work/prog.s"
+  "$LLC" -mtriple="$TRIPLE" "${llc_float_flags[@]}" -filetype=asm "$work/stripped.ll" -o "$work/prog.s"
+
+  # Append the hand-written __addsf3_hw/__fixsfsi_hw/etc. assembly (see
+  # rt/eclipse_hwfloat.s's own header comment and eclipse-cc's identical
+  # step) onto llc's own output before reorder_asm.py runs -- needed
+  # whenever llc's own float-libcall choice actually resolved to the _hw
+  # variants, which as of DEBUGGING_NOTES.md entry #30 is the DEFAULT (no
+  # flags at all), not just `--hwfloat`. `--ieee` (without `--hwfloat`) is
+  # the only combination that does NOT need it.
+  if [ "$ieee" -eq 0 ] || [ "$hwfloat" -eq 1 ]; then
+    cat "$HWFLOAT_SRC" >> "$work/prog.s"
+  fi
+
   python3 "$REORDER" "$work/prog.s" "$work/prog_r.s"
   dgasm -t eclipse_s140 -f ab -o "$out" "$work/prog_r.s"
 }
@@ -157,7 +221,7 @@ while :; do
   # second, independent way dgasm's real errors were going invisible even
   # after the $out-existence fix above. Without the guard, that abort skips
   # the "dgasm failed" reporting below entirely.
-  missing="$(echo "$output" | grep -oE 'Undefined symbol: __[A-Za-z0-9_]+' \
+  missing="$(echo "$output" | grep -oE 'Undefined symbol: [A-Za-z_][A-Za-z0-9_]*' \
              | sed 's/Undefined symbol: //' | sort -u)" || true
   new="$(comm -23 <(echo "$missing") <(echo "$protected" | tr ',' '\n' | sort -u))" || true
   if [ -z "$new" ] || [ "$pass" -ge 15 ]; then
