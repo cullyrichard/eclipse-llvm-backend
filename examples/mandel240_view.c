@@ -52,16 +52,38 @@
  *    read path instead, in case FMT=1 hands back the raw triple.
  *
  * MEMORY: this target's logical address space is 32,768 words total --
- * a full 400x240 image (96,000 words) does not fit, not even close.
- * This is why the image is streamed one SIXEL band (6 image rows =
- * 2,400 words) at a time, DMA'd one image row (400 words) at a time
- * into a small rolling buffer, rather than assembled host-side first.
- * 40 rows/batch is not a multiple of 6, so a band can straddle a batch
- * boundary (e.g. band 6 = rows 36-41, spanning batch 0's last 4 rows
- * and batch 1's first 2) -- the per-row DMA loop below runs across
- * batch boundaries transparently (it just tracks an absolute row
- * counter and resumes the AP whenever it needs the next batch's data),
- * so no special-casing is needed for this.
+ * a full 400x240 image (96,000 words, and per the pixel encoding below,
+ * actually 192,000 words) does not fit, not even close. This is why the
+ * image is streamed one SIXEL band (6 image rows) at a time, DMA'd one
+ * image row at a time into a small rolling buffer, rather than
+ * assembled host-side first. 40 rows/batch is not a multiple of 6, so a
+ * band can straddle a batch boundary (e.g. band 6 = rows 36-41,
+ * spanning batch 0's last 4 rows and batch 1's first 2) -- the per-row
+ * DMA loop below runs across batch boundaries transparently (it just
+ * tracks an absolute row counter and resumes the AP whenever it needs
+ * the next batch's data), so no special-casing is needed for this.
+ *
+ * PIXEL ENCODING (resolved -- see DEBUGGING_NOTES.md entries on the
+ * mandel240_diagN.c series): assumption #3 above turned out to be
+ * wrong in a specific, now-confirmed way. Each pixel is NOT one plain
+ * word; it's TWO words forming this target's native 32-bit `float` bit
+ * pattern (confirmed via mandel240_diag3.c's known-value decode test
+ * and reconfirmed via mandel240_diag5.c/diag6.c on real hardware) --
+ * so each image row is 800 words, not 400, and the per-row DMA address
+ * stride below is `IMG_WIDTH * 2` words, not `IMG_WIDTH`. The decoded
+ * float's truncated integer part is the actual 0..32 iteration count.
+ *
+ * REAL-HARDWARE FLOAT WARNING (DEBUGGING_NOTES.md entry #34): this
+ * file MUST be compiled with --ieee on real hardware. The default DG
+ * hardware-float mode was found to produce silently wrong results on
+ * at least one real machine (suspected Nova 4 FPU, not a genuine
+ * Eclipse S/140 one) -- confirmed down to the hardware ADD instruction
+ * alone corrupting a trivial 8.0+1.0. This file's own float use here is
+ * modest (decode + truncate-to-int + a min/max-style compare is NOT
+ * even needed at this level -- see below), but --ieee is required
+ * regardless since the runtime library itself gets built the same way
+ * for the whole program. Use:
+ *   eclipse-run.sh --ieee mandel240_view.c fps.c
  */
 
 #define IMG_WIDTH        400
@@ -74,7 +96,31 @@
 #define MD_HALF_0        0000000
 #define MD_HALF_1        0040000
 
-static unsigned int row_buf[IMG_WIDTH];
+static unsigned int row_buf[IMG_WIDTH * 2];
+
+/* Each pixel is 2 words forming this target's native `float` bit
+ * pattern -- see this file's own header comment. Truncating to `int`
+ * gives the actual iteration count (0..32); clamped defensively since
+ * assumption #3 (FMT=1's exact semantics) is resolved but this specific
+ * clamp has not itself been exercised against every possible real value
+ * yet -- a stray out-of-range decode should not corrupt BAND()/the
+ * color-pass loop's own bounds. */
+static float bits_to_float(unsigned int hi, unsigned int lo) {
+    union {
+        unsigned long u;
+        float f;
+    } v;
+    v.u = ((unsigned long)hi << 16) | (unsigned long)lo;
+    return v.f;
+}
+
+static int decode_iter(unsigned int hi, unsigned int lo) {
+    float v = bits_to_float(hi, lo);
+    int iv = (int)v;
+    if (iv < 0) iv = 0;
+    if (iv > MAXITER) iv = MAXITER;
+    return iv;
+}
 
 /* Flattened 1D, NOT a genuine `unsigned int band[BAND_ROWS][IMG_WIDTH]`
  * -- found the hard way, while building this driver, that this
@@ -243,12 +289,12 @@ int main(void) {
         unsigned int half_base = (batch & 1) ? MD_HALF_1 : MD_HALF_0;
         int r;
         for (r = 0; r < ROWS_PER_BATCH; r++) {
-            unsigned int md_addr = half_base + 1 + (unsigned int)r * IMG_WIDTH;
-            host_dma_in((unsigned int)row_buf, IMG_WIDTH, md_addr);
+            unsigned int md_addr = half_base + 1 + (unsigned int)r * (IMG_WIDTH * 2);
+            host_dma_in((unsigned int)row_buf, IMG_WIDTH * 2, md_addr);
 
             int x;
             for (x = 0; x < IMG_WIDTH; x++) {
-                BAND(band_row, x) = row_buf[x];
+                BAND(band_row, x) = (unsigned int)decode_iter(row_buf[2 * x], row_buf[2 * x + 1]);
             }
             band_row++;
             abs_row++;
