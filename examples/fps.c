@@ -43,14 +43,24 @@ void load_psm(unsigned int pgm_addr, unsigned int fpu_pgm_len,  const unsigned i
     fpu_out(cmd_wtfn, fn_load_tma);
     static const unsigned int fn_load_ps[4] = {fn_load_ps_0, fn_load_ps_1,
                                                 fn_load_ps_2, fn_load_ps_3};
-    for (unsigned int i = 0; i <= fpu_pgm_len; i += 4) {
+    /* `<`, not `<=`: fpu_pgm_len is the halfword count (e.g. 340 for an
+     * 85-PS-location program), always an exact multiple of 4, so `i <=
+     * fpu_pgm_len` runs one extra outer iteration and reads
+     * fpu_pgm[fpu_pgm_len .. fpu_pgm_len+3] -- 4 words past the end of
+     * the caller's array. Harmless-looking on a small static array (just
+     * reads whatever's adjacent) but a real out-of-bounds read that also
+     * sends a spurious 5th round of load-PS commands with garbage data
+     * to the FPS100 board. Found while reviewing this function for the
+     * MANDEL240 driver (a 340-halfword/85-location program, so the bug
+     * triggers on literally every call, not just an edge case). */
+    for (unsigned int i = 0; i < fpu_pgm_len; i += 4) {
         for (unsigned int k = 0; k < 4; k++) {
             fpu_out(cmd_wtsr, fpu_pgm[i + k]);
             fpu_out(cmd_wtfn, fn_load_ps[k]);
         }
     }
 
-}   
+}
 void load_md(unsigned int md_addr,unsigned int md_len, const unsigned int md_arr[]){
     fpu_out(cmd_wtsr, md_addr);
     fpu_out(cmd_wtfn, fn_load_ma);
