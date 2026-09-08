@@ -3954,3 +3954,103 @@ stale on an unrelated point, entry #31's broadened undefined-symbol
 regex, now also picked up by the sync). No compiler/backend file was
 touched; this was purely a build-script gap between the two sibling
 scripts, not a code-generation bug.
+
+### 34. The DEFAULT hardware-float mode (entries #27/#30/#31) produces
+silently WRONG results on at least one real physical machine --
+suspected cause: the installed FPU option is a Nova 4 unit, not a
+genuine Eclipse S/140 one
+
+Once entry #33 unblocked `eclipse-compile.sh` again, `mandel240_diag4.c`
+still hung on real hardware -- for several minutes, with zero further
+output -- right after `CHK10` (DMA read-back complete), before its
+first progress checkpoint. A follow-up, `mandel240_diag5.c`, split the
+work into two clearly separated passes specifically to localize this:
+Pass 1 dumps every pixel's raw `(hi,lo)` unconditionally (plain
+`printf`, no FPU instruction involved at all); Pass 2 re-runs the actual
+min/max/distinct computation with a checkpoint every 50 pixels. Real
+hardware got through all of Pass 1 fine (confirming, independently of
+this entire investigation, that row 0 really is uniformly `8.0` across
+all 400 pixels -- not a truncated/partial read, not an addressing bug:
+`n_distinct=1`, `min=max=8.0`), then hung again immediately at the
+start of Pass 2, before even its first checkpoint (`i=49`).
+
+Since `bits_to_float()` is a plain union bit-reinterpret (`LDA`/`STA`
+only, no FPU instruction whatsoever), the hang had to be in the
+hardware compare (`FCMP`, entry #31) or the hardware float->int convert
+(`FFAS`, entry #31) -- and critically, the *identical* computation, run
+on `eclipseemu` against this exact uniform-8.0 data, completed
+correctly and instantly (see `test_diag4_logic.c`). That gap -- real
+hardware hangs, the emulator's simulation of the same instructions
+doesn't even slow down -- was the first hint this session's entire
+hardware-float initiative (entries #27/#30/#31) might never actually
+have been exercised against real physical FPU silicon before, only
+against `eclipseemu`'s software model of `FAS`/`FSS`/`FCMP`/`FLAS`/
+`FFAS`.
+
+To isolate which specific instruction class was responsible,
+`test_hwfloat_minimal.c` checkpointed around each hardware-FPU operation
+individually on a known-good value (8.0, bit pattern `0x41000000`,
+already verified via `eclipseemu`): decode (no FPU) -> hardware ADD
+(`FAS`) -> hardware COMPARE (`FCMP`) -> hardware CONVERT (`FFAS`). Real
+hardware got past decode, then printed `C: added w=-2147483648.000000`
+for what should have been `8.0 + 1.0 = 9.0` -- the hardware ADD itself,
+the single most basic and most-used hardware-float operation in the
+entire initiative (entry #27's original and only change), was already
+producing a completely wrong result. `-2147483648.0` is exactly
+`-2^31`, a classic 32-bit signed-overflow wraparound pattern, so a
+second follow-up (`test_hwfloat_bits.c`) was built to dump the raw bits
+of the ADD's result directly, bypassing `print_float`'s own digit-
+extraction entirely (per this project's own standing discipline: verify
+corruption at the bit level, don't trust what a display routine
+renders) -- but before that test could be run, the user identified the
+likely real explanation directly: the floating-point hardware option
+actually installed on this particular machine is a **Nova 4 FPU, not a
+genuine Eclipse S/140 one**. The Nova 4 and Eclipse S/140 are different
+machines in DG's lineup with no guarantee of a shared floating-point
+instruction encoding -- this single explanation retroactively accounts
+for every "hardware FPU quirk" found across entries #27/#30/#31 at
+once: `FMS`/`FDS` always zeroing the destination, `FCMP` only testing
+one operand's sign instead of doing a real two-operand compare,
+`FLAS`/`FFAS`'s oddly asymmetric safe ranges -- all of it is equally
+consistent with "this is simply the wrong FPU, decoding S/140-encoded
+instructions as something else entirely" as it is with "the real S/140
+FPU has rough edges", and this entry's finding (even the most basic
+hardware ADD is wrong) tips the balance decisively toward the former.
+None of entries #27/#30/#31's own verification work was wrong on its
+own terms -- every one of those was validated against `eclipseemu`'s
+simulation of these instructions, which necessarily models the S/140 as
+documented/specified, not whatever this particular machine's Nova 4 FPU
+board actually does with the same opcodes.
+
+The user confirmed rebuilding with software float (`--ieee`) resolved
+the issue in practice: `mandel240_diag5.c` rebuilt this way ran Pass 2
+to completion on real hardware with no further hang, `n_distinct=1`,
+`min=max=8.0`, matching the emulator exactly.
+
+**Decision** (explicitly asked of the user, given this reverses the
+practical safety of entry #30's own default on this specific real
+machine): keep DG hardware float as the DEFAULT (still correct for
+`eclipseemu`, and for any genuine S/140 FPU) -- but real-hardware builds
+must now pass `--ieee` explicitly. This was not previously even
+*possible* through `eclipse-run.sh`/`eclipse-run-sixel.sh` (the actual
+real-hardware runner scripts) -- both only ever forwarded source-file
+arguments straight to `eclipse-compile.sh` with no flags at all -- so
+both scripts gained `--ieee`/`--hwfloat` flag parsing (identical to
+`eclipse-compile.sh`'s own, forwarded straight through) to make the new
+"always pass --ieee on real hardware" discipline something you can
+actually do, not just remember to type by hand into a `COMPILE_SCRIPT`
+env var override.
+
+No compiler/backend file was touched or is implicated -- this is a real
+hardware *mismatch* (wrong FPU installed/targeted), not a code-
+generation bug in this project's own backend. Anyone hitting this same
+symptom (hardware add producing a huge-magnitude wrong result, or a
+hang in hardware compare/convert) on a *different* real machine should
+verify with `test_hwfloat_bits.c` (dumps raw ADD-result bits, bypassing
+`print_float`) before assuming their FPU is a match for this backend's
+S/140 assumptions.
+
+**Files changed**: `eclipse-run.sh`, `eclipse-run-sixel.sh` (both gained
+`--ieee`/`--hwfloat` flag parsing/forwarding; no other behavior
+changed). New diagnostics: `mandel240_diag5.c`, `test_hwfloat_minimal.c`,
+`test_hwfloat_bits.c`. No compiler/backend file touched.
