@@ -806,10 +806,10 @@ index 000000000..a0154fe9c
 +}
 diff --git a/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
 new file mode 100644
-index 000000000..5d48a48cb
+index 000000000..9c51ea417
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/EclipseAsmPrinter.cpp
-@@ -0,0 +1,785 @@
+@@ -0,0 +1,832 @@
 +//===-- EclipseAsmPrinter.cpp - Eclipse LLVM assembly writer ------------===//
 +//
 +// Part of the LLVM Project, under the Apache License v2.0 with LLVM
@@ -885,6 +885,47 @@ index 000000000..5d48a48cb
 +// callers for why this is gated on !STI.hasIEEEFloat().
 +static uint32_t constantFPBits32(const ConstantFP *CFP) {
 +  return static_cast<uint32_t>(CFP->getValueAPF().bitcastToAPInt().getZExtValue());
++}
++
++// Total number of Eclipse (16-bit) words a value of type Ty occupies once
++// fully flattened -- i.e. the same word count flattenConstant
++// (emitGlobalVariable, below) would produce for a *non*-zero initializer of
++// this type, recursing through every nested array/struct level rather than
++// stopping at the outermost one.
++//
++// This exists because ArrayType::getNumElements() only ever reports its
++// own, immediate dimension's element count. That's exactly right for a
++// genuinely one-dimensional array, but for a real multi-dimensional array
++// type -- `static T arr[R][C];` with no explicit initializer is the
++// common case, and is exactly what GV->getValueType() looks like for such
++// a global: ArrayType([R x ArrayType([C x T])]) -- naively using just
++// getNumElements() (R) silently reserves R words of storage instead of the
++// true R*C*wordsPerElement(T). Confirmed via a minimal repro and a
++// byte-level trace on real eclipseemu: a zero-initialized `unsigned int
++// band[BAND_ROWS][IMG_WIDTH]` reserved only BAND_ROWS words, so every
++// element from index BAND_ROWS onward (i.e. almost the entire array,
++// whenever IMG_WIDTH > 1) silently aliased whatever global happened to be
++// laid out immediately afterward — the program's own printf format
++// strings, in the repro's case, corrupted byte-for-byte by the array's own
++// runtime-indexed writes. Both the address *arithmetic* the C code
++// generates (GEP/HALVE lowering in EclipseISelLowering.cpp) and the loads/
++// stores it selects were independently confirmed correct via
++// `-debug-only=isel` DAG dumps for this same repro — this is purely a
++// storage-under-reservation bug, not an addressing bug, and no other file
++// needed to change. See DEBUGGING_NOTES.md for the full writeup.
++static uint64_t countFlattenedWords(Type *Ty) {
++  if (auto *AT = dyn_cast<ArrayType>(Ty))
++    return AT->getNumElements() * countFlattenedWords(AT->getElementType());
++  if (auto *ST = dyn_cast<StructType>(Ty)) {
++    uint64_t Total = 0;
++    for (unsigned i = 0, e = ST->getNumElements(); i != e; ++i)
++      Total += countFlattenedWords(ST->getElementType(i));
++    return Total;
++  }
++  if (auto *IT = dyn_cast<IntegerType>(Ty))
++    return (IT->getBitWidth() + 15) / 16;
++  return 1; // unsupported leaf type (e.g. float) -- one word, matching
++            // flattenConstant's own zero/undef-leaf fallback below.
 +}
 +
 +bool EclipseAsmPrinter::doInitialization(Module &M) {
@@ -1193,7 +1234,13 @@ index 000000000..5d48a48cb
 +
 +  if (isa<ConstantAggregateZero>(Init)) {
 +    if (auto *AT = dyn_cast<ArrayType>(GV->getValueType())) {
-+      emitArrayElements(AT->getNumElements(), [](unsigned) { return 0; });
++      // See countFlattenedWords's own comment: AT->getNumElements() alone
++      // is only this array's outer/immediate dimension, which silently
++      // under-reserves storage for a genuinely multi-dimensional array
++      // type (or an array of structs) -- use the fully recursive
++      // flattened count instead.
++      uint64_t Total = countFlattenedWords(AT);
++      emitArrayElements(static_cast<unsigned>(Total), [](unsigned) { return 0; });
 +      return;
 +    }
 +  }

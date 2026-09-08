@@ -3669,3 +3669,212 @@ eclipse-package/eclipse-toolchain, per this project's standing
 convention -- including a re-applied executable bit on eclipse-cc after
 this session's own comment-only edit silently stripped it (see this
 project's own standing "lost executable bit" gotcha).
+
+### 32. A genuine 2D array with both indices runtime silently corrupted adjacent memory (fixed) -- root cause was global storage under-reservation, not address arithmetic
+
+**The bug, as reported**: `T arr[ROWS][COLS]` (a real multi-dimensional
+array *type*, not a manually-flattened one) with **both** indices
+computed at runtime writes to the wrong address and silently corrupts
+adjacent memory -- confirmed byte-for-byte before any investigation
+began, per this session's own repro requirement: a small test program
+storing known values (4, then 5) into such an array inside nested
+runtime loops left the corrupted bytes of a later, unrelated string
+literal reading back exactly those raw values (`0x04`, eight `0x05`
+bytes) instead of the format-string text that belonged there. Flattening
+the same array to genuinely one-dimensional and computing `arr[r*COLS+x]`
+by hand does *not* reproduce it -- the strongest hint available going
+in, since it points at something specific to a real multi-index GEP
+rather than at runtime-multiply-based addressing in general.
+
+**Where the investigation initially pointed, and why that turned out to
+be a dead end**: this project's own history (entries #4/#5/#9/#12/#15/
+#18/#25/#26) is an extensive, repeated record of address-computation
+bugs in exactly `EclipseISelLowering.cpp`'s `PerformDAGCombine`
+`ISD::ADD` combine -- the `WORD_ADD`/`HALVE` machinery that corrects a
+runtime GEP's byte-scaled offset into this target's word-granular
+addressing. That was the obvious first suspect here too, given the "one
+index constant works, both runtime fails" shape. It is not the bug.
+`llc -debug-only=isel` DAG dumps of the exact failing shape (`band[r][x]
+= 5` with both `r` and `x` runtime, reached either as a plain function
+taking `r`/`x` as parameters or as the real nested-`for`-loop repro
+itself) show `DAGCombiner`'s ordinary reassociation folding the two
+chained GEPs' index expressions into one `ADD` tree
+(`(r*COLS_bytes + x*2) + WRAPPER(@band)`) *before* `PerformDAGCombine`
+ever has to distinguish a "second GEP on top of an already-corrected
+`WORD_ADD` result" shape from anything else -- it reaches the combine
+as the exact same `IsWrappedGlobal(Base) + runtime Offset` shape
+entries #4/#5/#9 already fixed, and the resulting `HALVE`/`WORD_ADD`
+sequence (confirmed via the DAG dump and the corresponding generated
+assembly, `MUL` then `DIV` then an indirect store through `_scratch2`)
+computes the textbook-correct word address: `@band + (r*COLS + x)`.
+Hand-tracing the actual `MUL`/`DIV` hardware-instruction sequence this
+lowers to (`EclipseInstrInfo.cpp`'s `expandPostRAPseudo`) against
+`docs/ECLIPSE_ISA_NOTES.md`'s documented semantics confirms it too. This
+address-computation code, despite its history, is correct for this bug.
+
+**Confirming the real mechanism, empirically, before touching
+anything**: a diagnostic repro (a small `ROWS=3`/`COLS=4` array, each
+cell written a distinct value `r*10+x+1` instead of a single repeated
+constant, then every cell read back and printed) turned the vague
+"string literal got corrupted" symptom into an exact map. The output
+showed 9 of the 12 written values landing, byte-for-byte and in strict
+iteration order, as raw corrupted bytes inside the program's own printf
+format string -- while the *first* 3 iterations (`r=0,x=0..2`) landed
+correctly inside the array itself. That is exactly the signature of
+`arr`'s real reserved storage being **3 words**, not the true 12: the
+first 3 (in-bounds) writes land safely, and iteration 4 onward
+(`r=0,x=3` and everything in `r=1`/`r=2`) walks straight off the end of
+a 3-word allocation into whatever global happens to be laid out right
+after it. Note `3 == ROWS`, not `ROWS*COLS` -- the real allocation
+was sized as if the array had only one dimension.
+
+**Root cause, confirmed by reading `EclipseAsmPrinter.cpp`'s
+`emitGlobalVariable`**: `static T arr[ROWS][COLS];` with no explicit
+initializer reaches LLVM IR as a `GlobalVariable` whose initializer is
+`ConstantAggregateZero` and whose `getValueType()` is a genuine nested
+`ArrayType` (`[ROWS x [COLS x T]]`). The zero-initializer case handling
+this,
+
+```cpp
+if (isa<ConstantAggregateZero>(Init)) {
+  if (auto *AT = dyn_cast<ArrayType>(GV->getValueType())) {
+    emitArrayElements(AT->getNumElements(), [](unsigned) { return 0; });
+    return;
+  }
+}
+```
+
+calls `ArrayType::getNumElements()`, which only ever reports its own,
+*immediate* dimension's element count -- for `[ROWS x [COLS x T]]`,
+that's `ROWS`, full stop; the inner `[COLS x T]` element type is never
+consulted at all. So a zero-initialized 2D array reserves `ROWS` words
+of storage (one `var` line per outer element, per `emitArrayElements`),
+not the `ROWS*COLS` (or more, for a >16-bit element type) the array
+actually needs -- exactly matching the diagnostic repro's `3`-word
+allocation for a `3x4` array. Every element from index `ROWS` onward
+(i.e. almost the entire array, whenever `COLS > 1`) silently aliases
+whatever global the assembler happens to lay out immediately
+afterward. `arr[0][0]`/`arr[ROWS-1][COLS-1]`-style **constant**-index
+sanity checks (this session's own repro's own case A, and c-testsuite
+tests that only ever touch a handful of fixed indices) don't catch
+this: a constant-offset GEP into a global folds straight into
+`GlobalAddressSDNode`'s own offset field (see entry #18), which computes
+a real address arithmetically regardless of how many words were
+actually *reserved* there, and writing then reading back through that
+exact same (possibly out-of-bounds) address is self-consistent even
+when it's wrong -- it only becomes visible once something else's
+storage actually gets clobbered and later read back independently, or
+inspected at the byte level.
+
+Two sibling `emitGlobalVariable` cases already had to solve this exact
+"nested aggregate, not just one level" problem before, for different
+initializer kinds -- the struct-field-flattening case's own comment
+even names it explicitly ("a real, confirmed bug before this existed
+... every field past the first silently aliased whatever global
+happened to be laid out immediately after it") and its `flattenConstant`
+lambda already recurses correctly through a nested `ArrayType` for the
+zero/undef leaf case (see its own `else if (auto *AT =
+dyn_cast<ArrayType>(Ty))` branch). But `flattenConstant` is only ever
+invoked for a `StructType`-rooted global (`isa<StructType>(GV->getValueType())`,
+further down the same function) -- a plain (possibly multi-dimensional)
+`ArrayType`-rooted zero-initialized global takes the separate, shallower
+branch quoted above instead, which never got the equivalent fix.
+
+**Fix**: added `countFlattenedWords(Type *Ty)`, a small recursive helper
+(`EclipseAsmPrinter.cpp`) that computes the true total word count for a
+possibly-nested `ArrayType`/`StructType`/`IntegerType` -- multiplying
+through every nested array dimension and summing through every struct
+field, exactly the way `flattenConstant` already does for a non-zero
+initializer, just without needing an actual `Constant` to walk (every
+leaf is zero here). The `ConstantAggregateZero`+`ArrayType` case now
+calls `countFlattenedWords(AT)` instead of `AT->getNumElements()`
+directly. For the common one-dimensional case this computes the exact
+same value as before (a flat `[N x i16]`'s `countFlattenedWords` is
+just `N`), so no existing zero-initialized 1D array changes at all;
+for a genuine multi-dimensional array (or an array of structs, also
+previously under-counted the same way) it now reserves the real total.
+Purely additive -- no other function in this file, and no other file at
+all, needed to change; the address arithmetic downstream of this fix was
+already correct, as confirmed above.
+
+**Verified**:
+- The task's own exact repro (all four cases A/B/C/D: constant indices,
+  runtime-column-only, runtime-row-only, both-runtime) now prints fully
+  correct output, confirmed via `od -An -c` on `eclipseemu`'s redirected
+  output -- previously `"D: bo\004h runtime"` / `"D ok: %d\n"` replaced by
+  eight raw `0x05` bytes, now `"D: both runtime"` / `"D ok: 5"` exactly.
+- The `3x4`, distinct-per-cell diagnostic repro above now reads back
+  every one of its 12 cells correctly, byte-for-byte via `od`.
+- Generalization, per this session's own requirement: a fresh test with
+  *different*, non-power-of-2 dimensions than the repro (`5x7` and
+  `3x11`, vs. the repro's `20`/`6`) and a different element type (`int`,
+  `1000`+-offset values) -- both **written and independently read back**
+  at runtime into a local variable and compared against a hand-computed
+  expected value for every cell (77 total checks across the two arrays)
+  -- all passed for the `int` array (all 33 checks). See below for what
+  the parallel `char` (`i8`-element) version of this same test surfaced.
+- Full `regress_hwstack.sh` regression: byte-identical to baseline --
+  every example HALTs with the same output as before, and exactly the
+  same 4 pre-existing "Step expired" cases (`isr_c_test`, `test_fps_add`,
+  `test_fps_md`, `fps_dma_test`).
+- Full c-testsuite, both build modes: 197/220 in each, and the
+  non-passing 23 test IDs are byte-identical to entry #26's own
+  re-measured baseline in *both* modes (`00040`, `00041`, `00104`,
+  `00157`, `00163`, `00166`, `00168`, `00174`, `00175`, `00178`,
+  `00179`, `00180`, `00187`, `00189`, `00195`, `00203`, `00204`,
+  `00205`, `00212`, `00216`, `00217`, `00218`, `00220`) -- no
+  regressions, no new passes. (None of the 23 non-passing tests happen
+  to exercise a genuinely multi-dimensional array global with no
+  explicit initializer, so this fix not flipping any of them is
+  expected, not a sign it did nothing.)
+
+**A second, independent, pre-existing bug found while generalizing --
+NOT fixed, NOT caused by this entry's own change**: the `char` version
+of the generalization test above (`5x7` `char cgrid`, same
+write-then-independently-read-back-and-compare shape) failed on roughly
+half its cells, with an unmistakable pattern: reading back
+`cgrid[r][x]` for an *even* flattened index (`r*7+x` even) returns the
+*next* (odd-index) cell's value instead of its own, while every
+odd-flattened-index cell reads back correctly. Root cause (reasoned
+through, not yet fixed): `char` is `i8` at the LLVM IR/DataLayout level
+on this target (confirmed via `-cc1 -emit-llvm`), so a GEP into a
+`char` array scales its runtime index by 1 byte per element, not 2 --
+but this backend's existing runtime-offset `HALVE` correction
+(`PerformDAGCombine`, the same combine this entry's own investigation
+re-confirmed correct for a real word-granular element) unconditionally
+divides *any* non-constant/non-string-literal global offset by 2,
+assuming every element is word-sized. For a `char` array reached this
+way, two consecutive elements' byte offsets (`i`, `i+1`) both divide
+down to the *same* word index (`i/2`), so a plain, un-byte-selected
+word store of the second one silently clobbers the first -- the parity
+pattern observed is exactly what "last write to a shared word wins"
+predicts. This is not a new mechanism: it's the same "this target's
+backend has no byte-select at all for a sub-word-granular access, only
+whole-word `LDA`/`STA`" gap entry #15's Gap 1 already found and
+explicitly left unfixed for *local* char arrays reached at a
+compile-time-constant odd offset ("nothing in the actual load/store
+path ... ever does the corresponding byte-select"); this session's
+generalization test simply reached the same underlying gap through a
+different, previously-untested door (a *global* char array, *runtime*
+double index). Confirmed independent of this entry's own storage-size
+fix: a plain one-dimensional global `char` array with a runtime index
+(read and write both, sequential values, no row multiplier at all) was
+tested in isolation and printed fully correctly, meaning the alternating
+corruption specifically needs the generic-runtime-offset `HALVE` path a
+multi-dimensional (or otherwise multiply-derived) byte-scaled index
+reaches, not merely "any runtime char access" -- consistent with entry
+#15's own scope (frame/local byte-select gap), now shown to reach global
+arrays too, through this different path. Given this exact function's
+own extensive, explicitly-cautious history (entries #12/#15's Gap 1 was
+deliberately left unfixed after real investigation time, precisely
+because a confident low-risk fix wasn't found), no fix was attempted
+here -- this is flagged for whoever picks up entry #15's Gap 1 next, not
+force-fixed alongside an unrelated storage-size bug. Programs on this
+target needing a real multi-dimensional runtime-indexed `char`/byte
+array should avoid it the same way entry #12's own advice already
+covers for pointer-offset byte access, until Gap 1 is actually fixed.
+
+**Files changed**: `EclipseAsmPrinter.cpp` only (`countFlattenedWords`
+plus the one-line call-site change in `emitGlobalVariable`'s
+`ConstantAggregateZero`+`ArrayType` case). No other backend file was
+touched.
