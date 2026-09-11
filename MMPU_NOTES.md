@@ -217,9 +217,15 @@ separately from this investigation; the baseline used here is
 Phase 1 proves the primitive works. It is not usable from C, and
 nowhere close to "operating systems and other larger projects":
 
-- **No LLVM/backend integration.** `ELDA`/`ESTA`/`EJSR`/`ELEF` codegen
-  is untouched — a compiled C program still cannot address anything
-  past 32767 no matter what the MMPU could reach for it.
+- **No LLVM/backend integration — investigated, deliberately not
+  attempted; see "LLVM codegen integration: scoped but not attempted"
+  below.** `ELDA`/`ESTA`/`EJSR`/`ELEF` codegen is untouched — a compiled
+  C program still cannot address anything past 32767 no matter what the
+  MMPU could reach for it. A narrower target (compiler builtins lowering
+  to the existing verified sequence) was scoped and rejected as not
+  worth the risk for the benefit; the original full proposal
+  (transparent far pointers) remains a separate, larger, unstarted
+  redesign, not an increment.
 - **C-callable API: done — see "Phase 2: a C-callable API" below.**
   (This bullet previously claimed `eclipse-cc`'s multi-file support
   already allows a separately-assembled `.s` file to be linked in
@@ -672,3 +678,105 @@ out of scope here, per the manual's own reliability caveat above),
 specifically (not attempted — validity was chosen as the simpler of
 the two), any second-user/process-switching story, and (still, as
 always) LLVM codegen integration.
+
+## LLVM codegen integration: scoped but not attempted
+
+Investigated the deliberately narrow target for this increment —
+`__builtin_eclipse_mmpu_read_far`/`write_far`, lowered directly to the
+same `LMP`+`NIOP`+`ELDA`/`ESTA` sequence `examples/mmpu.c`'s inline asm
+already uses, as a bounded, mechanically-verifiable first step short of
+the original proposal's full transparent far-pointer/address-space
+machinery (explicitly not attempted — see that proposal's own scope
+warning). Concluded: not worth doing in this increment. Not because
+it's impossible — it isn't — but because the risk/benefit is backwards.
+
+**No per-target builtin infrastructure exists for Eclipse at all**,
+confirmed directly rather than assumed: `clang/lib/Basic/Targets/Eclipse.h`'s
+`getTargetBuiltins()` is a literal empty stub —
+```cpp
+llvm::SmallVector<Builtin::InfosShard> getTargetBuiltins() const override {
+  return {};
+}
+```
+Compared against `AVR` (the smallest existing target with real builtins,
+used as the precedent) to see exactly what adding real infrastructure
+would need:
+- `clang/include/clang/Basic/BuiltinsEclipse.def` (new file) — the
+  `BUILTIN(...)` table itself. Small, Eclipse-only, low risk on its own.
+- `clang/include/clang/Basic/TargetBuiltins.h` — **a file every single
+  LLVM target's builtin dispatch shares**, not an Eclipse-only file.
+  AVR's entry there (`namespace AVR { enum { ... LastTSBuiltin }; }`)
+  feeds directly into `LargestBuiltinID = std::max<uint64_t>({ARM::...,
+  AVR::LastTSBuiltin})` — a hardcoded list of *every* target in the
+  tree. Adding Eclipse means editing that list.
+- `clang/lib/Basic/Targets/Eclipse.cpp` (currently just the empty stub
+  above) needs the real `StringTable`/`MakeInfos` machinery AVR.cpp
+  uses (`AVR.cpp:22-33`), replacing the stub with a real
+  `getTargetBuiltins()` implementation.
+- `clang/lib/CodeGen/CGBuiltin.cpp`'s `EmitTargetArchBuiltinExpr` — a
+  hardcoded `switch` on `llvm::Triple::ArchType` (`case
+  llvm::Triple::avr: return CGF->EmitAVRBuiltinExpr(...)`) that **every
+  target's builtin lowering flows through**. Needs a new
+  `case llvm::Triple::eclipse:` arm (assuming that `ArchType` enum value
+  already exists for this backend's `eclipse-dg-none` triple — not
+  confirmed here) calling a new `CGF->EmitEclipseBuiltinExpr(...)`.
+- A new `clang/lib/CodeGen/TargetBuiltins/Eclipse.cpp` (AVR's own
+  version of this file is where the actual per-builtin codegen/asm
+  emission happens) plus whatever `CMakeLists.txt` registration makes
+  the build system pick it up.
+
+That's a real, bounded, mechanical task — AVR's implementation is
+existence proof it's *doable*, not a design problem. But every one of
+the middle three bullets touches a file shared across every other LLVM
+target in this tree, not an Eclipse-only file — a categorically
+different risk class from anything touched in Phase 1 or this
+increment's earlier three sections, all of which stayed inside
+Eclipse-specific files with zero blast radius beyond this backend.
+This project's existing regression baseline (`dgasm-src` CTest,
+`sizeof_check.c` through `eclipse-cc`) has no way to cheaply confirm
+"did this also break AVR/ARM/X86's own builtin dispatch" — the
+verification bar this document has held every previous claim to simply
+isn't available here without a much larger test than anything run so
+far.
+
+**Weighed against that risk, the actual benefit is small**: checked
+`examples/mmpu.h` directly — `mmpu_read_far`/`mmpu_write_far` are
+already ordinary, real, callable C functions;
+`mmpu_read_far(0100,0200)` and a hypothetical
+`__builtin_eclipse_mmpu_read_far(0100,0200)` would be syntactically and
+semantically identical at the call site. The *only* difference a real
+builtin buys is inlining away the `JSR`/`RTN` call overhead — a
+performance micro-optimization, not new capability, not better
+ergonomics, not progress toward far-pointer transparency (a builtin
+call still looks and works exactly like calling a function; it doesn't
+make `int *p = far_pointer; *p` work, which is what the original
+proposal actually wanted).
+
+**Conclusion**: not attempted, by choice, given low benefit against a
+real escalation in blast radius — matching this document's own standing
+preference for an honest boundary over a forced result. If a future
+increment wants inlining specifically, `EclipseAsmPrinter`-level
+`always_inline`-style handling of the *existing* inline-asm functions
+might be a smaller, Eclipse-only way to get much of the same benefit
+without touching shared cross-target files at all — not investigated
+here, but a more promising direction than the builtin-infrastructure
+path above if inlining specifically turns out to matter.
+
+**Honest assessment of the original full proposal** (transparent far
+pointers/address-space-qualified types over the MMPU, letting ordinary
+`*ptr` syntax reach physical memory past 32767): this is not a bigger
+version of what was just scoped out above — it's a different and
+larger problem again. It needs either a real LLVM address-space
+mechanism (Clang already has generic address-space-qualifier
+machinery for other targets, e.g. OpenCL/CUDA's `__global`/`__local` —
+unexplored here, but the closest existing precedent, and worth
+starting there rather than inventing something Eclipse-specific) or
+compiler-managed page-table bookkeeping at every dereference (far
+riskier: it would need the compiler to track, and possibly emit calls
+to reprogram, live map state around arbitrary pointer accesses,
+touching `EclipseISelLowering.cpp`'s core addressing logic that every
+currently-passing test already depends on). Realistically a
+future *redesign*-sized undertaking, not an increment — treat it as
+its own investigation, starting with reading how an existing Clang
+target's address-space qualifiers actually lower to codegen, before
+committing to an approach.
