@@ -255,10 +255,20 @@ nowhere close to "operating systems and other larger projects":
   with the simulator's own instruction trace. Still open: protection
   faults (this test's map entries are always valid, never exercises
   `Fault`), `MapIntMode`'s interrupt-safe save/restore of map state
-  across a real interrupt, and any second-user (map B) or
-  process-switching story — see that section's own closing bullet.
-- **No multi-process story**, obviously — that's what all of the above
-  would need to add up to.
+  across a real interrupt — see that section's own closing bullet.
+- **Second-user-map (B) / basic context switch: done — see "Phase 2:
+  two-user-map context switch" below.** The same logical address, under
+  map A then map B in turn, verified landing on two distinct physical
+  pages, with the simulator's own trace independently confirming both
+  the map-load step (`LMP (Map=0)` vs `(Map=2)`) and the activation step
+  (trace prefix `A` vs `B`, tied directly to `Usermap`'s value in
+  source). This is a real two-map switch, not yet a real "process" —
+  no scheduler, no saved/restored general-purpose register state beyond
+  what this test's own minimal design needed, no interrupt involved.
+- **No multi-process story in the OS sense**, still — a real scheduler
+  and involuntary (interrupt-driven) switching are what the above would
+  need to add up to; `MapIntMode` (untouched) is specifically about the
+  involuntary case.
 - **Real-hardware caveat, fully updated**: every core-MMPU (`MAP`
   device) instruction's dictionary entry has now been checked directly
   against the manual's own page images (not OCR) — `LMP`, `DIA` (Read
@@ -678,6 +688,145 @@ out of scope here, per the manual's own reliability caveat above),
 specifically (not attempted — validity was chosen as the simpler of
 the two), any second-user/process-switching story, and (still, as
 always) LLVM codegen integration.
+
+## Phase 2: two-user-map context switch
+
+`examples/mmpu_context_switch_probe.s`: proves the real S/140's *two*
+user maps (A and B) are genuinely independent — the same logical
+address, under each map in turn, lands on a completely different
+physical page. Every prior phase used only a single map (A, implicitly,
+via `mmpu_usermode_probe.s`/`mmpu_fault_probe.s`'s `doaval=1`); this is
+the first to exercise B at all, and the first to switch between them.
+
+**Two independent mechanisms in the same `DOA`-loaded word, easy to
+conflate — kept separate on purpose**:
+- **Map Select** (manual's bits 6-8): which map context the *next*
+  `LMP` writes into. Confirmed two ways at once by this increment's own
+  trace, not just cited from the manual: `dw 0400` (Map Select = `010`,
+  User B) followed by `LMP` printed `65 LMP (Map=2)` — `LoadMap()`'s own
+  map-index naming (`MMPU_NOTES.md`'s Phase 1 section: "0/1/2/3 = user
+  maps A/C/B/D") confirms index 2 is User B, matching the manual's own
+  table for the same 3-bit field. Loading User A needs no bits set at
+  all (`dw 0` — Map Select `000`), which the trace's `56 LMP (Map=0)`
+  independently confirms.
+- **A/B** (manual's bit 13): which map gets *activated* (`Usermap=1` vs
+  `2`) the next time User Enable fires. Confirmed directly in
+  `eclipse_cpu.c`'s `DOA`/`MAP` handler: `Enable = 1; if (MapStat & 04)
+  Enable = 2;` — `04` octal is exactly bit 13 in this word (DG's
+  MSB-first numbering puts bit 13 at LSB-first weight 2^(15-13) = 4).
+  So `doa_enterA = 1` (User Enable only, A/B defaults to 0/User A) and
+  `doa_enterB = 5` (User Enable + A/B=1) — reusing `mmpu_usermode_probe.s`'s
+  exact `doaval=1` for the A case, deliberately, to keep that half of
+  this test identical to something already proven.
+
+Both maps are loaded fully, in supervisor mode, before either is
+activated — Map Select is cycled A-then-B once, up front; A/B is cycled
+A-then-B separately, once per activation. This is why the two
+mechanisms have to be distinct: reloading a map every time it's merely
+*activated* would defeat the point of having two independent maps at
+all.
+
+**A real bug, caught by the trace exactly the way this project catches
+these things**: the first version of this program's code (two full
+map-load/enter/write/return cycles — twice `mmpu_usermode_probe.s`'s
+single cycle) ran to roughly word `0104` octal starting from `org 050`,
+overflowing past an `org 0100` data-section boundary copied uncritically
+from `mmpu_usermode_probe.s` (whose *shorter*, single-cycle code
+correctly fits before `0100`). The data labels landed on top of the
+tail of the code itself. Symptom: `step` never reached `HALT`, and
+`d debug 100003`'s trace showed a `JMP 0` fetched from address `0100`
+octal — which is data (a zero word), not code, decoded as an
+instruction only because the corrupted overlap made it *look* like one.
+Fixed by moving the data section to `org 0200`, comfortably past the
+actual code's real end.
+
+**Empirical verification**, with the same instruction trace this
+project always uses for MMPU work (`d debug 100003`):
+
+```
+$ dgasm -t eclipse_s140 -f simh -o mmpu_context_switch_probe.simh mmpu_context_switch_probe.s
+$ { cat mmpu_context_switch_probe.simh; echo 'dep PC 50'; echo 'step 100'; \
+    echo 'e PC'; echo 'e 4200'; echo 'e 320200'; echo 'e 110200'; echo 'quit'; } | eclipse
+
+HALT instruction, PC: 00105 (JMP 0)
+PC:	00105
+4200:	000000
+320200:	002322
+110200:	021075
+```
+
+- `4200` (logical page 2, offset 0200; examined from supervisor mode,
+  where logical=physical directly): **0, untouched** — neither write
+  ever landed at the plain physical page 2.
+- `320200` (physical page `0150` octal — map A's target): **`002322`
+  octal = 1234 decimal**, `markerA`'s value — and this is the value
+  *after* the map-B write happened too, directly confirming no
+  cross-contamination between the two physical targets.
+- `110200` (physical page `0044` octal — map B's target, computed by
+  hand as `0044<<10 | 0200`, then confirmed correct by this actual run
+  rather than trusted on arithmetic alone): **`021075` octal = 8765
+  decimal**, `markerB`'s value.
+
+The trace itself is the more direct evidence, not just the memory dump:
+```
+56 LMP (Map=0)
+      205 MAP L=0 W=0 P=0
+      206 MAP L=2 W=0 P=150
+...
+65 LMP (Map=2)
+      207 MAP L=0 W=0 P=0
+      210 MAP L=2 W=0 P=44
+...
+  000070 acs: 000001 000000 000211 000000 0 LDA 0,@211
+ A000071 acs: 000157 000000 000211 000000 0 LDA 1,213
+ A000072 acs: 000157 002322 000211 000000 0 ESTA 1,4200
+ A000074 acs: 000157 002322 000211 000000 0 NIOP 0,MAP
+...
+  000077 acs: 000005 002322 000211 000000 0 LDA 0,@214
+ B000100 acs: 000336 002322 000211 000000 0 LDA 1,216
+ B000101 acs: 000336 021075 000211 000000 0 ESTA 1,4200
+ B000103 acs: 000336 021075 000211 000000 0 NIOP 0,MAP
+```
+Both `LMP` lines independently confirm the loaded map data (the
+simulator's own decode of what was loaded, not an inference from the
+source words) — `Map=0`/`Map=2`, and each map's own `L=2 -> P=150`
+vs. `P=44` entry, matching the two physical targets exactly. The trace
+prefix is **`A`** for the first activation's three instructions and a
+genuinely **different letter, `B`**, for the second — confirmed
+directly in `eclipse_cpu.c`: `if (Usermap == 1) strcpy(debmap, "A"); if
+(Usermap == 2) strcpy(debmap, "B");` (lines 866-867). That's the
+simulator's own trace code independently distinguishing `Usermap==1`
+from `Usermap==2`, not something inferred from the end-state memory
+dump alone — the same `ESTA 1,4200` instruction, executed twice under
+two different active maps, visibly produces two different AC1 values
+(`002322` under `A`, `021075` under `B`) at the exact same logical
+address.
+
+**Regression check**: this increment's baseline is every prior
+verification artifact, not just the original two, per this document's
+own escalating standard: `dgasm-src` CTest (**314/315**, `memcheck_hello`
+still `Not Run`/no valgrind, unchanged), `examples/sizeof_check.c`
+through the full `eclipse-cc` pipeline (byte-identical, `1 2 2 4 2 4 10
+14`), and `mmpu_probe.s`/`mmpu_usermode_probe.s`/`mmpu_fault_probe.s`/
+`mmpu_far_test.c`/`mmpu_far_multi_test.c` all re-run and matching their
+own documented transcripts exactly (`mmpu_far_test.c`'s run happened to
+need more than 5000 steps to reach its own `HALT` and reported "Step
+expired" instead this time — its printed output and memory-dump values
+matched regardless, and this file made no changes anywhere near that
+test, so it's a step-budget artifact of this particular re-run, not a
+regression). Zero `dgasm-src`/`eclipse-cc`/`llvm-project` changes.
+
+**What's still open**: `MapIntMode`'s interrupt-safe save/restore of
+map state (still completely unexercised — this test's two activations
+are sequential, never interrupted), write-protection faults
+specifically, genuine fault recovery/resume, and (still, as always)
+LLVM codegen integration. Of these, `MapIntMode` is probably the most
+natural next increment: this test already demonstrates that switching
+*which* map is active works correctly when done deliberately and
+sequentially; the open question a real OS would actually hit is whether
+that same state survives an *involuntary* switch (an interrupt arriving
+mid-execution) correctly, which is a meaningfully different and harder
+question than anything tested so far.
 
 ## LLVM codegen integration: scoped but not attempted
 
