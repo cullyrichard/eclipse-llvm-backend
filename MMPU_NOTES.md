@@ -219,14 +219,20 @@ nowhere close to "operating systems and other larger projects":
 
 - **No LLVM/backend integration.** `ELDA`/`ESTA`/`EJSR`/`ELEF` codegen
   is untouched — a compiled C program still cannot address anything
-  past 32767 no matter what the MMPU could reach for it. Using the
-  MMPU today means hand-written assembly exactly like
-  `mmpu_probe.s`, called from C only the way `eclipse-cc`'s multi-file
-  support already allows (a separately-assembled `.s` file linked in) —
-  there is no inline-asm story and no compiler-generated map management.
-- **No C-callable API.** Nothing wraps `LMP`/`DOA MAP`/`NIOP MAP` as
-  callable primitives (e.g. `mmpu_map_page(slot, physpage)`) — Phase 1
-  is a single hand-sequenced probe, not a reusable library.
+  past 32767 no matter what the MMPU could reach for it.
+- **C-callable API: done — see "Phase 2: a C-callable API" below.**
+  (This bullet previously claimed `eclipse-cc`'s multi-file support
+  already allows a separately-assembled `.s` file to be linked in
+  alongside compiled C. That turned out to be wrong — checked directly
+  against `eclipse-cc`'s own source before relying on it: every
+  element of its `sources` array unconditionally goes through `clang
+  -cc1 -emit-llvm`, which cannot process raw target assembly text. The
+  *only* existing mechanism for combining hand-written assembly with
+  compiled C is a single hardcoded `cat "$HWFLOAT_SRC" >> "$asm"` for
+  exactly one file, `rt/eclipse_hwfloat.s` — not a general feature.
+  Phase 2 uses inline `asm volatile(...)` instead, the same mechanism
+  `examples/fps.h` already uses for the FPS100 driver, which needs no
+  `eclipse-cc` changes at all.)
 - **No page-fault handling.** `Fault`/`Check`/`DIC`/`DOC` (the "Page
   Check" read-back mechanism) exist in the emulation and are completely
   unexercised here. A real OS needs to catch and resolve faults, not
@@ -271,3 +277,115 @@ nowhere close to "operating systems and other larger projects":
   the standing rule for this document is: trust a claim here only as
   far as its citation — a page/table reference means it was checked
   against that image directly; anything without one hasn't been.
+
+## Phase 2: a C-callable API
+
+`examples/mmpu.h`/`mmpu.c`: `int mmpu_read_far(unsigned int physpage,
+unsigned int offset)` and `void mmpu_write_far(unsigned int physpage,
+unsigned int offset, unsigned int value)` — a real, reusable,
+parameterized version of `mmpu_probe.s`'s single hand-sequenced probe,
+callable from ordinary C. Still entirely supervisor-mode, still no
+page-fault handling, still no user-mode context switching — same
+explicit scope as Phase 1, just made reusable.
+
+**Design, and why it looks the way it does:**
+
+- Every value crosses the C/asm boundary through a named global
+  (`_mmpu_pte`, `_mmpu_target`, `_mmpu_value`), never through an
+  operand-substituted register. `examples/fps.h`'s `fpu_out`/`fpu_in`
+  use `"r"`-constrained operands successfully, but that works because
+  `DOA`/`DOB`'s accumulator is a genuine operand slot the register
+  allocator can fill with anything. `LMP` is different: `AC0`
+  (relocation), `AC1` (count), and `AC2` (source address) are fixed by
+  *architectural convention*, not operand-encoded — bare `LMP` takes
+  zero operands at all. Mixing `"r"`-constrained operands with
+  hardcoded `AC0`-`AC2` clobbers in one asm block risks a collision
+  this backend's inline-asm has no confirmed way to prevent (no
+  clobber-list or fixed-register constraint support verified to
+  exist). Routing everything through memory sidesteps the question
+  entirely — confirmed empirically that a C global's name is not
+  mangled, so `ELDA`/`ESTA ...,_mmpu_pte,0` (absolute addressing)
+  reaches it directly. Plain `LDA`/`STA` (2-operand, page-zero-only)
+  do *not* work for this — confirmed empirically the hard way (a
+  "Address out of range, should be 0-255" `dgasm` error) once these
+  globals landed outside page zero; `ELDA`/`ESTA` with explicit
+  absolute addressing is required.
+- `asm("dev MAP = 03");` at **file scope**, not inside either
+  function's own asm block. A `dev` declaration inside a function body
+  only survives if that specific function survives dead-code
+  elimination; two independent copies (one per function, if both
+  survive) is a hard `dgasm` error ("Multiple definitions for symbol
+  MAP") — confirmed empirically. Module-level `asm(...)` is emitted
+  unconditionally regardless of which functions survive — also
+  confirmed empirically — so there is exactly one declaration, correct
+  regardless of which of `mmpu_read_far`/`mmpu_write_far` a caller
+  actually uses.
+- `ADI`'s immediate operand is the literal amount to add (1-4), not a
+  0-based code — `ADI 1,1` adds 1 to AC1; `ADI 1,0` is a `dgasm` range
+  error ("Immediate out of range. Must be 1-4, got 0"). Confirmed by
+  reading `dgasm`'s own `encode_immediate_instruction`/`get_short_imm`
+  after hitting that error the first time.
+- **The real bug this took longest to find**: an early version
+  clobbered `AC2` (via `ELEF`/`ELDA`, to build the `LMP` source address
+  and the redirect target) without restoring it. `AC2` is not just
+  "some register" here — it's this backend's live frame pointer for
+  the *entire* function body (every `LDA/STA n,2` frame-relative
+  access uses it), confirmed by single-stepping the broken version in
+  `eclipse` and watching `AC0` change from the correct return value
+  (`010341` octal / 4321, present right up through the function's own
+  `RTN`) to a stale, unrelated value immediately after — traced to
+  `RTN`'s own handler in `eclipse_cpu.c` (confirmed by reading it
+  directly): it unconditionally restores `AC[0]`-`AC[3]` from the
+  stack block `SAVE` pushed at entry, which is architecturally correct
+  (see the manual's own Stack Instructions table), but means the
+  *compiler-generated* code between the asm block and `RTN` — which
+  stores the real return value to a frame-relative stack slot — was
+  using the clobbered `AC2` as its base address, silently storing
+  the real result nowhere the caller ever reads it. Fixed by saving
+  `AC2`/`AC3` (via `ESTA`, to `_mmpu_save2`/`_mmpu_save3`) as literally
+  the first two instructions in each asm block, and restoring them as
+  the last two, before falling back into compiler-generated code that
+  assumes `AC2` is still the frame pointer. `AC3`'s save/restore is
+  defensive, not confirmed-necessary the same way `AC2`'s was.
+- `_mmpu_save2`/`_mmpu_save3` need a dummy plain-C write
+  (`_mmpu_save2 = 0;` right before the asm block) or `dgasm` reports
+  "Undefined symbol" — confirmed empirically. With *no* visible C-level
+  reference at all (only asm-text references, invisible to the
+  compiler's own liveness analysis), `globaldce` removes the global's
+  storage entirely. `_mmpu_pte`/`_mmpu_target`/`_mmpu_value` never hit
+  this because each is genuinely written from plain C before its own
+  asm block runs.
+
+**Empirical verification**, through the *real* `eclipse-cc` pipeline
+(clang -cc1 → llvm-link → opt → llc → reorder_asm.py → dgasm), not
+hand-assembled like `mmpu_probe.s`:
+
+- `examples/mmpu_far_test.c`: `mmpu_write_far(0100, 0200, 4321)` then
+  `mmpu_read_far(0100, 0200)` → prints `4321`. Direct memory-dump
+  confirmation after running: `e 200200` (physical page `0100` octal
+  `<< 10 | 0200` octal) shows `010341` octal (4321); `e 200` (the
+  same offset in plain, unmapped logical space) shows a small,
+  unrelated value, confirming the write only ever touched the far
+  physical address.
+- `examples/mmpu_far_multi_test.c`: two *different* physical
+  pages/offsets (`0300,0700` → 9999; `0044,0033` → 111), plus a repeat
+  read of the first address after the second call — all three correct
+  (`r1=9999`, `r2=111`, `r1b=9999`), confirming no state leaks between
+  calls to different physical locations.
+- Isolated read path (not committed — a throwaway test during
+  debugging, described here for the record): pre-seeded the target
+  physical address directly via SIMH `dep` (bypassing
+  `mmpu_write_far` entirely) and confirmed `mmpu_read_far` alone
+  retrieves a pre-existing value — ruled out any write/read
+  interaction as the source of the `AC2` bug before finding it.
+
+**Regression check**: `dgasm-src` CTest, re-run after these changes:
+**315 tests, 314 passing, 1 `Not Run`** (`memcheck_hello`, still
+`valgrind`-not-installed, identical to Phase 1's baseline — this
+change touched zero `dgasm-src` files, so this is expected, not just
+hoped for). `examples/sizeof_check.c` through the full pipeline:
+byte-identical (`1 2 2 4 2 4 10 14`) before and after.
+
+**What Phase 2 still doesn't have**: LLVM codegen integration, page
+fault handling, and user-mode context switching — see the list above,
+now with exactly one item checked off.
