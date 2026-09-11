@@ -1178,3 +1178,280 @@ each needs either different tooling or a genuinely larger scope than
 this incremental hand-written-assembly approach — consistent with
 where the `MapIntMode` investigation above already concluded this
 approach was reaching its natural limit.
+
+## Phase 2: `MapIntMode` — deterministic interrupt injection, and what it means for a future scheduler
+
+The "Interrupt-safety of MMPU state" section above stopped at a
+concrete, checked blocker: every interrupt source in this SIMH build is
+wall-clock-calibrated, not instruction-count-deterministic, so no test
+could guarantee which instruction an interrupt lands on. This
+increment solves exactly that tooling gap, then uses it to answer the
+actual scoping question this whole `MapIntMode` investigation exists
+for: **does the hardware/simulator preserve enough MMPU state across a
+real interrupt for supervisor code to correctly resume the interrupted
+user map?**
+
+**Bottom line, stated up front since the rest of this section is
+detail**: **yes, conditionally.** The automatic hardware mechanism
+(`MapIntMode`) only guarantees one bit — "was some user map active" —
+not which one. But a second, undocumented-as-such side effect of the
+same dispatch code means the *complete* pre-interrupt map state (which
+of the two user maps, A or B, was active) is also recoverable, with no
+prior software bookkeeping at all — *if* the handler's first action is
+to read it out via `DIA` before touching the `MAP` device for any other
+reason. Miss that window — even by one intervening, otherwise-ordinary
+`DOA` — and the information is gone with no fault, no warning, just a
+silently wrong resume. Both the safe path and the hazard are verified
+below with real, single-stepped traces, not asserted.
+
+### The tooling breakthrough: SCP register deposit as a deterministic interrupt trigger
+
+The mechanism that unblocks this, read directly in `eclipse_cpu.c` and
+`nova_defs.h`, not guessed at: SIMH's PIT device registers its own
+interrupt-request bit as an ordinary, writable SCP register — no
+`REG_RO` flag, unlike the CPU device's own read-only `INT` register at
+`~line 539`:
+```c
+REG pit_reg[] = {
+    { ORDATA (INIT, pit_initial, 16) },
+    { ORDATA (COUNT, pit_counter, 16) },
+    { FLDATA (BUSY, dev_busy, INT_V_PIT) },
+    { FLDATA (DONE, dev_done, INT_V_PIT) },
+    { FLDATA (DISABLE, dev_disable, INT_V_PIT) },
+    { FLDATA (INT, int_req, INT_V_PIT) },
+    ...
+```
+`pit_svc` (the *timed* completion routine actually calibrated against
+the host clock via `sim_rtcn_calb`) does exactly two things when its
+countdown genuinely expires: `dev_done |= INT_PIT;` then `int_req =
+(int_req & ~INT_DEV) | (dev_done & ~dev_disable);`. Both of those bits
+are directly reachable from the SCP console — `deposit PIT DONE 1`
+followed by `deposit PIT INT 1` sets precisely the same two bits, with
+zero dependency on wall-clock time, at the exact moment the command
+runs. Confirmed empirically before touching the MMPU at all, with a
+plain supervisor-mode program (no MMPU involvement) whose only job was
+to prove this lands on an exact, chosen instruction boundary,
+repeatably:
+```
+$ { cat det_test.simh; echo 'd debug 100003'; echo 'dep PC 100'; echo 'step 3'; \
+    echo 'dep PIT DONE 1'; echo 'dep PIT INT 1'; echo 'step 2'; \
+    echo 'e PC'; echo 'e 115'; echo 'quit'; } | eclipse
+
+Step expired, PC: 00110 (HALT)
+115:	000043
+```
+Trace (three instructions executed, `NIOS 077`/`LDA`/`LDA`, *then* the
+deposit, *then* the interrupt fires on the very next loop check —
+before the fourth program instruction ever runs):
+```
+  000100 acs: 000000 000000 000000 000000 0 INTEN
+I 000101 acs: 000000 000000 000000 000000 0 LDA 0,111
+I 000102 acs: 000157 000000 000000 000000 0 LDA 1,112
+--------- Interrupt 1000004 (43) to    106 ---------
+  000106 acs: 000157 000336 000000 000000 0 INTA 1
+  000107 acs: 000157 000043 000000 000000 0 STA 1,115
+```
+`115:000043` is the handler's own `DIB 1,077` (interrupt-acknowledge)
+result, stored to memory — `043` octal is `DEV_PIT`, confirming not
+just that *an* interrupt fired but that it was correctly identified as
+the one this test injected. The fourth program instruction (`LDA
+2,113`) never executed — visible directly in the trace (no such line
+appears before the `Interrupt` marker) and confirmed by `step 3`
+landing exactly on it, unexecuted, per SIMH's own "Step expired, PC:
+00103 (LDA 2,113)" message from an intermediate check. This is fully
+repeatable — SCP commands between `step` calls have no wall-clock
+component at all, unlike the calibrated service routine this bypasses
+entirely.
+
+This generalizes directly to every prior phase's evidentiary bar: pick
+any instruction boundary with `step N`, deposit the two PIT bits,
+`step` again. No SIMH source changes, no new build — a pure
+console-command technique, reusable for any future interrupt-timing
+question this project runs into.
+
+### `examples/mmpu_intmode_probe.s`: MapIntMode's bit correctly reflects genuine user-mode activity
+
+Builds on `mmpu_usermode_probe.s`'s entry mechanism (same identity-page-0
+safety design, same `DOA`-arms/indirect-triggers pattern). A real PIT
+interrupt is injected, via the technique above, at three different
+points relative to the user-mode entry, to get a genuine contrast, not
+one data point:
+
+1. **Genuinely active** (`Usermap==1`, mid a known instruction
+   sequence): `dep PC 50, step 12, dep PIT DONE 1, dep PIT INT 1, step 4`
+   → `e 213` (`mapstat_at_int`, the handler's `DIA 0,MAP` result) =
+   `000001` — bit 0 correctly set. `e 320200` (physical page `0150`
+   octal, map A's target) = `000000` — the `ESTA` after the injection
+   point never executed, confirming the interrupt landed exactly where
+   planned, not merely "before the program finished."
+2. **True supervisor**, well before the MMPU is even armed: `step 5`
+   instead of `step 12` → `mapstat_at_int` = `000000` — the negative
+   control. Without this, "always reads 1" couldn't be ruled out.
+3. **Armed but not yet switched** — `DOA` has set `MapStat`'s User
+   Enable bit, but the indirect-reference trigger that actually flips
+   `Usermap` hasn't executed yet: `step 9` (right after the arming
+   `DOA`) → `mapstat_at_int` = `000001` still. This looks like it should
+   be the ambiguous case (`MapStat` bit 0 already 1, `Usermap` still
+   architecturally 0) but isn't: `eclipse_cpu.c`'s `DOA`/Load-Map-Status
+   handler also sets `Inhibit = 2` whenever it turns User Enable on, and
+   the interrupt check itself is gated on `!Inhibit`
+   (`if (int_req > INT_PENDING && !Inhibit)`). `Inhibit` is only cleared
+   back to 0 *inside* the trigger instruction's own indirect-chain code
+   (`Usermap = Enable; Inhibit = 0;`) — so the earliest an interrupt can
+   possibly land, once armed, is immediately *after* that instruction
+   completes, by which point `Usermap` has already flipped. Confirmed
+   directly in the trace: with the deposit issued right after the arming
+   `DOA`, the interrupt does not fire until after `LDA 0,@iptr` (the
+   trigger) has run — never before it, across the step counts chosen
+   specifically to probe this boundary. There is no real window where
+   `MapStat`'s bit reads 1 but `Usermap` is genuinely still 0 — `DIA`'s
+   bit 0 is a clean, race-free signal for "a real user map was active,"
+   confirmed by direct probing of exactly the instant where a design
+   flaw would show up if one existed, not just by reading the dispatch
+   code once and trusting it.
+
+### `examples/mmpu_intmode_resume_probe.s`: the actual scheduler-relevant question
+
+`mmpu_intmode_probe.s` establishes *that* the bit is trustworthy. It
+says nothing about *which* map (A or B) was active — the real question
+a preemptive scheduler needs answered. This probe loads both maps (A →
+phys page `0150` octal, B → phys page `0044` octal at logical page 2 —
+exactly `mmpu_context_switch_probe.s`'s own already-verified values),
+enters user mode under **map B** specifically, gets deterministically
+interrupted mid-execution (before the map-B write runs), and then
+attempts two different resumes from that one interrupted point:
+
+- **"Naive" resume**: reloads `MapStat` via `DOA` using only User
+  Enable=1, A/B bit left at its default (0) — i.e. without using
+  anything `DIA` returned. This is what a handler would do if it
+  (reasonably, given the documented contract) assumed `DIA`'s bit 0 was
+  *all* the hardware gives it back.
+- **"Informed" resume**: reloads `MapStat` via `DOA` using the *literal*
+  value the handler's own `DIA` read back at interrupt entry (saved to
+  `mapstat_at_int`, then replayed with a plain `LDA 0,mapstat_at_int`
+  before the second `DOA`) — no hardcoded stand-in for "the scheduler
+  already knew," just hardware state played straight back.
+
+```
+$ { cat mmpu_intmode_resume_probe.simh; echo 'dep PC 50'; echo 'step 17'; \
+    echo 'dep PIT DONE 1'; echo 'dep PIT INT 1'; echo 'step 40'; \
+    echo 'e 315'; echo 'e 320200'; echo 'e 110200'; echo 'e 4200'; echo 'quit'; } | eclipse
+
+315:	000005      -- mapstat_at_int: EXACTLY enterB's own original DOA
+                     value (User Enable=1 | A/B=1 = 5 octal) -- DIA's
+                     readback fully reconstructed the pre-interrupt
+                     MapStat, not just bit 0
+320200:	010341      -- phys page 0150 octal (map A's target): 4321
+                     decimal = markerNaive -- the naive resume silently
+                     wrote into map A's physical page, even though the
+                     interrupted process was genuinely running under B
+110200:	021270      -- phys page 0044 octal (map B's REAL target): 8888
+                     decimal = markerInformed -- the informed resume
+                     correctly returned to map B and wrote to the right
+                     place
+4200:	000000       -- plain logical (Usermap==0 now): untouched by
+                     either write, as expected
+```
+The instruction trace independently confirms the same divergence via
+this project's own established `Usermap`-label convention (`A` for
+`Usermap==1`, `B` for `Usermap==2`):
+```
+IB000072 acs: 001747 000000 000311 000000 0 LDA 1,313
+ A000105 acs: 001053 000043 000311 000000 0 LDA 1,320
+ A000106 acs: 001053 010341 000311 000000 0 ESTA 1,4200
+ A000110 acs: 001053 010341 000311 000000 0 NIOP 0,MAP
+ B000114 acs: 001232 010341 000311 000000 0 LDA 2,323
+ B000115 acs: 001232 010341 021270 000000 0 ESTA 2,4200
+ B000117 acs: 001232 010341 021270 000000 0 NIOP 0,MAP
+```
+The program was genuinely interrupted while labeled `IB` (`Usermap==2`,
+User B, interrupts on); the naive resume's `ESTA` is labeled plain `A`
+(`Usermap==1`) — a real, different map than the one interrupted, not a
+labeling artifact; the informed resume's `ESTA` is labeled `B`, matching
+the original. Two independent forms of evidence (memory dump, trace
+labels) agree.
+
+**Why the informed resume works at all — a real finding, not by
+design of any documented instruction**: `eclipse_cpu.c`'s interrupt
+dispatch (`~line 783-787`) clears *only* bit 0 of `MapStat`:
+```c
+MapIntMode = MapStat;                               /* Save Status as it was */
+Usermap = 0;                                        /* Inhibit MAP */
+MapStat &= ~1;                                      /* Disable user map */
+```
+Bit 13 (the A/B select bit) and every other bit are left exactly as
+they were. So an ordinary `DIA 0,MAP`, read before any other `MAP`
+device I/O, returns `(MapStat & 0xFFFE) | (MapIntMode & 1)` — which,
+because only bit 0 was ever cleared, is bit-for-bit identical to the
+complete `MapStat` that was live immediately before the interrupt. That
+is a genuine, complete resume descriptor, recoverable from hardware
+alone, with no prior software bookkeeping — but it is **not** what
+`MapIntMode`'s own documented OR-in mechanism promises (that mechanism
+is only ever described, here and in the manual's own terms, as
+supplying bit 0). It works because of what *isn't* cleared, not because
+of anything advertised as a multi-bit save. This document's own
+standing rule (cite only what's actually checked) applies here in a new
+way: the manual does not describe this side channel at all, so this is
+purely an emulator-source-and-trace-verified finding — whether real
+S/140 hardware behaves identically is not established here, and would
+need the same kind of behavioral test this project can't yet run
+against real hardware.
+
+**Why this is fragile, not a guaranteed contract for a real OS**:
+`MapStat` is a single live register, not a stack or a per-process save
+area. The moment supervisor code issues **any other** `DOA` to the
+`MAP` device — for this process's own housekeeping, to set up a
+*different* process, or because a second interrupt arrives before the
+first is saved — that recoverable state is gone, exactly as this
+probe's own "naive" resume demonstrates by clobbering it on purpose.
+`MapIntMode` itself is likewise a single register: a second interrupt
+before the handler saves anything would overwrite it too (not
+separately tested here — doing so would need nested, deterministically-
+staged interrupt injection, a plausible next extension of the same
+tooling this increment built, not attempted in this increment).
+
+### Answer to the scoping question
+
+**Is it safe to preempt user-mode-with-MMPU-active code via a real
+interrupt, and does supervisor code have what it needs to resume
+correctly?**
+
+**Yes, with one precise, non-negotiable discipline, now empirically
+verified rather than assumed**: the interrupt handler's *first* action,
+before any other `MAP`-device I/O, must be `DIA 0,MAP`, with the result
+saved into that process's own per-process state immediately. Do that,
+and the exact pre-interrupt `MapStat` — including which of the two user
+maps was active — is fully and correctly recoverable, confirmed by
+directly comparing a "did it right" and "did it wrong" resume from the
+identical interrupted state. Skip that discipline, or let anything else
+touch the `MAP` device first, and the failure mode is silent — no
+fault, no trap, just a process quietly resumed under the wrong address
+space, also confirmed directly rather than inferred.
+
+This is a real, usable, and now precisely-scoped requirement for a
+future scheduler design: the interrupt entry path needs a `DIA`-and-
+save step ahead of *everything* else the OS's interrupt/dispatch logic
+does, including its own bookkeeping for which process to run next.
+Once that value is captured into ordinary supervisor memory, resuming
+it later — even after switching through other processes' maps
+entirely, which this document's own two-user-map limit means a
+real multi-process OS would need to do constantly, since only two
+user maps exist in hardware at all (see "What Phase 2 would actually
+need" above) — is ordinary software bookkeeping from that point on,
+not something the hardware keeps track of for you. What remains
+genuinely open: nested-interrupt behavior before the save (plausible
+to test with this same tooling, not attempted here), and whether real
+S/140 hardware matches this emulator's specific "only bit 0 is
+cleared" behavior, since the manual does not document that side
+channel at all.
+
+**Regression check**: `dgasm-src` CTest re-run after both additions:
+**315 tests, 314 passing, 1 Not Run** (`memcheck_hello`, unchanged, no
+`valgrind`). `examples/sizeof_check.c` through the full `eclipse-cc`
+pipeline: byte-identical (`1 2 2 4 2 4 10 14`).
+`examples/mmpu_usermode_probe.s` re-run directly: byte-identical to its
+documented transcript (`4200:000000`, `320200:013056`). Zero
+`dgasm-src`/`eclipse-cc`/`llvm-project`/`simh-src` changes — both new
+files are additive only; the deterministic-interrupt technique this
+section relies on is a pure SCP console command sequence, not a
+simulator source modification.
