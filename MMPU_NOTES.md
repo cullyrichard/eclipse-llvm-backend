@@ -691,10 +691,11 @@ byte-identical (`1 2 2 4 2 4 10 14`).
 
 **What's still open**: genuine recovery/resume after a fault (explicitly
 out of scope here, per the manual's own reliability caveat above),
-`MapIntMode`'s interrupt-safe save/restore, write-protection faults
-specifically (not attempted — validity was chosen as the simpler of
-the two), any second-user/process-switching story, and (still, as
-always) LLVM codegen integration.
+`MapIntMode`'s interrupt-safe save/restore, any second-user/process-
+switching story, and (still, as always) LLVM codegen integration.
+(Write-protection faults specifically, not attempted when this section
+was first written, are now covered — see "Phase 2: write-protection
+fault and `DIC` (Page Check) readback" below.)
 
 ## Phase 2: two-user-map context switch
 
@@ -825,15 +826,19 @@ regression). Zero `dgasm-src`/`eclipse-cc`/`llvm-project` changes.
 
 **What's still open**: `MapIntMode`'s interrupt-safe save/restore of
 map state (still completely unexercised — this test's two activations
-are sequential, never interrupted), write-protection faults
-specifically, genuine fault recovery/resume, and (still, as always)
-LLVM codegen integration. Of these, `MapIntMode` is probably the most
-natural next increment: this test already demonstrates that switching
-*which* map is active works correctly when done deliberately and
-sequentially; the open question a real OS would actually hit is whether
-that same state survives an *involuntary* switch (an interrupt arriving
-mid-execution) correctly, which is a meaningfully different and harder
-question than anything tested so far.
+are sequential, never interrupted), genuine fault recovery/resume, and
+(still, as always) LLVM codegen integration. Of these, `MapIntMode` is
+probably the most natural next increment: this test already
+demonstrates that switching *which* map is active works correctly when
+done deliberately and sequentially; the open question a real OS would
+actually hit is whether that same state survives an *involuntary*
+switch (an interrupt arriving mid-execution) correctly, which is a
+meaningfully different and harder question than anything tested so
+far. (Write-protection faults specifically, listed here when this
+section was first written, are now covered — see "Phase 2:
+write-protection fault and `DIC` (Page Check) readback" below; the
+`MapIntMode` investigation this bullet anticipated is further below
+too, and concluded it needs different tooling, not just more effort.)
 
 ## LLVM codegen integration: scoped but not attempted
 
@@ -1027,3 +1032,149 @@ precise. `MapIntMode` is the first thing in this whole investigation
 that doesn't have that property available for free, and the honest
 finding is that it needs different tooling, not just more effort at
 the same approach.
+
+## Phase 2: write-protection fault and `DIC` (Page Check) readback
+
+Two smaller, tractable loose ends left over from page-fault handling:
+a write-protection fault (distinct from the validity fault
+`mmpu_fault_probe.s` already covers), and `DIC`/`DOC` (Page Check),
+never exercised by any prior phase. Both verified with falsifiable
+predictions worked out by hand from `eclipse_cpu.c`'s source *before*
+running anything, then checked against the actual result — same
+discipline as every phase before this one.
+
+**Write-protection fault's exact trigger**, confirmed directly in
+`PutMap` (case 1, User A; `eclipse_cpu.c` ~5588):
+```c
+if (((Map[1][page] & 0100000) && (MapStat & 020)) ||
+    Map[1][page] == INVALID)
+    Fault = 010000;                    /* Write Protect Fault */
+```
+Two independent paths can set this fault; `examples/mmpu_wpfault_probe.s`
+isolates the first, distinct from the validity fault already tested:
+a page's own bit 0 (`0100000`, the same bit the manual's `LMP` note
+calls "1 for user maps") **and** `MapStat`'s WP-enable bit (`020`
+octal, the manual's "bit 11") both set, on an otherwise-valid page —
+matching the manual's plain-language description ("Write Protection",
+Ch. 2 p.2-30): *"When the user map is loaded, its address space is
+automatically write protected. Write protection can be enabled or
+disabled by the supervisor."* A page loaded with bit 0 clear (like
+every prior probe's identity page 0) is never write-protected
+regardless of `MapStat` — confirmed by the `&&`, not assumed.
+
+**A real bug caught before running anything**, the same class this
+project keeps finding: the first draft of `mmpu_wpfault_probe.s`'s
+second `ptes` entry was `dw 0100003` (WP bit + physical page 3, no
+logical-page selector). `LMP` needs the logical-page field
+(`logical<<10`, consumed to pick the map slot, then masked away from
+what's actually stored — see Phase 1's `LMP` writeup) present in the
+*input* word even though it isn't in the *stored* one; omitting it
+meant the entry silently landed in `Map[1][0]`, clobbering the
+identity page-0 entry every prior probe depends on for safe code
+execution under `Usermap != 0`. Caught by direct comparison against
+`mmpu_usermode_probe.s`'s already-working `ptes` values (which do
+include the shift, `dw 04150` = `2<<10 | 0150`) before running
+anything against the emulator at all — not discovered by the crash it
+would have caused. Fixed: `dw 0104003` (`0100000 | 04000 | 3`).
+
+**Falsifiable prediction, worked out before running**, from the
+fault-dispatch code (`MMPU_NOTES.md`'s page-fault section has the full
+quote): `MapStat` going in is `021` octal (`DOA`'s User Enable=1 |
+WP Enable=`020`, distinct from `mmpu_fault_probe.s`'s plain `1`).
+`&= ~01` → `020`. `if (Fault & 0100000) ...` does **not** fire this
+time — `010000` (Write Protect) doesn't have that bit, unlike
+`0100000` (Validity) — so, unlike the validity-fault case, this
+clear-out step is skipped. `MapStat |= Fault & 077777` → `020 | 010000
+= 010020` octal. Predicted `DIA` readback: `010020` octal.
+
+**Confirmed exactly**, two independent ways:
+```
+$ dgasm -t eclipse_s140 -f simh -o mmpu_wpfault_probe.simh mmpu_wpfault_probe.s
+$ { cat mmpu_wpfault_probe.simh; echo 'dep PC 50'; echo 'step 30'; \
+    echo 'e 113'; echo 'quit'; } | eclipse
+113:	010020
+```
+matching the prediction exactly, and independently via the simulator's
+own instruction trace (`set debug trace.log` + `d debug 100003`):
+```
+64 LMP (Map=0)
+      107 MAP L=0 W=0 P=0
+      110 MAP L=2 W=1 P=3
+ A000066 acs: 001747 000000 000111 000000 0 LDA 1,103
+ A000067 acs: 001747 010341 000111 000000 0 ESTA 1,4200
+  000072 acs: 001747 010341 000111 000000 0 DIA 0,MAP
+72 DIA 0=10020 (Read Map Status)
+```
+The `LMP` trace line confirms both map entries loaded exactly as
+intended (`W=0`/not-protectable for page 0, `W=1`/protectable, `P=3`
+for page 2). The `A` prefix (this project's established "`Usermap==1`"
+marker) is present through the faulting `ESTA` and gone by the time
+`DIA` executes at address `072` — exactly `pf_handler`'s address, the
+never-reached `HALT` at `071` skipped entirely, the same evidence
+pattern `mmpu_fault_probe.s` established. `72 DIA 0=10020` is the
+emulator's own trace independently reporting the exact same value the
+memory dump showed.
+
+**A genuine complement to the earlier open `DIA` discrepancy**: the
+page-fault handling section above found that a *validity* fault's
+`DIA` readback is `0`, not the "last fault was WP" bit a literal
+manual reading suggests — flagged there as unresolved. This result
+clarifies it without fully resolving it: a validity fault (`Fault =
+0100000`) *does* trigger the dispatch code's extra `MapStat &= ~0170`
+clear, and `0100000`'s low 15 bits are `0`, so nothing survives into
+the OR-in step — net `0`, by construction. A write-protect fault
+(`Fault = 010000`) has neither property — no extra clear, and
+`010000`'s bits *do* survive the `& 077777` mask — so its fault code
+genuinely shows up in the `DIA` readback (`010020`, with `010000`
+plainly visible in it), while validity's doesn't. Both are internally
+consistent with the source; the earlier discrepancy is specifically
+about whether the manual's own described "last fault type" status bit
+matches *either* of these two mechanisms — still open, but now
+narrowed with a second, contrasting data point instead of one.
+
+**`DIC`/`DOC` (Page Check)**, confirmed directly in `eclipse_cpu.c`'s
+`ioDOC`/`ioDIC` (`~5242`, `~5218`) — both execute unconditionally in
+supervisor mode (`if (!Usermap || !(MapStat & 0140))`), so
+`examples/mmpu_pagecheck_probe.s` needs no user-mode entry at all,
+reusing the exact same, already trace-confirmed map entries from
+`mmpu_wpfault_probe.s` to avoid introducing new arithmetic risk:
+```c
+case ioDOC:  Check = AC[dstAC];                       /* verbatim copy */
+case ioDIC:  AC[dstAC] = Map[i][j] & 0101777;
+             AC[dstAC] |= (Check << 5) & 070000;       /* map-select echo */
+```
+`i`/`j` are decoded from `Check`'s bits 6-8/1-5 (manual numbering) —
+`Check = logical_page<<10 | map_select<<7`. For logical page 2, User A
+(map-select `000`): `Check = 04000` octal, and the map-select echo
+term works out to `0` by hand (`04000<<5 = 0200000` octal, outside the
+`070000` mask window entirely) — so the predicted result is simply
+`Map[1][2] & 0101777`, which `mmpu_wpfault_probe.s`'s own `LMP` trace
+already established as `0100003` octal (`W=1 P=3`). Confirmed exactly:
+```
+$ dgasm -t eclipse_s140 -f simh -o mmpu_pagecheck_probe.simh mmpu_pagecheck_probe.s
+$ { cat mmpu_pagecheck_probe.simh; echo 'dep PC 50'; echo 'step 10'; \
+    echo 'e 105'; echo 'quit'; } | eclipse
+105:	100003
+```
+
+**Regression check**: `dgasm-src` CTest, re-run after both additions:
+**315 tests, 314 passing, 1 Not Run** (`memcheck_hello`, unchanged, no
+`valgrind`). `examples/sizeof_check.c` through the full `eclipse-cc`
+pipeline: byte-identical (`1 2 2 4 2 4 10 14`). `mmpu_fault_probe.s`
+re-run directly: byte-identical to its documented return-block values
+(`61:001747 62:000000 63:000110 64:000000 65:000070 112:000000`). Zero
+`dgasm-src`/`eclipse-cc`/`llvm-project` changes — both new files are
+additive only.
+
+**What's left**: genuine fault recovery/resume (still out of scope per
+the manual's own PC-reliability caveat), `MapIntMode` (investigated,
+not empirically attempted — see above), any second-user/process
+scheduling story built on the two-map switch, and — as always — LLVM
+codegen integration. With write-protection faults and `DIC` readback
+done, this closes out every loose end from the page-fault and
+two-user-map phases that had a deterministic, single-steppable path to
+verification. What remains (`MapIntMode`, recovery, LLVM integration)
+each needs either different tooling or a genuinely larger scope than
+this incremental hand-written-assembly approach — consistent with
+where the `MapIntMode` investigation above already concluded this
+approach was reaching its natural limit.
