@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""eclipse-ab2tape -- package an already-assembled DG object/loader
+absolute-binary file (dgasm -f ab, or eclipse-compile.sh -o foo.ab) as a
+bootable 9-track tape image (SIMH .tap format), with no recompilation.
+
+Sibling to eclipse-mktape: that tool compiles C source and always uses
+entry address 050 (the fixed convention every program this toolchain's
+own pipeline produces relies on -- see eclipse-cc/eclipse-compile.sh's
+header comments). This tool instead parses an .ab file directly, so it
+works on any DG absolute binary this toolchain (or anything else that
+emits the same block format) has already produced -- not just this
+project's own compiled output -- which is why its entry address isn't
+assumed fixed; see --entry below.
+
+Usage:
+  eclipse-ab2tape [-o output.tap] [--entry ADDR] input.ab
+
+--entry defaults to the lowest address any block in the .ab file loads
+at. That's correct for every .ab file eclipse-compile.sh itself produces
+(050, always -- page-zero data and code are laid out contiguously from
+there by reorder_asm.py) and is a reasonable default for a general DG
+absolute binary, but it is only a default: a file whose real entry point
+isn't its lowest loaded address needs --entry ADDR (octal, e.g. --entry
+0100) to override it.
+
+Same real-hardware caveat as eclipse-mktape/eclipse-compile.sh's -f ab:
+verified against eclipseemu only, not real tape hardware -- see
+tape/mktape.py's and tape/boot_stage2.s.in's header comments for the
+full boot mechanism this relies on.
+
+Gap note: the .ab file's blocks are flattened into one contiguous image
+spanning its lowest to highest used address, with any gap in between
+zero-filled (see tape/mktape.py's flatten()) -- fine for this toolchain's
+own contiguous output, but a .ab file with widely separated blocks (e.g.
+one at 0100 and another at 040000) would flatten into an impractically
+large tape record; build_tape() will reject anything past the
+32768-word single-record limit (see boot_stage2.s.in's "Known limit"),
+but a large-and-still-under-that-limit gap will silently bloat the
+output instead.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tape"))
+import mktape  # noqa: E402
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("input_ab", help="a dgasm -f ab file")
+    p.add_argument("-o", dest="out", help="output .tap path (default: input.ab -> input.tap)")
+    p.add_argument("--entry", type=mktape.parse_addr, default=None,
+                    help="entry address, e.g. 050 or 0100 (default: lowest "
+                         "address used in input_ab)")
+    p.add_argument("--dgasm", default="dgasm", help="dgasm executable (default: dgasm on PATH)")
+    args = p.parse_args()
+
+    out = args.out or os.path.splitext(args.input_ab)[0] + ".tap"
+
+    try:
+        words_by_addr = mktape.parse_ab(args.input_ab)
+        lo, program_words = mktape.flatten(words_by_addr)
+        entry = args.entry if args.entry is not None else lo
+        if entry != lo:
+            print(f"eclipse-ab2tape: entry {entry:#o} overrides the file's "
+                  f"lowest loaded address {lo:#o}", file=sys.stderr)
+        span = len(program_words)
+        print(f"eclipse-ab2tape: {args.input_ab}: {len(words_by_addr)} words "
+              f"in {span} words spanning {lo:#o}-{lo + span - 1:#o}, entry={entry:#o}")
+        r1, r2 = mktape.build_tape(entry, program_words, out, args.dgasm)
+    except (ValueError, RuntimeError, AssertionError) as e:
+        print(f"eclipse-ab2tape: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"wrote {out}: record1={r1}B (boot), record2={r2}B (program) + tapemark")
+    print("boot in eclipseemu with:")
+    print(f"  att mta0 {out}")
+    print("  boot mta0")
+
+
+if __name__ == "__main__":
+    main()

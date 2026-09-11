@@ -1,7 +1,10 @@
-// boot_stage2.s -- second-stage 9-track tape bootstrap for the Eclipse LLVM
-// backend. Assembled standalone (dgasm -f bin) and spliced into word offset
-// 255 of tape record 1 by mktape.py -- see that file's header comment for
-// the full boot sequence this is one half of.
+// boot_stage2.s.in -- second-stage 9-track tape bootstrap for the Eclipse
+// LLVM backend. This is a template, not directly assemblable: mktape.py
+// substitutes the @ENTRY@ placeholder below with the actual program
+// entry address (octal), writes the result to a temp file, and
+// assembles *that* with dgasm -f bin, splicing the result into word
+// offset 255 of tape record 1 -- see mktape.py's header comment for the
+// full boot sequence this is one half of.
 //
 // Why this exists / how record 1 ends up executing this at all:
 // eclipseemu's (and real Eclipse hardware's) magtape boot ROM is generic
@@ -37,23 +40,24 @@
 // interrupt vector at 0/1 (irrelevant here: IORST, executed by the first
 // boot ROM before any of this runs, leaves interrupts disabled, and this
 // program never enables them) -- so it can't collide with anything a
-// compiled program itself uses; every compiled program's own layout
-// starts at 050 (see eclipse-cc/eclipse-compile.sh's own header
-// comments -- a fixed, program-independent convention this file relies
-// on directly, both as the DMA target for record 2 and as the address
-// it jumps to when done).
+// compiled program itself uses, whatever address that program actually
+// starts at (@ENTRY@ below -- every program *this toolchain's own C
+// pipeline* builds fixes that at 050, see eclipse-cc/eclipse-compile.sh's
+// header comments, but this file and mktape.py don't hardcode that
+// assumption: eclipse-ab2tape packages an arbitrary already-assembled
+// .ab file, which may declare a different entry).
 //
 // What it actually does: reset the magtape word-count register (a
 // leftover nonzero count from record 1's own 256-word read would
 // otherwise silently truncate record 2 -- see nova_mta.c's CU_READ: a
 // too-small `wc` makes an oversized incoming record set STA_WCO and get
 // cut down to the stale word count instead of its real length), point
-// the magtape memory-address register at 050, issue one start pulse, and
-// spin on "done" -- no per-word DIAS/status polling needed here (unlike
-// the generic byte-serial boot ROM this file follows), since the
-// controller's own DMA already deposited the words directly into memory
-// by the time the done flag comes true. Once done, jump to 050 -- every
-// program this toolchain produces starts there.
+// the magtape memory-address register at the entry address, issue one
+// start pulse, and spin on "done" -- no per-word DIAS/status polling
+// needed here (unlike the generic byte-serial boot ROM this file
+// follows), since the controller's own DMA already deposited the words
+// directly into memory by the time the done flag comes true. Once done,
+// jump to the entry address.
 //
 // Known limit: one NIOS pulse reads exactly one physical tape record in
 // full (nova_mta.c's CU_READ, capped at MTA_MAXFR = 65536 bytes = 32768
@@ -68,7 +72,7 @@
 	dev MTA = 022
 
 loadaddr:
-	dw 050
+	dw @ENTRY@
 zero:
 	dw 0
 
@@ -78,15 +82,22 @@ stage2:
 					// controller's own max record size, not
 					// whatever record 1's 256-word read left
 					// behind
-	LDA 0, loadaddr			// AC0 = 050
-	DOB 0, MTA			// mta_ma = 050 -- record 2 lands exactly
-					// where every compiled program expects
-					// to start
+	LDA 0, loadaddr			// AC0 = entry address
+	DOB 0, MTA			// mta_ma = entry address -- record 2
+					// lands exactly where it's meant to run
 	NIOS MTA			// start pulse: read record 2 (async)
 poll:
 	SKPDN MTA
 	JMP poll
-	JMP 050, 0			// every compiled program's entry point
+	JMP @loadaddr			// the program's entry point -- indirect
+					// through the same page-zero word used
+					// above, not a direct zero-page jump:
+					// @ENTRY@ can be anywhere in the full
+					// 16-bit address space (eclipse-ab2tape
+					// packages arbitrary .ab files, whose
+					// entry need not be in page zero),
+					// while a direct JMP's displacement is
+					// limited to 0-255
 
 	org 0377
 	JMP stage2, 0			// word offset 255 of tape record 1:

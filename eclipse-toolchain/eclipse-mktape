@@ -11,8 +11,11 @@
 # step differs: dgasm -f bin (a flat memory image) instead of -f ab (the
 # DG object/loader block format), since the tape's second record is DMA'd
 # directly into memory by the magtape controller rather than parsed by a
-# block-structured loader -- see tape/boot_stage2.s's header comment for
-# the full mechanism and tape/mktape.py for the image format itself.
+# block-structured loader -- see tape/boot_stage2.s.in's header comment
+# for the full mechanism and tape/mktape.py for the image format itself.
+# Already have a .ab file instead of C source (e.g. from
+# eclipse-compile.sh)? Use eclipse-ab2tape instead -- it packages one
+# directly, no recompilation.
 #
 # NB real-hardware caveat: like eclipse-compile.sh's -f ab output, this
 # has only been verified against eclipseemu (SIMH's Eclipse simulator,
@@ -57,7 +60,6 @@ LLVM_LINK="$LLVM_BUILD/bin/llvm-link"
 OPT="$LLVM_BUILD/bin/opt"
 REORDER="$TOOLCHAIN/reorder_asm.py"
 RT_SRC="$TOOLCHAIN/rt/eclipse_rt.c"
-STAGE2_SRC="$SCRIPT_DIR/tape/boot_stage2.s"
 MKTAPE_PY="$SCRIPT_DIR/tape/mktape.py"
 TRIPLE="eclipse-dg-none"
 
@@ -147,11 +149,12 @@ while :; do
   pass=$((pass + 1))
 done
 
-echo "[7/8] dgasm: boot_stage2.s -> flat binary (record 1)"
-dgasm -t eclipse_s140 -f bin -o "$work/stage2.bin" "$STAGE2_SRC"
-
 echo "[8/8] mktape.py: pack into $out"
-python3 "$MKTAPE_PY" "$work/stage2.bin" "$work/prog.bin" "$out"
+# 050: the fixed entry point every program this toolchain's own C
+# pipeline produces (see eclipse-cc/eclipse-compile.sh's own header
+# comments) -- eclipse-ab2tape is the sibling tool for packaging an
+# already-assembled .ab file whose entry may differ.
+python3 "$MKTAPE_PY" "$work/prog.bin" -o "$out" --entry 050 --dgasm dgasm
 
 echo
 echo "wrote $out"
