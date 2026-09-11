@@ -34,50 +34,67 @@ checked before being relied on):
   logical address means, page by page.
 - **Physical address = `((Map[ctx][page] & PAGEMASK) << 10) | (addr &
   001777)`** (`GetMap`/`PutMap`, `eclipse_cpu.c` ~5510-5610). `PAGEMASK
-  = 01777` = 10 bits = physical page numbers 0-1023 in this *emulation*.
-  Physical page × 1024-word pages = 1,048,576 words (1 megaword) as
-  SIMH models it (`nova_defs.h:77`, `#define MAXMEMSIZE 1048576`, and
-  `show cpu` → `1MW, STD`) — **but this is not what the real S/140
-  supports**, checked directly against the real Programmer's Reference
-  (see below), and superseded by it.
+  = 01777` = 10 bits = physical page numbers 0-1023. Physical page ×
+  1024-word pages = 1,048,576 words (1 megaword) as SIMH models it
+  (`nova_defs.h:77`, `#define MAXMEMSIZE 1048576`, and `show cpu` →
+  `1MW, STD`).
+  - **Correction to this section's own history**: an earlier version of
+    this note claimed the real ceiling was half that (524,288 words,
+    9-bit page field), based on Chapter 2's prose and a page-table bit
+    diagram found via a lossy OCR/text-search pass. That was wrong —
+    the bit diagram belonged to the **Burst Multiplexor Channel (BMC)**,
+    a separate optional DMA device (Chapter 3, device code `5` octal),
+    not the core MMPU (device `MAP`, device code `3` octal) — same
+    instruction *mnemonics* (`DIC`/`DOA`/`DOB`/`DOC`), completely
+    different hardware, easy to conflate from text alone. Caught by
+    going back to the actual scanned page images (not OCR text) for the
+    core MMPU's own `LMP` instruction — see below.
   - **Verified against the real S/140 Programmer's Reference** (Data
     General pub. 014-000642-02, Rev. 02, April 1981 —
-    bitsavers.org/pdf/dg/eclipse/014-000642-02_S140_PgmrRef_Apr81.pdf,
-    OCR text at archive.org/details/bitsavers_dgeclipse0efApr81_8158761),
-    not just the emulator source, per this project's standing rule
-    against trusting unverified ISA facts:
-    - *"Physical address — ... The maximum size of the physical address
-      space is 1,048,576 **bytes** (1M) and it is addressed by a 19-bit
-      address."* (word-addressed like everything else in this doc — the
-      same passage states the *logical* space as "32,768 words...
-      addressed by a 15-bit address" — so 19 bits = 2^19 = **524,288
-      words**, × 2 bytes/word = 1,048,576 bytes. Words, not bytes, is
-      the right unit to compare against SIMH's word-denominated
-      `MAXMEMSIZE`.)
-    - Independently confirmed by the BMC (optional Burst Multiplexor
-      Channel) page-table format's own bit diagram: *"7-15 Physical
-      Page — The 9-bit physical page number."* 9 bits = 512 pages ×
-      1024-word pages = **524,288 words** — the exact same number,
-      arrived at from a completely different part of the manual.
-  - **So the real ceiling is 524,288 words (512K words / 1MB), exactly
-    half of what this SIMH emulation's `PAGEMASK` (10-bit, 1024 pages)
-    permits.** This is a genuine, confirmed emulator-vs-real-hardware
-    gap, not a rounding difference: physical pages 512-1023 are
-    reachable in `eclipseemu` but have no real S/140 equivalent — don't
-    trust an address in that range as representative of real hardware.
-    `examples/mmpu_probe.s` used physical page 40 (decimal), safely
-    inside the real 0-511 range, so the empirical result below is
-    unaffected.
-  - This also corrects the "up to two megawords" figure the request
-    that started this investigation used — the real number is a
-    further half of even the (already too generous) emulator figure.
-  - **Also corrected by the same document**: the real S/140 has only
-    **two** user maps (A/B) — *"The MMPU can hold two user maps, but
-    only one can be enabled at any one time."* The `Map[8][32]` array's
-    slots for user maps C/D exist in `eclipse_cpu.c` for *other* Eclipse
-    models (the file's own header comment already flagged this — "some
-    models have two extra user maps" — this note just didn't apply that
-    caveat carefully enough the first time around). Four data-channel
+    bitsavers.org/pdf/dg/eclipse/014-000642-02_S140_PgmrRef_Apr81.pdf),
+    by viewing the actual page images, not text extraction: the `LMP`
+    (Load Map) instruction's own loaded-word format, page "5-84",
+    states plainly:
+    ```
+    Bits   Name            Contents or Function
+    0      WRITE PROTECT   Must be 0 for data channel maps; 1 for user maps.
+    1-5    LOGICAL         Logical page number.
+    6-15   PHYSICAL        Physical page number.
+    ```
+    Bits 6-15 is **10 bits** — physical page numbers 0-1023, exactly
+    matching `PAGEMASK`. 1024 pages × 1024-word pages = **1,048,576
+    words (1 megaword) — the core MMPU's real addressing capability
+    matches this SIMH emulation exactly.** This is the mechanically
+    authoritative source (the literal bit format the hardware decodes
+    when `LMP` loads a map register), weighted above Chapter 2's prose
+    description below, which has an unresolved internal inconsistency.
+  - **A separate, also-real number**: Chapter 1's product overview
+    states the S/140 as actually sold topped out at "1 Mbyte (up to
+    eight boards)" of *installed* RAM — 524,288 words. That's a real
+    fact, but it answers a different question (how much physical memory
+    any real, historically-shipped S/140 unit could actually have
+    populated) than the MMPU's addressing capability above (how far its
+    page table can point, whether or not memory is actually there).
+    Both are true; they're not in tension once kept separate. Chapter
+    2's own prose ("physical address space is 1,048,576 **bytes**
+    (1M)... addressed by a 19-bit address") is internally inconsistent
+    under any unit reading — 2^19 = 524,288, not 1,048,576, as bytes or
+    as words — likely a genuine error/looseness in the 1981 document;
+    not resolved further here, and not trusted over the `LMP` bit table.
+  - **Net effect on the "two megawords" premise that started this
+    investigation**: the real number is 1 megaword (1,048,576 words),
+    half the original premise, matching SIMH exactly — not a further
+    correction down to 512K as this note previously (and wrongly)
+    concluded. `examples/mmpu_probe.s`'s physical page 40 is safely
+    inside every version of this range regardless, so its empirical
+    result is unaffected by any of this back-and-forth.
+  - **One correction from the earlier pass does still stand**: the real
+    S/140 has only **two** user maps (A/B) — Chapter 2's "Types of
+    Maps" section, confirmed on the same page-image pass as the `LMP`
+    table above: *"The MMPU can hold two user maps, but only one can be
+    enabled at any one time."* The `Map[8][32]` array's slots for user
+    maps C/D exist in `eclipse_cpu.c` for *other* Eclipse models (the
+    file's own header comment already flagged this). Four data-channel
     maps (A-D) *is* correct for the S/140 per the same document.
 - **Map contexts**: `Map[8][32]` — 8 page-table contexts, each 32
   entries (one per logical page). `LoadMap()`'s switch on `(MapStat>>7)
@@ -225,20 +242,24 @@ nowhere close to "operating systems and other larger projects":
 - **No multi-process story**, obviously — that's what all of the above
   would need to add up to.
 - **Real-hardware caveat, updated**: the memory-size and user-map-count
-  facts above *have* now been checked against the real S/140
-  Programmer's Reference (see "A pleasant surprise" section above for
-  the citation) — the emulator's `PAGEMASK`/`MAXMEMSIZE` and its 4
-  user-map slots both turned out to be more generous than real S/140
-  hardware. What's *still* unverified against real documentation: the
-  exact bit layout of a *user*-map page-table entry (only the BMC's
-  page-table format was found spelled out with an explicit bit
-  diagram; the user/data-channel map entry's layout was inferred from
-  `eclipse_cpu.c`'s `GetMap`/`PutMap`/`LoadMap` code, not confirmed
-  against a diagram in the manual), the exact `LMP`/`NIOP`/`DOA`-`DOC`
-  instruction encodings (confirmed to exist and to have the right
-  *names* and *purposes* per Table 2.34, not bit-for-bit against
-  Chapter 4/5's dictionary entries), and everything else in this
-  section (page faults, user-mode context switching, `MapIntMode`).
+  facts above have now been checked against the real S/140
+  Programmer's Reference's own page images (see the memory-size bullet
+  above for the citation and the correction-of-a-correction history).
+  Net result: `PAGEMASK`/`MAXMEMSIZE` (1 megaword) match real S/140
+  hardware's `LMP` page-table format exactly; the user-map count (2, not
+  4) is the one place the emulator is more generous than real hardware.
+  What's *still* unverified against real documentation, and should be
+  checked the same page-image way before relying on it: the exact
+  `NIOP`/`DOA`-`DOC` instruction *encodings* (confirmed to exist and
+  have the right names/purposes/operand formats per Table 2.34 and the
+  Chapter 5 dictionary entries read so far, but not every field
+  cross-checked bit-for-bit against `eclipse_cpu.c`'s dispatch logic
+  the way `LMP`'s was), and everything else in this section (page
+  faults, user-mode context switching, `MapIntMode`). Given that even
+  the *previous* correction pass in this file turned out to have an
+  error (see above), don't treat anything in this document as settled
+  without re-checking the actual manual page, not just this file's own
+  prose summary of it.
   Treat the memory-size correction as solid; treat the rest of Phase
   1's mechanism as "consistent with the real manual's instruction
   names and purposes, not yet checked instruction-encoding-by-encoding."
