@@ -267,8 +267,15 @@ nowhere close to "operating systems and other larger projects":
   what this test's own minimal design needed, no interrupt involved.
 - **No multi-process story in the OS sense**, still — a real scheduler
   and involuntary (interrupt-driven) switching are what the above would
-  need to add up to; `MapIntMode` (untouched) is specifically about the
-  involuntary case.
+  need to add up to.
+- **`MapIntMode` (involuntary/interrupt-driven switching): investigated,
+  not attempted — see "Interrupt-safety of MMPU state" below.** The
+  save/restore mechanism itself is fully understood and citation-backed
+  (it fires automatically on any interrupt, no new code needed to
+  exercise the bookkeeping). Not attempted because every interrupt
+  source available in this SIMH build is wall-clock-calibrated, not
+  instruction-count-deterministic — the first thing in this whole
+  investigation without a cheap, single-step-precise way to test it.
 - **Real-hardware caveat, fully updated**: every core-MMPU (`MAP`
   device) instruction's dictionary entry has now been checked directly
   against the manual's own page images (not OCR) — `LMP`, `DIA` (Read
@@ -929,3 +936,94 @@ future *redesign*-sized undertaking, not an increment — treat it as
 its own investigation, starting with reading how an existing Clang
 target's address-space qualifiers actually lower to codegen, before
 committing to an approach.
+
+## Interrupt-safety of MMPU state (`MapIntMode`): investigated, not attempted
+
+Every previous phase's map switches were deliberate and sequential —
+supervisor code choosing exactly when to enter/exit user mode or swap
+maps. Whether the same state survives an *involuntary* switch (a real
+hardware interrupt landing mid-execution while `Usermap != 0`) is a
+different, harder question, and untested until this investigation.
+
+**The mechanism itself is real and well-defined** — read directly from
+`eclipse_cpu.c`, not inferred:
+- The main instruction loop's interrupt check (`if (int_req >
+  INT_PENDING && !Inhibit)`, ~line 782) runs unconditionally on *every*
+  interrupt, regardless of device: `MapIntMode = MapStat;` (saves the
+  *entire* Map Status register, not just `Usermap`), then `Usermap =
+  0; MapStat &= ~1;` (forces supervisor mode, clears the User Enable
+  bit) *before* the ordinary interrupt-vector dispatch continues. This
+  is bolted onto the generic interrupt path, not something bound to
+  the `MAP` device specifically — any interrupt source triggers it.
+- `DIA` (Read Map Status, `~line 5181`): ORs bit 0 of `MapIntMode`
+  into the returned status — `/* Bit 15 is mode asof last int */` —
+  giving a handler a direct, single-instruction way to learn "was user
+  mode active when this interrupt landed."
+- `DOA` (Load Map Status, `~line 5178`) unconditionally resets
+  `MapIntMode = 0` the moment supervisor code reloads Map Status —
+  consistent with an interrupt-return sequence that reads `MapIntMode`
+  via `DIA` once, then clears it by reloading status via `DOA` as part
+  of resuming.
+- `IORST` (I/O Reset) also unconditionally zeros it, as part of a full
+  system reset.
+
+So the *save/restore bookkeeping itself* needs no new code to exercise
+correctly — it already fires automatically. What's actually untested
+is whether real code built on it — enter user mode, take a real
+interrupt mid-execution, read `MapIntMode` via `DIA`, resume user-mode
+execution correctly — works end to end.
+
+**Why a controlled, single-steppable test wasn't achieved**: every
+prior phase's evidentiary bar depends on exact, repeatable
+determinism (single-stepping to a known instruction, or a scripted
+`eclipse` run producing byte-identical output every time). Checked
+what's actually available as an interrupt source in this SIMH build,
+looking for anything that fires deterministically after a fixed
+instruction count rather than real elapsed time:
+- The Programmable Interval Timer (`pit_svc`/`pit` in `eclipse_cpu.c`,
+  the device backing what the manual calls the RTC) is wall-clock
+  calibrated: `sim_rtcn_init`/`sim_rtcn_calb` explicitly tune the
+  delay against the host's *actual* clock (`sim_rtcn_calb` exists
+  specifically to correct for host speed variance), not a fixed
+  instruction count. That's the opposite of deterministic — the exact
+  instruction the interrupt lands on would vary by host load, and two
+  runs of the same script aren't guaranteed to land it at the same
+  point.
+- Every other I/O device flag command seen in the manual that
+  triggers `Done`/an interrupt (TTI/TTO character transmission, etc.)
+  completes via its own timed service routine the same way — none of
+  the interrupt sources available in this emulator are the
+  instruction-count-deterministic kind some SIMH devices use
+  elsewhere; all the ones checked here are calibrated to real time.
+- This project's existing interrupt-handling work is in a *different*
+  part of `~/dev` entirely (`interrupt_test*.s`, `isr_c_test.c`,
+  `__attribute__((interrupt))` support in the plain LLVM backend) —
+  useful precedent for *how* an interrupt handler is structured on this
+  ISA, not for solving the timing-determinism problem, since it isn't
+  combined with the MMPU there either.
+
+Forcing a test against a wall-clock-timed interrupt would mean either
+accepting non-reproducible pass/fail (contrary to this document's own
+evidentiary standard everywhere else) or building new tooling to pin
+down SIMH's calibration behavior precisely enough to make it
+reproducible — a distinct, open-ended sub-investigation of its own,
+not a small addition to this increment.
+
+**Conclusion**: not attempted, for a concrete, checked reason (timing
+non-determinism), not because the mechanism is unclear — the
+save/restore logic above is fully understood and citation-backed. A
+future attempt should either find/force a genuinely
+instruction-deterministic interrupt source in this SIMH build (not
+found here) or accept and explicitly design around wall-clock timing
+(e.g. a generous, deliberately-loose test that only checks *eventual*
+correct behavior rather than single-stepping to an exact instruction).
+
+This is close to the natural end of what this incremental,
+hand-written-assembly-and-single-stepping approach can verify cheaply.
+Everything reached so far (Phase 1's probe, the C-callable API,
+user-mode entry/exit, page-fault detection, a two-map switch) shares
+one property: fully deterministic, scriptable, single-instruction-
+precise. `MapIntMode` is the first thing in this whole investigation
+that doesn't have that property available for free, and the honest
+finding is that it needs different tooling, not just more effort at
+the same approach.
