@@ -233,11 +233,15 @@ nowhere close to "operating systems and other larger projects":
   Phase 2 uses inline `asm volatile(...)` instead, the same mechanism
   `examples/fps.h` already uses for the FPS100 driver, which needs no
   `eclipse-cc` changes at all.)
-- **No page-fault handling.** `Fault`/`Check`/`DIC`/`DOC` (the "Page
-  Check" read-back mechanism) exist in the emulation and are completely
-  unexercised here. A real OS needs to catch and resolve faults, not
-  just probe a pre-loaded, always-valid map entry the way this test
-  does.
+- **Page-fault handling: done for detection — see "Phase 2: page-fault
+  handling" below.** A real validity fault, triggered from genuine user
+  mode, correctly reaches a handler at the documented location with a
+  correct, directly-verified 5-word return block. Recovery/resume is
+  explicitly not attempted — the manual itself says the returned PC
+  isn't reliably correct for this fault class — and write-protection
+  faults specifically, `DIC`'s "Page Check" *read-back by the handler*
+  (this increment only used `DIA`), and `Check`/`MapIntMode` remain
+  unexercised.
 - **User-mode context switching: done — see "Phase 2: real user-mode
   context switching" below.** Real, sustained Usermap != 0 execution
   (not the single-cycle trick), entered via an indirect-reference
@@ -534,3 +538,137 @@ subtlety) despite starting from a fully-verified Phase 1/2 base, the
 standing rule from the memory-size correction saga applies with extra
 force here: don't assume the next increment (page faults especially)
 will be as clean as this one turned out to be once actually attempted.
+
+## Phase 2: page-fault handling
+
+`examples/mmpu_fault_probe.s`: a user-mode program deliberately
+triggers a real MMPU validity protection fault (building directly on
+`mmpu_usermode_probe.s`'s entry mechanism) and a real supervisor-mode
+handler, installed at the manual's documented location, correctly
+receives control with correct, directly-verified state.
+
+**Why validity, not write protection**: both are always reachable from
+user mode, but validity needs no extra enable bit — confirmed directly
+in `eclipse_cpu.c`'s `GetMap` (case 1, User A): `if (Map[1][page] ==
+INVALID && !SingleCycle) Fault = 0100000;`, no `MapStat`/WP-enable
+check at all, matching the manual's Ch. 2 p.2-30 "Validity protection is
+always enabled." Write protection additionally needs `MapStat`'s WP
+bit set — one more moving part this increment didn't need.
+
+**The "declare invalid" encoding, checked by arithmetic and then by
+the emulator's own trace, not assumed**: the manual's NOTE under `LMP`'s
+word format says "Declare a logical page invalid by setting the write
+protect bit to 1 and all of bits 6-15 to 1." For logical page 2:
+bit0(WP)=1, bits1-5(LOGICAL)=2, bits6-15(PHYSICAL)=all-1s → `0105777`
+octal as the word fed to `LMP`. After `LoadMap`'s masking
+(`Map[ctx][m] = w & MAPMASK`), this lands as exactly `INVALID`
+(`0101777`, `eclipse_cpu.c`'s own sentinel) — confirmed both by hand
+arithmetic (`0105777 & 0101777 = 0101777`) and by the simulator's own
+built-in `LMP` trace line, which independently decodes the loaded word
+and printed exactly `MAP L=2 W=1 P=1777` — matching the intended
+encoding from a second, independent source.
+
+**Fault dispatch mechanism, read directly from `eclipse_cpu.c`'s main
+loop** (the `if (Fault) {...}` block, checked once per *completed*
+instruction, not mid-instruction):
+```
+Usermap = 0;                    // current user map disabled
+MapStat &= ~01;                 // MMPU itself disabled
+if (Fault & 0100000) MapStat &= ~0170;   // only for Fault==0100000 (Validity)
+MapStat |= Fault & 077777;      // fault code merged into MapStat
+<push AC0, AC1, AC2, AC3, PC as a 5-word return block, via PutMap>
+PC = indirect(M[003]);          // JMP to loc 3 -- RAW M[3], not GetMap(3)
+```
+That last line is worth being precise about: it reads location 3 as
+flat physical memory, not through the (already-disabled) map — direct
+confirmation that Ch. 2's "unmapped logical address space" for
+locations 0-3 (Table 2.14) means what it says, not just conceptually.
+
+**Empirical verification**, with the simulator's own instruction trace
+(`d debug 100003`) plus direct memory examination of the pushed return
+block:
+```
+$ dgasm -t eclipse_s140 -f simh -o mmpu_fault_probe.simh mmpu_fault_probe.s
+$ { cat mmpu_fault_probe.simh; echo 'dep PC 50'; echo 'step 40'; \
+    echo 'e 40'; echo 'e 61'; echo 'e 62'; echo 'e 63'; echo 'e 64'; echo 'e 65'; echo 'e 112'; \
+    echo 'quit'; } | eclipse
+
+40:	000065      -- stack pointer, advanced by exactly 5 (060 -> 065)
+61:	001747      -- AC0 at fault time
+62:	000000      -- AC1 at fault time
+63:	000110      -- AC2 at fault time
+64:	000000      -- AC3 at fault time
+65:	000070      -- saved PC: the faulting ELDA's own address (000066) + 2
+                     (it's a 2-word instruction) -- the instruction
+                     *after* the fault, matching the manual's general
+                     description
+112:	000000     -- mapstat_after: DIA's read-back of MapStat post-fault
+```
+Cross-checked against the trace directly (not just the final memory
+dump): AC0/AC1/AC2/AC3 at addresses 61-64 match the trace's own printed
+register state in the instruction immediately before the fault
+(`001747 000000 000110 000000`) exactly. More tellingly, the trace
+shows the faulting `ELDA` prefixed with `A` (this project's own
+"Usermap==1" marker, same convention `mmpu_usermode_probe.s`
+established) and the very next line — `DIA 0,MAP` — has no `A` prefix
+at all, and its own address (`000071`) is `pf_handler`'s real address,
+*not* `000070` where the never-reached `HALT` sits. That's direct proof
+the fault fired, the map was disabled, and control reached the
+installed handler — not an inference from before/after state alone.
+
+**A real finding, confirmed empirically rather than left as a
+derivation**: `DIA` (Read Map Status) read back `MapStat = 0` after
+this validity fault — *not* with the manual's described "last fault
+was write-or-validity" (`WP`) status bit set. Working through why,
+from the dispatch code above: `MapStat` was `1` (from `DOA`'s earlier
+User-Enable write) going in; `&= ~01` clears it to `0`; `Fault &
+077777` for `Fault == 0100000` (pure validity, bit 15 only) is `0`, so
+the OR-in sets nothing further. Net: `0`. This means — in *this*
+emulation, for *this* specific fault path — the "last fault type"
+status bit the manual describes for `DIA` does not actually get set on
+a validity fault; only `Fault`'s low 15 bits (which is where the
+*write-protect* fault code, `010000`, actually lives) would show up
+via this mechanism. Whether that's a genuine emulator inaccuracy versus
+real S/140 hardware, or whether the manual's `DIA` bit-3 description
+applies to a different code path than the one exercised here, is not
+resolved — flagged as a real, citable discrepancy rather than smoothed
+over, consistent with this document's standing rule.
+
+**What this deliberately does not attempt: recovery/resume.** The
+manual itself (Ch. 2, p.2-30) says plainly: *"A protection fault can
+occur at any point during the execution of an instruction. Therefore,
+the return address in the fifth word of the return block is not always
+correct. For I/O protection faults, however, the fifth word will
+always be the logical address of the instruction following the
+instruction that caused the fault."* Validity/write faults are
+explicitly *not* the I/O case that gets a guaranteed-correct return
+PC. A generic "just `RTN` back and continue" demo would misrepresent
+something DG's own manual flags as unreliable for exactly this fault
+class — so this increment stops at "fault occurs, handler receives
+correct, verified state," per the standing scope this document already
+uses for open-ended items.
+
+**A real bug in this test itself, caught and fixed**: `dw 177777`
+(intended as octal, for the stack limit) has no leading zero, so
+`dgasm` parsed it as *decimal* 177777, wrapping to `133161` octal
+(46705 mod 65536) — the exact same "octal needs a leading zero" gotcha
+`mktape.py`'s own header comment already documents elsewhere in this
+project, which this test forgot to apply. Caught via the instruction
+trace showing `133161` loaded instead of the intended value; fixed by
+writing `0177777`. Confirmed via re-run that this had zero effect on
+the fault-handling result itself (the stack limit is only consulted
+for overflow *protection*, never exercised by this test's single
+5-word push).
+
+**Regression check**: `dgasm-src` CTest, re-run after this addition:
+**315 tests, 314 passing, 1 Not Run** (`memcheck_hello`, unchanged,
+`valgrind` still absent — this change touched zero `dgasm-src` files).
+`examples/sizeof_check.c` through the full `eclipse-cc` pipeline:
+byte-identical (`1 2 2 4 2 4 10 14`).
+
+**What's still open**: genuine recovery/resume after a fault (explicitly
+out of scope here, per the manual's own reliability caveat above),
+`MapIntMode`'s interrupt-safe save/restore, write-protection faults
+specifically (not attempted — validity was chosen as the simpler of
+the two), any second-user/process-switching story, and (still, as
+always) LLVM codegen integration.
