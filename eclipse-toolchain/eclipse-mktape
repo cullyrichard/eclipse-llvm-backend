@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# eclipse-mktape: compile a C source file and package it as a bootable
+# 9-track tape image (SIMH .tap format) for eclipseemu's MTA device --
+# attach with `att mta0 out.tap` and `boot mta0` boots it with no
+# operator intervention (no manual PC-set/start needed, unlike the
+# eclipse-cc/-f simh path or eclipse-run.sh's serial APL sequence).
+#
+# This is a sibling to eclipse-compile.sh, not a replacement -- same
+# compile pipeline (clang -cc1 -> llvm-link -> opt -> llc ->
+# reorder_asm.py), reproduced here rather than reused because the last
+# step differs: dgasm -f bin (a flat memory image) instead of -f ab (the
+# DG object/loader block format), since the tape's second record is DMA'd
+# directly into memory by the magtape controller rather than parsed by a
+# block-structured loader -- see tape/boot_stage2.s's header comment for
+# the full mechanism and tape/mktape.py for the image format itself.
+#
+# NB real-hardware caveat: like eclipse-compile.sh's -f ab output, this
+# has only been verified against eclipseemu (SIMH's Eclipse simulator,
+# via `boot mta0`) -- see this project's DEBUGGING_NOTES.md/README.md
+# for how rigorously the -f simh path was verified before being trusted,
+# and treat this the same way eclipse-compile.sh's own header comment
+# treats -f ab: not tried against a real magtape drive or real Eclipse
+# hardware here. Untested-in-this-project edges specific to tape: real
+# magtape density/format settings (PE vs NRZI, 800/1600 bpi), and
+# whether a real controller's boot-time DMA behaves identically to
+# eclipseemu's (this entire design was reverse-engineered from reading
+# simh's own NOVA/eclipse_cpu.c and NOVA/nova_mta.c source plus
+# empirical single-stepping in eclipseemu -- not from real hardware
+# documentation).
+#
+# Usage: eclipse-mktape [-o output.tap] input.c [input2.c ...]
+# Accepts multiple source files exactly like eclipse-cc/eclipse-compile.sh.
+
+set -euo pipefail
+
+out=""
+sources=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    *) sources+=("$1"); shift ;;
+  esac
+done
+
+if [ ${#sources[@]} -eq 0 ]; then
+  echo "usage: eclipse-mktape [-o output.tap] input.c [input2.c ...]" >&2
+  exit 1
+fi
+out="${out:-${sources[0]%.*}.tap}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LLVM_BUILD="${LLVM_BUILD:-$HOME/dev/llvm-build}"
+TOOLCHAIN="${TOOLCHAIN:-$SCRIPT_DIR}"
+CLANG="$LLVM_BUILD/bin/clang"
+LLC="$LLVM_BUILD/bin/llc"
+LLVM_LINK="$LLVM_BUILD/bin/llvm-link"
+OPT="$LLVM_BUILD/bin/opt"
+REORDER="$TOOLCHAIN/reorder_asm.py"
+RT_SRC="$TOOLCHAIN/rt/eclipse_rt.c"
+STAGE2_SRC="$SCRIPT_DIR/tape/boot_stage2.s"
+MKTAPE_PY="$SCRIPT_DIR/tape/mktape.py"
+TRIPLE="eclipse-dg-none"
+
+for tool in "$CLANG" "$LLC" "$LLVM_LINK" "$OPT"; do
+  if [ ! -x "$tool" ]; then
+    echo "eclipse-mktape: not found or not executable: $tool" >&2
+    echo "  LLVM_BUILD is currently: $LLVM_BUILD" >&2
+    echo "    LLVM_BUILD=/path/to/llvm-build $0 $*" >&2
+    exit 1
+  fi
+done
+if ! command -v dgasm >/dev/null 2>&1; then
+  echo "eclipse-mktape: dgasm not found on PATH" >&2
+  exit 1
+fi
+if [ ! -d "$TOOLCHAIN" ]; then
+  echo "eclipse-mktape: not found: $TOOLCHAIN" >&2
+  echo "    TOOLCHAIN=/path/to/eclipse-toolchain $0 $*" >&2
+  exit 1
+fi
+
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+
+RESDIR="$("$CLANG" -print-resource-dir)"
+CC1_FLAGS=(-cc1 -triple "$TRIPLE" -nostdsysteminc
+           -isystem "$RESDIR/include"
+           -I "$TOOLCHAIN/rt/include" -I "$TOOLCHAIN/rt")
+
+ll_files=()
+n=0
+for src in "${sources[@]}"; do
+  n=$((n + 1))
+  echo "[1/8] clang -cc1: $src -> IR"
+  ll="$work/src$n.ll"
+  "$CLANG" "${CC1_FLAGS[@]}" -emit-llvm "$src" -o "$ll"
+  ll_files+=("$ll")
+done
+
+echo "[2/8] clang -cc1: runtime library -> IR"
+"$CLANG" "${CC1_FLAGS[@]}" -emit-llvm "$RT_SRC" -o "$work/rt.ll"
+ll_files+=("$work/rt.ll")
+
+echo "[3/8] llvm-link: merge"
+"$LLVM_LINK" -S "${ll_files[@]}" -o "$work/merged.ll"
+
+echo "[4-7/8] opt/llc/reorder/dgasm: assemble to flat binary (record 2)"
+# See eclipse-compile.sh's own comment on this same retry loop -- the
+# soft-float/memcpy-family libcalls llc's codegen inserts aren't visible
+# to globaldce as of the opt pass below, so the exact set this program
+# needs is discovered iteratively rather than protected unconditionally
+# (which would cost real page-zero budget on every program regardless of
+# whether it uses float at all). dgasm has to run inside this same loop,
+# not after it: the "Undefined symbol" errors this loop reacts to are
+# dgasm's own (llc emits soft-float/memcpy-family calls as plain
+# undefined externals; dgasm is what actually reports them missing), not
+# something opt/llc raise on their own.
+build_and_assemble() {
+  local pub_api="$1"
+  "$OPT" -S -passes="internalize,globaldce" \
+    -internalize-public-api-list="$pub_api" \
+    "$work/merged.ll" -o "$work/stripped.ll"
+  "$LLC" -mtriple="$TRIPLE" -filetype=asm "$work/stripped.ll" -o "$work/prog.s"
+  python3 "$REORDER" "$work/prog.s" "$work/prog_r.s"
+  dgasm -t eclipse_s140 -f bin -o "$work/prog.bin" "$work/prog_r.s"
+}
+
+protected="main"
+pass=1
+while :; do
+  rm -f "$work/prog.bin"
+  output="$(build_and_assemble "$protected" 2>&1)" || true
+  if [ -f "$work/prog.bin" ]; then
+    echo "$output"
+    break
+  fi
+  missing="$(echo "$output" | grep -oE 'Undefined symbol: [A-Za-z_][A-Za-z0-9_]*' \
+             | sed 's/Undefined symbol: //' | sort -u)" || true
+  new="$(comm -23 <(echo "$missing") <(echo "$protected" | tr ',' '\n' | sort -u))" || true
+  if [ -z "$new" ] || [ "$pass" -ge 15 ]; then
+    echo "eclipse-mktape: build failed:" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+  echo "eclipse-mktape: retrying with $(echo "$new" | tr '\n' ' ')protected (needed by this program)" >&2
+  protected="$protected,$(echo "$new" | tr '\n' ',' | sed 's/,$//')"
+  pass=$((pass + 1))
+done
+
+echo "[7/8] dgasm: boot_stage2.s -> flat binary (record 1)"
+dgasm -t eclipse_s140 -f bin -o "$work/stage2.bin" "$STAGE2_SRC"
+
+echo "[8/8] mktape.py: pack into $out"
+python3 "$MKTAPE_PY" "$work/stage2.bin" "$work/prog.bin" "$out"
+
+echo
+echo "wrote $out"
+echo "boot in eclipseemu with:"
+echo "  att mta0 $out"
+echo "  boot mta0"
