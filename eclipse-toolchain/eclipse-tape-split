@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""eclipse-tape-split -- break a SIMH 9-track tape image (.tap) apart
+into its independent files by tape-mark boundary, e.g. a Zetaco-style
+tape carrying several standalone diagnostic/utility programs back to
+back rather than this toolchain's own single boot+program layout.
+
+This tool knows nothing about what's *inside* a file -- no boot-record
+convention, no entry-address recovery, no .ab decoding. It only splits
+on tape marks (see tape/mktape.py's split_tape_files() header comment
+for the exact grouping rule, including the double-tape-mark
+end-of-tape convention). eclipse-tape2ab is the sibling tool that
+decodes a single file's contents *if* it happens to follow this
+toolchain's own 2-record (256-word boot record + program record, see
+tape/boot_stage2.s.in) convention -- run it against one file's own
+records (see this tool's own output layout below) once you've located
+the file you care about; a foreign tape's bootstrap format, if it has
+one at all, won't match that convention, so there is no attempt here
+to guess it.
+
+Output layout: <outdir>/f<NN>/r<MM>.bin -- one subdirectory per file
+(NN = 1-based file index in tape order), one .bin per data record
+within that file (MM = 1-based record index within the file, each
+record's raw bytes exactly as read off tape, no byte-swapping --
+compare tape/mktape.py's unpack_big_endian_words() if a record turns
+out to hold big-endian DMA'd words the way this toolchain's own record
+2 does; that's a per-file, per-format judgment call, not something
+this tool assumes). <outdir>/MANIFEST.txt summarizes file/record
+counts and sizes and whether each file ended in a tape mark or was cut
+off by plain EOF.
+
+Usage:
+  eclipse-tape-split [-o outdir] input.tap
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tape"))
+import mktape  # noqa: E402
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("input_tap", help="a SIMH .tap tape image")
+    p.add_argument("-o", dest="outdir",
+                    help="output directory (default: input.tap's name, minus extension, "
+                         "plus '_files')")
+    args = p.parse_args()
+
+    outdir = args.outdir or os.path.splitext(args.input_tap)[0] + "_files"
+
+    try:
+        records = mktape.parse_tap(args.input_tap)
+    except ValueError as e:
+        print(f"eclipse-tape-split: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    files, eot_reached, leftover = mktape.split_tape_files(records)
+    if not files:
+        print(f"eclipse-tape-split: {args.input_tap}: no data records found "
+              f"(tape is empty or all tape marks)", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(outdir, exist_ok=True)
+    manifest_lines = [f"eclipse-tape-split: {args.input_tap} -> {outdir}", ""]
+
+    for fi, (recs, terminated) in enumerate(files, start=1):
+        fdir = os.path.join(outdir, f"f{fi:02d}")
+        os.makedirs(fdir, exist_ok=True)
+        sizes = []
+        for ri, rec in enumerate(recs, start=1):
+            rpath = os.path.join(fdir, f"r{ri:02d}.bin")
+            with open(rpath, "wb") as f:
+                f.write(rec)
+            sizes.append(len(rec))
+        status = "terminated by tape mark" if terminated else "UNTERMINATED (cut off by EOF)"
+        line = (f"f{fi:02d}: {len(recs)} record(s), sizes {sizes} bytes, "
+                f"total {sum(sizes)} bytes -- {status}")
+        print(f"eclipse-tape-split: {line}")
+        manifest_lines.append(line)
+
+    if eot_reached:
+        note = f"double tape mark (logical EOT) after f{len(files):02d}"
+        if leftover:
+            note += (f", but {len(leftover)} more tape record(s) follow it on the medium "
+                     f"(ignored -- past where a real drive's own EOT detection would stop)")
+        print(f"eclipse-tape-split: {note}")
+        manifest_lines.append(note)
+
+    with open(os.path.join(outdir, "MANIFEST.txt"), "w") as f:
+        f.write("\n".join(manifest_lines) + "\n")
+
+    print(f"wrote {len(files)} file(s) to {outdir}/ (see {outdir}/MANIFEST.txt)")
+
+
+if __name__ == "__main__":
+    main()

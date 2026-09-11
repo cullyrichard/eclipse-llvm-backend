@@ -93,6 +93,137 @@ def big_endian_bytes(words):
     return b"".join(struct.pack(">H", w & 0xFFFF) for w in words)
 
 
+def unpack_big_endian_words(data):
+    """Inverse of big_endian_bytes: tape records hold DMA'd big-endian
+    words (see this module's header comment on byte order) regardless of
+    the host's own native order."""
+    if len(data) % 2:
+        raise ValueError(f"odd byte count ({len(data)}), not a whole number of words")
+    return [struct.unpack_from(">H", data, i)[0] for i in range(0, len(data), 2)]
+
+
+def parse_tap(path):
+    """Parse a SIMH .tap tape image (see this module's header comment:
+    each record is a 4-byte little-endian byte count, the record's bytes
+    padded to even length, then the same count repeated; a tape mark is
+    a bare 4-byte zero count with no data/repeat). Returns a list of
+    records in tape order, each either bytes (a data record, trailing
+    pad byte already stripped) or None (a tape mark)."""
+    records = []
+    with open(path, "rb") as f:
+        while True:
+            hdr = f.read(4)
+            if not hdr:
+                break
+            if len(hdr) != 4:
+                raise ValueError(f"{path}: truncated record-length field near EOF")
+            (n,) = struct.unpack("<I", hdr)
+            if n == 0:
+                records.append(None)
+                continue
+            padded = n + (n & 1)
+            data = f.read(padded)
+            if len(data) != padded:
+                raise ValueError(f"{path}: truncated record data (wanted {n} bytes)")
+            trailer = f.read(4)
+            if len(trailer) != 4:
+                raise ValueError(f"{path}: missing trailing record-length field")
+            (n2,) = struct.unpack("<I", trailer)
+            if n2 != n:
+                raise ValueError(f"{path}: mismatched record-length fields ({n} vs {n2})")
+            records.append(data[:n])
+    return records
+
+
+def write_ab(entry_addr, words, path):
+    """Write a dgasm -f ab file from a flat {entry_addr, entry_addr+1,
+    ...} word list, replicating output.c's write_absolute_binary exactly
+    (see parse_ab's header comment for the block format this produces):
+    <=16-word blocks, native byte order, checksum =
+    -(block_size + addr + sum(block words)) with uint16_t wraparound.
+    Inverse of flatten()+parse_ab, modulo the original block boundaries
+    -- those aren't recoverable once a .ab has been flattened into a
+    tape image's single contiguous record, so this always emits one run
+    of maximal 16-word blocks from entry_addr to the end of words."""
+    addr = entry_addr & 0xFFFF
+    out = bytearray()
+    i, n = 0, len(words)
+    while i < n:
+        block = words[i:i + 16]
+        block_size = len(block)
+        running_total = 0
+        for w in block:
+            running_total = (running_total + (w & 0xFFFF)) & 0xFFFF
+        checksum = (-(-block_size + addr + running_total)) & 0xFFFF
+        out += struct.pack("<h", -block_size)
+        out += struct.pack("<H", addr)
+        out += struct.pack("<H", checksum)
+        for w in block:
+            out += struct.pack("<H", w & 0xFFFF)
+        i += block_size
+        addr = (addr + block_size) & 0xFFFF
+    with open(path, "wb") as f:
+        f.write(out)
+
+
+def split_tape_files(records):
+    """Group parse_tap()'s raw record list into logical files by tape
+    mark, standard 9-track convention: a run of consecutive data
+    records terminated by one tape mark is a file (e.g. a Zetaco-style
+    tape carrying several independent bootable utilities, each its own
+    file). Two consecutive tape marks is the conventional double-mark
+    logical end-of-tape signal, not a zero-record file -- splitting
+    stops there, matching what a real drive's own EOT detection would
+    do, and anything physically past it on the medium is returned
+    separately rather than folded into another "file". A run of data
+    records with no closing tape mark before physical end-of-medium
+    (plain EOF) is still returned, marked unterminated, rather than
+    silently dropped -- the tape is truncated or was never properly
+    closed, not empty.
+
+    This only knows tape-mark boundaries; it has no opinion on what's
+    inside a file (e.g. this toolchain's own 2-record boot+program
+    shape, see eclipse-tape2ab -- a foreign tape's own bootstrap
+    convention, if any, won't match that one).
+
+    Returns (files, eot_reached, leftover):
+      files: list of (record_list, terminated_bool) tuples, tape order.
+      eot_reached: True if a double tape mark was seen.
+      leftover: records physically after that double mark, if any
+                (eot_reached implies this may be non-empty; empty list
+                if eot_reached is False or nothing followed the marks).
+    """
+    files = []
+    i, n = 0, len(records)
+    while i < n:
+        if records[i] is None:
+            # a mark with nothing accumulated since the last boundary:
+            # either the tape starts with a mark, or the previous
+            # iteration already consumed the first of a pair as a file
+            # terminator and this is a lone leftover -- not an EOT pair
+            # by itself (that's detected below, at the point the first
+            # mark of the pair is seen). Just an empty-file marker.
+            i += 1
+            continue
+        current = []
+        while i < n and records[i] is not None:
+            current.append(records[i])
+            i += 1
+        if i >= n:
+            files.append((current, False))  # cut off by EOF, no closing mark
+            break
+        # records[i] is the closing mark for `current`. If it's
+        # immediately followed by a second mark, that pair is the
+        # double-tape-mark EOT signal -- this file still counts (it did
+        # get a proper terminator), but splitting stops right there.
+        if i + 1 < n and records[i + 1] is None:
+            files.append((current, True))
+            return files, True, records[i + 2:]
+        files.append((current, True))
+        i += 1
+    return files, False, []
+
+
 def parse_ab(path):
     """Parse a dgasm -f ab file (see output.c's write_absolute_binary):
     a sequence of blocks, each [int16 -blocksize][uint16 addr]

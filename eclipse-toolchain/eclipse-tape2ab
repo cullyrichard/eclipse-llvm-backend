@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""eclipse-tape2ab -- unpack a bootable 9-track tape image (SIMH .tap
+format, as produced by eclipse-mktape/eclipse-ab2tape/tape/mktape.py)
+back into a dgasm -f ab file, the inverse of eclipse-ab2tape.
+
+Usage:
+  eclipse-tape2ab [-o output.ab] [--no-verify] input.tap
+
+How the entry address is recovered: tape record 1 is boot_stage2.s.in's
+assembled image, and its very first data word -- address 1, tape record
+1's word offset 1, see boot_stage2.s.in's `loadaddr: dw @ENTRY@` -- is
+the program's entry address, substituted in literally by mktape.py at
+build time. Record 2 (the program itself) is DMA'd straight into memory
+with no header of its own, so record 1's loadaddr word is the only place
+on the tape that names where record 2 belongs; everything else (word
+count, addresses of individual words) follows from that plus record 2's
+own length.
+
+Round-trip note: eclipse-ab2tape flattens a .ab file's blocks into one
+contiguous image before writing the tape (see its own header comment on
+gaps), so the original block boundaries -- and any all-zero padding
+inserted for gaps between blocks -- aren't recoverable. This tool always
+emits one run of maximal 16-word blocks from the recovered entry address
+to the end of record 2, which is a different (but data-equivalent, same
+address -> word mapping) block layout than an .ab file that started with
+disjoint blocks would have had.
+
+Verification: by default, reassembles boot_stage2.s.in for the recovered
+entry address (the same call mktape.py itself makes when building a
+tape) and checks it byte-for-byte against tape record 1. This catches a
+tape that wasn't built by this toolchain, or was built by a
+build_tape()-compatible tool but for a different entry than record 1
+actually reflects, rather than silently emitting a wrong .ab. Needs
+dgasm on PATH (see --dgasm); pass --no-verify to skip if it isn't
+available.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tape"))
+import mktape  # noqa: E402
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("input_tap", help="a SIMH .tap tape image built by this toolchain")
+    p.add_argument("-o", dest="out", help="output .ab path (default: input.tap -> input.ab)")
+    p.add_argument("--dgasm", default="dgasm", help="dgasm executable (default: dgasm on PATH)")
+    p.add_argument("--no-verify", action="store_true",
+                    help="skip reassembling boot_stage2.s.in to confirm the recovered "
+                         "entry address (default: verify)")
+    args = p.parse_args()
+
+    out = args.out or os.path.splitext(args.input_tap)[0] + ".ab"
+
+    try:
+        records = [r for r in mktape.parse_tap(args.input_tap) if r is not None]
+        if len(records) != 2:
+            raise ValueError(
+                f"{args.input_tap}: found {len(records)} data record(s), expected exactly 2 "
+                f"(boot record + program record) -- this toolchain's tapes never have more; "
+                f"a tape with extra records (e.g. multiple files, a label record) can't be "
+                f"unpacked without silently dropping data"
+            )
+        record1, record2 = records[0], records[1]
+        if len(record1) != 512:
+            raise ValueError(
+                f"{args.input_tap}: record 1 is {len(record1)} bytes, expected 512 "
+                f"(256 words) -- not a tape image this toolchain built"
+            )
+        if len(record2) % 2:
+            raise ValueError(f"{args.input_tap}: record 2 is {len(record2)} bytes, an odd byte count")
+
+        record1_words = mktape.unpack_big_endian_words(record1)
+        entry = record1_words[1]
+        program_words = mktape.unpack_big_endian_words(record2)
+
+        if not args.no_verify:
+            expected_body = mktape.assemble_stage2(entry, args.dgasm)[:255]
+            actual_body = record1_words[1:256]
+            if expected_body != actual_body:
+                raise RuntimeError(
+                    f"{args.input_tap}: record 1 doesn't match boot_stage2.s.in reassembled "
+                    f"for entry {entry:#o} -- this tape wasn't built by this toolchain for "
+                    f"that entry, refusing to guess (pass --no-verify to skip this check)"
+                )
+
+        mktape.write_ab(entry, program_words, out)
+    except (ValueError, RuntimeError, AssertionError) as e:
+        print(f"eclipse-tape2ab: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    span = len(program_words)
+    print(f"eclipse-tape2ab: {args.input_tap}: recovered entry={entry:#o}, "
+          f"{span} words spanning {entry:#o}-{entry + span - 1:#o}")
+    print(f"wrote {out}")
+
+
+if __name__ == "__main__":
+    main()
