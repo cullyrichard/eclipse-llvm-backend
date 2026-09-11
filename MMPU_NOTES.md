@@ -238,13 +238,15 @@ nowhere close to "operating systems and other larger projects":
   unexercised here. A real OS needs to catch and resolve faults, not
   just probe a pre-loaded, always-valid map entry the way this test
   does.
-- **No user-mode context switching.** Everything here stays in
-  supervisor mode via the single-cycle trick specifically *to avoid*
-  needing to enter/exit user mode correctly. A real process model needs
-  that (`Usermap = Enable` on some real context-switch path — not yet
-  identified/verified here), plus `Map31`'s shared-top-page convention,
-  plus interrupt-safe save/restore of map state (`MapIntMode` exists for
-  exactly this and is untouched).
+- **User-mode context switching: done — see "Phase 2: real user-mode
+  context switching" below.** Real, sustained Usermap != 0 execution
+  (not the single-cycle trick), entered via an indirect-reference
+  trigger and exited via `NIOP`, verified across multiple instructions
+  with the simulator's own instruction trace. Still open: protection
+  faults (this test's map entries are always valid, never exercises
+  `Fault`), `MapIntMode`'s interrupt-safe save/restore of map state
+  across a real interrupt, and any second-user (map B) or
+  process-switching story — see that section's own closing bullet.
 - **No multi-process story**, obviously — that's what all of the above
   would need to add up to.
 - **Real-hardware caveat, fully updated**: every core-MMPU (`MAP`
@@ -389,3 +391,146 @@ byte-identical (`1 2 2 4 2 4 10 14`) before and after.
 **What Phase 2 still doesn't have**: LLVM codegen integration, page
 fault handling, and user-mode context switching — see the list above,
 now with exactly one item checked off.
+
+## Phase 2: real user-mode context switching
+
+`examples/mmpu_usermode_probe.s`: proves genuine, sustained Eclipse
+S/140 user-mode execution — `Usermap` actually nonzero across multiple
+instructions — not Phase 1/2's single-cycle trick, which never leaves
+supervisor mode at all.
+
+**The real danger, confirmed in source before designing around it**:
+once `Usermap != 0`, `eclipse_cpu.c`'s main loop fetches *every*
+instruction through the map (`IR = GetMap(PC)`, read directly, not
+assumed) — unlike the single-cycle mechanism, which only ever redirects
+one data access. Getting this wrong risks the CPU fetching garbage for
+its own next instruction. This program avoids the risk rather than
+handling it: it stays entirely within logical/physical page 0 (`org
+050`) and loads an identity map entry there (logical page 0 -> physical
+page 0), so code/data in that page reads identically regardless of
+`Usermap`'s value — the transition is invisible to normal execution. A
+second, deliberately non-identity entry (logical page 2 -> physical
+page 0150 octal) is what actually demonstrates translation is real.
+
+**Trigger, confirmed in source, not just the manual**: the manual's
+`DOA` ("Load Map Status") bit 15/User Enable says the switch happens
+"on the first memory reference after the next indirect reference or
+return type instruction." Reading `eclipse_cpu.c`'s `effective()`
+directly confirms it precisely: its indirect-chain loop does `MA =
+GetMap(...); if (MapStat & 1) { Usermap = Enable; Inhibit = 0; }` on
+every indirect fetch — so a plain `LDA 0,@iptr` is a real, minimal,
+controllable trigger, avoiding the stack setup `POPJ`/`RTN`/etc (the
+manual's other documented triggers) would need.
+
+**A subtlety that would have silently broken a naive design**: the
+manual's "Unmapped Mode" section describes logical page 31 as always
+specially mapped via a separate `Map31` register — but `GetMap`'s own
+`case 0` (Usermap==0) vs `case 1`/`case 2` (real user maps) confirm
+that only applies while `Usermap==0`. Once genuinely in user mode, page
+31 is governed by the ordinary per-map `Map[ctx][31]` entry like every
+other page, not `Map31`. This program never references page 31 at all,
+sidestepping the question rather than relying on an unloaded/stale
+`Map[1][31]` entry behaving usefully.
+
+**Return path, confirmed in source**: the manual's `NIOP` entry ("Map
+Single Cycle / Disable User Mode") documents dual behavior depending on
+current mode — from supervisor, it arms single-cycle mapping (Phase
+1/2's mechanism); "from user mode — if LEF mode and I/O protection are
+disabled, this instruction turns off the MMPU." Confirmed directly in
+`eclipse_cpu.c`'s `DEV_MAP` pulse handler: `if (Usermap) { MapStat &=
+0177776; Usermap = 0; Inhibit = 0; } else { SingleCycle = Enable; ...
+}` — the same instruction, opposite effect, depending on whether
+`Usermap` is already active.
+
+**A real bug found and fixed, the same way Phase 2's `AC2` bug was —
+by not trusting the first result**: `var farlogaddr = 04200`, intended
+as a compile-time constant for `ESTA`'s absolute-address operand,
+turned out to allocate a real storage *word* instead — confirmed by
+reading `dgasm-src/assembler.c`'s `VARIABLE_NUMBER` case directly:
+`buffer[current_addr] = eval(...)`, i.e. `var X = N` is exactly
+equivalent to `X: dw N`, not a symbolic alias with no storage cost.
+`ESTA` then encoded the *address of that word* (0110 octal) rather
+than `04200` itself. Caught by enabling `eclipse_cpu.c`'s own built-in
+per-instruction trace (`d debug 100003`, then reading `trace.log`) and
+noticing `ESTA 1,110` where `ESTA 1,4200` was expected. Fixed by using
+the literal `04200` directly in the instruction instead of a named
+`var`.
+
+**A real SIMH console limitation found and worked around, not silently
+avoided**: this `eclipse` binary's `DEVICE` struct declares
+`awidth=17` (`eclipse_cpu.c`'s `cpu_dev`), so the interactive console's
+`e`/`d` commands cannot address physical memory at or above 128K words
+(`0400000` octal) — confirmed empirically by bisection (`e 377777`
+works, `e 400000` doesn't) and unaffected by `set cpu 1024k`. This has
+no effect on a *running program's* own `GetMap`/`PutMap` (which touch
+`M[]` directly in C, not through this console path) — only on
+interactively examining physical memory above that threshold. This is
+likely why Phase 2's own far-page tests (`mmpu_far_multi_test.c`,
+physical pages up to 0700 octal — which, computed out, land past this
+same 128K boundary) verified via the C program's own printed output
+rather than console `e`: they would have hit this same wall. This
+test's far physical page (0150 octal) was chosen small enough to stay
+under the ceiling instead, matching `mmpu_probe.s`'s own precedent,
+rather than changing the underlying `awidth` declaration (a SIMH
+source change, out of scope here).
+
+**Empirical verification**, with the simulator's built-in instruction
+trace enabled (`d debug 100003`) to show the `Usermap` transition
+directly, not just infer it from before/after memory state:
+
+```
+$ dgasm -t eclipse_s140 -f simh -o mmpu_usermode_probe.simh mmpu_usermode_probe.s
+$ { cat mmpu_usermode_probe.simh; echo 'dep PC 50'; echo 'step 40'; \
+    echo 'e PC'; echo 'e 4200'; echo 'e 320200'; echo 'quit'; } | eclipse
+
+HALT instruction, PC: 00065 (JMP 0)
+PC:	00065
+4200:	000000
+320200:	013056
+```
+
+- `4200` (octal) = logical page 2, offset 0200 — examined after
+  returning to supervisor mode, where logical=physical directly:
+  **0, untouched** — the write never touched physical page 2.
+- `320200` (octal) = physical page 0150 octal `<< 10` | offset 0200 —
+  **013056 octal = 5678 decimal**, exactly the value `ESTA` wrote while
+  genuinely in user mode.
+
+The instruction trace shows the mechanism directly, not just the
+before/after result:
+```
+  000057 acs: 000000 000000 000105 000000 0 LDA 0,@105
+ A000060 acs: 001747 000000 000105 000000 0 LDA 1,107
+ A000061 acs: 001747 013056 000105 000000 0 ESTA 1,4200
+ A000063 acs: 001747 013056 000105 000000 0 NIOP 0,MAP
+63 NIO 0 (No I/O, clear faults)
+63 xxxP (Single Cycle)
+  000064 acs: 001747 013056 000105 000000 0 HALT
+```
+The leading `A` — this project's own trace format for "Usermap==1",
+confirmed in `eclipse_cpu.c`'s trace code (`if (Usermap==1)
+strcpy(debmap,"A")`) — appears starting exactly at PC `000060`, the
+instruction immediately after the indirect-reference trigger, and
+persists across `LDA`, `ESTA`, and `NIOP` (three consecutive
+instructions, not a single blip), then disappears for the final
+`HALT`: direct proof that real, sustained user-mode translation was
+active for more than one instruction and was cleanly deactivated by
+`NIOP` — not just an inference from memory contents.
+
+**Regression check**: `dgasm-src` CTest, re-run after this change:
+**315 tests, 314 passing, 1 Not Run** (`memcheck_hello`, unchanged,
+`valgrind` still absent — this change touched zero `dgasm-src` files).
+`examples/sizeof_check.c` through the full `eclipse-cc` pipeline:
+byte-identical (`1 2 2 4 2 4 10 14`).
+
+**What this still doesn't cover**: protection faults (this test's map
+entries are always valid, deliberately never triggers `Fault`),
+`MapIntMode`'s interrupt-safe save/restore of map state across a real
+interrupt, any second-user (map B) or process-switching story, and
+(still, as always) LLVM codegen integration. Given how many real,
+non-obvious findings turned up in *this* increment alone (the `var`
+storage-allocation bug, the console `awidth` limit, the page-31
+subtlety) despite starting from a fully-verified Phase 1/2 base, the
+standing rule from the memory-size correction saga applies with extra
+force here: don't assume the next increment (page faults especially)
+will be as clean as this one turned out to be once actually attempted.
