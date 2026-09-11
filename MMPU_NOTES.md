@@ -241,25 +241,33 @@ nowhere close to "operating systems and other larger projects":
   exactly this and is untouched).
 - **No multi-process story**, obviously — that's what all of the above
   would need to add up to.
-- **Real-hardware caveat, updated**: the memory-size and user-map-count
-  facts above have now been checked against the real S/140
-  Programmer's Reference's own page images (see the memory-size bullet
-  above for the citation and the correction-of-a-correction history).
-  Net result: `PAGEMASK`/`MAXMEMSIZE` (1 megaword) match real S/140
-  hardware's `LMP` page-table format exactly; the user-map count (2, not
-  4) is the one place the emulator is more generous than real hardware.
-  What's *still* unverified against real documentation, and should be
-  checked the same page-image way before relying on it: the exact
-  `NIOP`/`DOA`-`DOC` instruction *encodings* (confirmed to exist and
-  have the right names/purposes/operand formats per Table 2.34 and the
-  Chapter 5 dictionary entries read so far, but not every field
-  cross-checked bit-for-bit against `eclipse_cpu.c`'s dispatch logic
-  the way `LMP`'s was), and everything else in this section (page
-  faults, user-mode context switching, `MapIntMode`). Given that even
-  the *previous* correction pass in this file turned out to have an
-  error (see above), don't treat anything in this document as settled
-  without re-checking the actual manual page, not just this file's own
-  prose summary of it.
-  Treat the memory-size correction as solid; treat the rest of Phase
-  1's mechanism as "consistent with the real manual's instruction
-  names and purposes, not yet checked instruction-encoding-by-encoding."
+- **Real-hardware caveat, fully updated**: every core-MMPU (`MAP`
+  device) instruction's dictionary entry has now been checked directly
+  against the manual's own page images (not OCR) — `LMP`, `DIA` (Read
+  Map Status), `DIC` (Page Check), `DOA` (Load Map Status), `DOB` (Map
+  Page 31), `DOC` (Initiate Page Check), `NIOP` (Map Single Cycle).
+  Results:
+  - **1-megaword memory size, triply confirmed**: `LMP`'s loaded-word
+    format, `DOB`'s "Map Page 31" AC format, and `DOC`'s "Initiate Page
+    Check" AC format all independently use the same 10-bit PHYSICAL
+    field pattern. All three agree with `PAGEMASK`/`MAXMEMSIZE`.
+  - **2-user-map limit, now confirmed by the hardware's own encoding
+    table, not just prose**: `DOA`'s Map Select field and `DOC`'s Map
+    field (both 3-bit, bits 6-8) list all 8 possible codes identically
+    — `000`=User A, `010`=User B, `100`-`111`=the four data-channel
+    maps, and **`001`/`011` explicitly marked "Reserved."** That's the
+    real hardware's own instruction format declaring the "extra"
+    user-map codes unused, stronger evidence than the earlier prose
+    citation alone.
+  - **`NIOP`'s behavior matches `eclipse_cpu.c`'s `SingleCycle`
+    mechanism** as this document already described it from source: "the
+    instruction maps one memory reference using the last user map" —
+    no correction needed to that section.
+  - **Still unverified**: everything about page faults, user-mode
+    context switching, and `MapIntMode` — none of Phase 2's harder
+    problems have been checked against the manual yet.
+  Given that the *previous* correction pass in this file itself
+  contained an error (see the memory-size bullet's history above),
+  the standing rule for this document is: trust a claim here only as
+  far as its citation — a page/table reference means it was checked
+  against that image directly; anything without one hasn't been.
