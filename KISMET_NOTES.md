@@ -1,5 +1,26 @@
 # Kismet (DG-Disk Storage Subsystem, Models 6160/6161/6214) — driver scoping
 
+**Post-unification pointer:** the real build conflict this file's own
+"A real cross-driver conflict, found by checking the sibling Vulcan
+effort" section documents below was fixed by refactoring
+`examples/zebra.c`, `examples/vulcan.c`, and `examples/kismet.c` onto a
+shared DSKP-family register core (`examples/dskp_common.h`/`.c`) with a
+compile-time variant selector, so exactly one generation's driver is
+ever linked into a build. See `DSKP_FAMILY_NOTES.md` at the repo root
+for the unification design, the empirical re-confirmation that the
+conflict is actually fixed (not just argued), and this file's own two
+documented manual inconsistencies (DOC/DIC bit 1, DIB alt-mode-1 bit 4)
+carried forward unresolved, exactly as recorded below — not silently
+resolved differently by the refactor. Everything below this point
+describes the original, pre-unification scoping pass and is otherwise
+unchanged and still accurate — `kismet.h`'s public API
+(`kismet_read_block`/`kismet_write_block`) and Kismet's own geometry
+constants are unchanged in shape by that refactor; `kismet.c`'s
+internal register discipline did change (global+`ELDA`/`ESTA` to
+shared-function-call "r"-constrained operands) — see
+`DSKP_FAMILY_NOTES.md` and `kismet.c`'s own header comment for why that
+specific change is safe.
+
 Prompted by a real question: the user owns real physical "Kismet" disk
 hardware (DG Models 6160/6161/6214) and wants block-level driver
 support for it. This is one of four parallel driver-scoping efforts on

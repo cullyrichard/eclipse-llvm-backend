@@ -1,5 +1,20 @@
 # Vulcan (DG Model 6122 DG-Disc Storage Subsystem) — driver scoping
 
+**Post-unification pointer:** `examples/vulcan.c` was later refactored
+to sit on top of a shared DSKP-family register core
+(`examples/dskp_common.h`/`.c`), also used by `examples/zebra.c` and
+`examples/kismet.c`, after all three independently discovered they
+share the identical device select code and `DSKP` register convention.
+See `DSKP_FAMILY_NOTES.md` at the repo root for the unification design
+(including this file's own split-sector/count-MSB subtlety, quoted
+directly and preserved unchanged in the refactor) and fresh
+verification that the shared-core build still compiles/assembles
+cleanly. Everything below this point describes the original,
+pre-unification scoping pass and is otherwise unchanged and still
+accurate — `vulcan.h`'s public API (`vulcan_read_block`/
+`vulcan_write_block`) and Vulcan's own geometry constants are unchanged
+in shape by that refactor.
+
 Prompted by a real question in service of the larger OS-scoping effort:
 the user owns real physical "Vulcan" disk hardware and wants block-level
 driver support for it. This is one of four parallel driver-scoping

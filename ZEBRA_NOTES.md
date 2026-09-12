@@ -1,5 +1,20 @@
 # Zebra (DG 6060-series DG-DISC Storage Subsystem) — driver scoping notes
 
+**Post-unification pointer:** `examples/zebra.c` was later refactored
+to sit on top of a shared DSKP-family register core
+(`examples/dskp_common.h`/`.c`), also used by `examples/vulcan.c` and
+`examples/kismet.c`, after all three independently discovered they
+share the identical device select code and `DSKP` register convention
+this file's own "An unplanned but strong cross-check: Vulcan" section
+below already flagged. See `DSKP_FAMILY_NOTES.md` at the repo root for
+the unification design, what's shared vs. Zebra-specific, and fresh
+verification that the shared-core build still compiles/assembles
+cleanly. Everything below this point describes the original,
+pre-unification scoping pass and is otherwise unchanged and still
+accurate — `zebra.h`'s public API (`zebra_read_block`/
+`zebra_write_block`/`zebra_status`) and Zebra's own geometry constants
+are unchanged in shape by that refactor.
+
 Prompted by the user's real hardware: they own a physical DG "Zebra"
 disk subsystem (Model 6060/6061/6067 DG-DISC Storage Subsystem) and
 want block-level driver support for it, toward a Unix-like OS this
