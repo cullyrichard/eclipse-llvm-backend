@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""eclipse-floppy2ab -- unpack a 6030 floppy image (.img, as produced by
+eclipse-ab2floppy/tape/floppy.py) back into a dgasm -f ab file, the
+inverse of eclipse-ab2floppy.
+
+Usage:
+  eclipse-floppy2ab [-o output.ab] [--no-verify] input.img
+
+How the entry address and word count are recovered: track 0 sector 0 is
+boot_stage2_floppy.s.in's assembled image, and its first two data words
+-- address 1 (word count) offset 1) and address 2 (word offset 2) -- are
+the program's entry address and word count, substituted in literally by
+tape/floppy.py at build time (see that file's header comment). The
+program's raw words themselves live at a fixed offset (word 0400 octal,
+LANDING_ZONE_ADDR in tape/floppy.py) regardless of the real entry
+address -- that's the whole point of the stage2 relocator -- so nwords
+from sector 0 is the only way to know how much of that fixed-size
+landing zone is real program vs. trailing zero-padding.
+
+Verification: by default, reassembles boot_stage2_floppy.s.in for the
+recovered (entry, nwords) (the same call tape/floppy.py itself makes
+when building an image) and checks it byte-for-byte against track 0
+sector 0. This catches an image that wasn't built by this toolchain, or
+was built by a build_floppy()-compatible tool but for different values
+than sector 0 actually reflects, rather than silently emitting a wrong
+.ab. Needs dgasm on PATH (see --dgasm); pass --no-verify to skip if it
+isn't available.
+
+Round-trip note: like eclipse-tape2ab, this can't recover the original
+.ab file's block boundaries (eclipse-ab2floppy flattens them into one
+contiguous run before writing the image) -- it always emits one run of
+maximal 16-word blocks from the recovered entry address, a different
+(but data-equivalent) block layout than a .ab file that started with
+disjoint blocks would have had.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tape"))
+import floppy  # noqa: E402
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("input_img", help="a 6030 .img built by this toolchain")
+    p.add_argument("-o", dest="out", help="output .ab path (default: input.img -> input.ab)")
+    p.add_argument("--dgasm", default="dgasm", help="dgasm executable (default: dgasm on PATH)")
+    p.add_argument("--no-verify", action="store_true",
+                    help="skip reassembling boot_stage2_floppy.s.in to confirm the "
+                         "recovered entry/word count (default: verify)")
+    args = p.parse_args()
+
+    out = args.out or os.path.splitext(args.input_img)[0] + ".ab"
+
+    try:
+        entry, nwords = floppy.floppy2ab(
+            args.input_img, out, dgasm_cmd=args.dgasm, verify=not args.no_verify)
+    except (ValueError, RuntimeError, AssertionError) as e:
+        print(f"eclipse-floppy2ab: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"eclipse-floppy2ab: {args.input_img}: recovered entry={entry:#o}, "
+          f"{nwords} words spanning {entry:#o}-{entry + nwords - 1:#o}")
+    print(f"wrote {out}")
+
+
+if __name__ == "__main__":
+    main()

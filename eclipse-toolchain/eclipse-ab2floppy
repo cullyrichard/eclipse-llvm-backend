@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""eclipse-ab2floppy -- package an already-assembled DG object/loader
+absolute-binary file (dgasm -f ab, or eclipse-compile.sh -o foo.ab) as a
+raw sector image (.img) matching the real DG Model 6030 flexible-
+diskette subsystem's geometry, bootable via the 6030's own Program Load
+hardware convention. No recompilation.
+
+Sibling to eclipse-ab2tape: same idea (package an arbitrary already-
+assembled .ab, entry address not assumed fixed -- see --entry below),
+different target medium. See tape/floppy.py's header comment for the
+full geometry/boot-mechanism citation trail (DG "Model 6030 Diskette
+Subsystem Technical Reference", 014-000065-03, manual-verified geometry
+and track-0 boot handoff; project-authored stage2 relocator beyond
+that, verified only against this project's own SIMH ECLIPSE build, not
+real 6030 hardware -- see FLOPPY_NOTES.md).
+
+Usage:
+  eclipse-ab2floppy [-o output.img] [--entry ADDR] input.ab
+
+--entry defaults to the lowest address any block in the .ab file loads
+at, same default and same caveat as eclipse-ab2tape's --entry.
+
+Size limit: the program (after flattening -- see the gap note below)
+must fit in tape/floppy.py's MAX_PROGRAM_WORDS (1792 words / 3584 bytes)
+-- everything the 6030's own Program Load hardware auto-loads from
+track 0, minus the stage2 relocator's own 256-word sector-0 budget. This
+tool refuses to build an oversized image rather than silently
+truncating; see FLOPPY_NOTES.md for what a bigger program would need.
+
+Gap note: same as eclipse-ab2tape -- the .ab file's blocks are flattened
+into one contiguous image spanning its lowest to highest used address,
+any gap zero-filled (see tape/mktape.py's flatten()). Fine for this
+toolchain's own contiguous output; a .ab file with widely separated
+blocks could flatten into something that exceeds the 1792-word limit
+even though the sum of its actual blocks is small.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tape"))
+import floppy  # noqa: E402
+import mktape  # noqa: E402
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("input_ab", help="a dgasm -f ab file")
+    p.add_argument("-o", dest="out", help="output .img path (default: input.ab -> input.img)")
+    p.add_argument("--entry", type=mktape.parse_addr, default=None,
+                    help="entry address, e.g. 050 or 0100 (default: lowest "
+                         "address used in input_ab)")
+    p.add_argument("--dgasm", default="dgasm", help="dgasm executable (default: dgasm on PATH)")
+    args = p.parse_args()
+
+    out = args.out or os.path.splitext(args.input_ab)[0] + ".img"
+
+    try:
+        words_by_addr = mktape.parse_ab(args.input_ab)
+        lo, program_words = mktape.flatten(words_by_addr)
+        entry = args.entry if args.entry is not None else lo
+        if entry != lo:
+            print(f"eclipse-ab2floppy: entry {entry:#o} overrides the file's "
+                  f"lowest loaded address {lo:#o}", file=sys.stderr)
+        span = len(program_words)
+        print(f"eclipse-ab2floppy: {args.input_ab}: {len(words_by_addr)} words "
+              f"in {span} words spanning {lo:#o}-{lo + span - 1:#o}, entry={entry:#o}")
+        sector0_bytes, prog_bytes, total_bytes = floppy.build_floppy(
+            entry, program_words, out, args.dgasm)
+    except (ValueError, RuntimeError, AssertionError) as e:
+        print(f"eclipse-ab2floppy: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"wrote {out}: {total_bytes} bytes "
+          f"({floppy.CYLS} cyls x {floppy.SECTORS_PER_TRACK} sectors x "
+          f"{floppy.WORDS_PER_SECTOR} words), track0 sector0={sector0_bytes}B "
+          f"(boot), program={prog_bytes}B")
+    print("attach/boot in eclipseemu (ECLIPSE simulator) with:")
+    print(f"  set dkp0 6030")
+    print(f"  att dkp0 {out}")
+    print("  boot dkp0")
+
+
+if __name__ == "__main__":
+    main()

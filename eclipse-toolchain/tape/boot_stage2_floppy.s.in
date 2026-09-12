@@ -1,0 +1,118 @@
+// boot_stage2_floppy.s.in -- second-stage DG 6030 diskette bootstrap for
+// the Eclipse LLVM backend. Template, not directly assemblable:
+// floppy.py substitutes @ENTRY@ (the program's real entry address) and
+// @NWORDS@ (its word count) below, writes the result to a temp file, and
+// assembles *that* with dgasm -f bin, splicing the result into word
+// offset 0 of track 0's sector 0 -- see floppy.py's header comment and
+// FLOPPY_NOTES.md for the full boot sequence and its citations.
+//
+// Real, manual-verified mechanism this relies on (DG "Model 6030
+// Diskette Subsystem Technical Reference", 014-000065-03, pages I-9 and
+// III-4 -- see FLOPPY_NOTES.md for the exact page citations):
+//   "A diskette drive assigned unit number 0 may be a bootstrap device
+//   using the Program Load Option... Pressing the Program Load switch
+//   loads a short program, usually from a special ROM in the processor,
+//   which initiates a read operation from the first sector in track 0.
+//   Unless the read operation is terminated by the program, reading
+//   continues until 8 sectors from track 0 have been transferred."
+// The manual's own console-deposit procedure for computers *without*
+// the Program Load option confirms where that hardware read lands and
+// where it hands off control: it has the operator deposit a "start the
+// disk" instruction at location 000376 and a bare "JMP 377" at location
+// 000377, then start execution at 000376 -- i.e. the same "spin at
+// address 0377 until an in-flight DMA overwrites that exact word, then
+// fall into whatever instruction is now sitting there" trap this
+// project's own tape/boot_stage2.s.in already documents and relies on
+// for the 9-track magtape boot ROM (see that file's header comment,
+// "confirmed empirically" against eclipseemu). SIMH's own nova_dkp.c
+// dkp_boot() independently corroborates this: its DKP boot ROM is just
+// `IORST; NIOS DKP; JMP 377` at addresses 0375-0377.
+//
+// track 0 (8 sectors x 256 words = 2048 words) is what the Program Load
+// hardware DMAs to memory address 0 in one operation before handing off
+// at address 0377 -- see floppy.py's build_floppy() for the exact
+// layout: sector 0 (words 0-0377, this file's own assembled image) is
+// followed by sectors 1-7 (words 0400-3777 octal, 1792 words) holding
+// the real program's raw words verbatim. This file's only job is to
+// relocate those 1792 words from their fixed hardware landing zone
+// (0400 octal) to the program's real entry address (which is not
+// generally 0400 -- this toolchain's own C pipeline fixes it at 050,
+// and an arbitrary packaged .ab file can use any address at all), then
+// jump there. No further diskette I/O is needed or attempted: unlike
+// tape (where the boot ROM's one-shot DMA reads exactly one record and
+// stage2 must issue its own second read for the program), the 6030's
+// Program Load hardware has *already* fetched the entire first track --
+// including the program's own bytes -- by the time this code gets
+// control at all.
+//
+// Known limit: this only relocates within what Program Load's hardware
+// already auto-loaded (track 0, 2048 words, minus this file's own
+// 256-word sector 0 budget = 1792 words / 3584 bytes max program size).
+// floppy.py's build_floppy() enforces this and refuses to build a
+// larger image rather than silently truncating. A program that doesn't
+// fit would need a stage2 that drives the 6030 controller itself to
+// read track 1 onward (SPECIFY DISC ADDRESS AND SECTOR COUNT / SPECIFY
+// COMMAND AND CYLINDER / etc., per the same manual's Section I
+// Programmer's Reference) -- real register-level driver work in the
+// spirit of this project's Kismet/Vulcan/Zebra probes, not attempted
+// here. See FLOPPY_NOTES.md for the honest scope line.
+//
+// Known caveat this design does NOT share with the tape path: tape's
+// record 1 is *exactly* 256 words, so the boot ROM's DMA of record 1
+// cannot possibly finish (and hand off at 0377) before record 1's own
+// last word (which lives at 0377) has arrived -- there's no window for
+// stage2 to run early. SIMH's DKP model transfers a whole multi-sector
+// command as one atomic simulated event, so the same is true here in
+// practice against eclipseemu: this file cannot begin executing until
+// nova_dkp.c's dkp_svc() has finished writing *all* of track 0 to
+// memory, sectors 1-7 included. Real 6030 hardware, however, is a
+// cycle-stealing DMA controller that interleaves with the CPU one
+// sector at a time; address 0377 sits exactly at the sector 0/sector 1
+// boundary, so on real hardware this file could plausibly start running
+// (and start copying from the still-loading landing zone at 0400)
+// before sectors 1-7 have actually finished arriving. This has NOT been
+// verified against real 6030 hardware or timing -- flagged honestly in
+// FLOPPY_NOTES.md, same spirit as tape/boot_stage2.s.in's own
+// real-hardware caveat.
+
+	org 1
+
+loadaddr:
+	dw @ENTRY@
+nwords:
+	dw @NWORDS@
+srcbase:
+	dw 0400				// fixed hardware landing zone: word
+					// offset of track 0 sector 1, where
+					// Program Load's own DMA deposits the
+					// program's raw words (see this
+					// file's header comment)
+count:
+	dw 0
+
+stage2:
+	LDA 2, srcbase			// AC2 = source cursor = 0400
+	LDA 3, loadaddr			// AC3 = dest cursor = real entry addr
+	LDA 1, nwords
+	STA 1, count			// count = nwords (working counter)
+copyloop:
+	LDA 0, 0, 2			// AC0 = Mem[AC2]  (mode 2: AC2-relative,
+					// displacement 0 -- dereferences AC2)
+	STA 0, 0, 3			// Mem[AC3] = AC0  (mode 3: AC3-relative)
+	INC 2, 2			// AC2 += 1
+	INC 3, 3			// AC3 += 1
+	DSZ count, 0			// count -= 1; skip next instr if 0
+	JMP copyloop, 0
+	JMP @loadaddr			// relocation done -- jump to the
+					// program's real entry point,
+					// indirect through the same page-zero
+					// word used above (loadaddr can be
+					// anywhere in the full 16-bit address
+					// space, not just page zero)
+
+	org 0377
+	JMP stage2, 0			// word offset 255 of track 0 sector 0:
+					// this is where the Program Load ROM's
+					// own trap ends up once the hardware's
+					// DMA of sector 0 finishes -- see this
+					// file's header comment
