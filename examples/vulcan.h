@@ -1,12 +1,22 @@
 #ifndef _VULCAN_H
 #define _VULCAN_H
 
-/* Driver skeleton for the DG Model 6122 "Vulcan" DG-Disc Storage
- * Subsystem (device mnemonic DSKP in the manual). See VULCAN_NOTES.md
- * at the repo root for the full register/command/status citation
- * trail against the real Programmer's Reference (014-000644-00, Rev.
- * 00, First Printing, December 1979) and the Maintenance Manual
+/* Driver for the DG Model 6122 "Vulcan" DG-Disc Storage Subsystem
+ * (device mnemonic DSKP in the manual). See VULCAN_NOTES.md at the
+ * repo root for the full register/command/status citation trail
+ * against the real Programmer's Reference (014-000644-00, Rev. 00,
+ * First Printing, December 1979) and the Maintenance Manual
  * (015-000107-00, 1980).
+ *
+ * As of this session, vulcan.c is implemented on top of a shared DSKP-
+ * family register core (examples/dskp_common.h/.c) also used by
+ * examples/zebra.c and examples/kismet.c -- the three drivers were
+ * unified after all three independently discovered they share the
+ * identical device select code and DSKP register convention (see
+ * DSKP_FAMILY_NOTES.md at the repo root). This header (the public
+ * vulcan_read_block/vulcan_write_block API and Vulcan's own geometry
+ * constants) is unchanged in shape by that refactor -- only vulcan.c's
+ * internals moved onto the shared core.
  *
  * *** UNVERIFIED ON A SIMULATOR OR REAL HARDWARE ***
  * This project's SIMH build (~/dev/simh-src/BIN/eclipse) does not
