@@ -1,148 +1,159 @@
+#define DSKP_VARIANT_KISMET
+#include "dskp_common.h"
 #include "kismet.h"
 
 /* kismet.c -- see kismet.h and KISMET_NOTES.md for the full picture.
  * This is UNVERIFIED against any running DSKP device: this project's
- * SIMH build does not model Kismet, so unlike examples/mmpu.c and
- * examples/disk_probe.s, nothing here has been single-stepped against
- * real or simulated hardware. What *has* been checked (see
- * KISMET_NOTES.md's verification section): this file compiles through
- * `eclipse-cc`'s real pipeline (clang -cc1 -> llvm-link -> opt -> llc
- * -> reorder_asm.py) and the resulting assembly assembles cleanly
- * with the real `dgasm -t eclipse_s140`, including every DOA/DOB/DOC/
- * DIA/DIB/DIC/SKPDN/SKPBN mnemonic and channel+pulse combination
- * (DOAS/DOAC/DOAP/DOBS/.../DIAC/DIBC/DICC) this file uses -- confirmed
- * directly against the real dgasm binary (~/dev/dgasm-src/dgasm),
- * independent of any specific device model, since dgasm's mnemonic
- * grammar doesn't know or care what device code a `dev` line names.
+ * SIMH build does not model Kismet, so nothing here has been single-
+ * stepped against real or simulated hardware. What *has* been checked
+ * (see KISMET_NOTES.md's and DSKP_FAMILY_NOTES.md's verification
+ * sections): this file compiles through `eclipse-cc`'s real pipeline
+ * and the resulting assembly assembles cleanly with the real
+ * `dgasm -t eclipse_s140`.
  *
- * Follows the same inline-asm discipline examples/mmpu.c established:
- * every value crosses the C/asm boundary through a named global (never
- * through "r"-constrained asm operands), because dgasm's `DOA ac,dev`-
- * style instructions take a fixed AC operand slot the way LMP does not
- * (LMP hardcodes AC0-2, DOA/DOB/DOC/DIA/DIB/DIC accept whichever AC you
- * name). Unlike mmpu.c, this file never touches AC2 or AC3 at all --
- * every DOx/DIx instruction below uses AC0 exclusively, reloaded fresh
- * from memory before each one -- so, unlike mmpu.c's mmpu_read_far/
- * mmpu_write_far, there is no need to save/restore the compiler's live
- * frame pointer (AC2) around these asm blocks. (This is a narrower
- * claim than mmpu.c's: it says AC0 is safe to clobber for the duration
- * of one of *these* asm blocks, which matches every existing example
- * in this codebase that uses AC0 as scratch (mmpu.c's own physpage/
- * offset handling, disk_probe.s's DSK register loads) -- it does not
- * re-verify mmpu.c's own AC2 finding.)
+ * This file now sits on top of the shared DSKP-family register core
+ * (dskp_common.h/.c): the `dev DSKP = 027` declaration, the bare
+ * DOA/DOC/DOB loads, bare DIA/DIB reads, the P-pulsed Specify-Cylinder
+ * seek trigger, and the combined S-pulsed Specify-Memory-Address+
+ * start+poll primitive are no longer defined here -- they're identical
+ * across all three DSKP generations and now live once in
+ * dskp_common.c. Two real, substantive changes from the pre-
+ * unification version of this file, both explained here rather than
+ * left silent:
+ *
+ *   1. REGISTER DISCIPLINE: this file previously routed every value
+ *      through named globals (_k_doa_seek, _k_dib_status, etc.) and
+ *      ELDA/ESTA, citing mmpu.c's rationale for why LMP-based code
+ *      needs that. But this file's own original header comment already
+ *      noted that reasoning is NARROWER than mmpu.c's: DOA/DOB/DOC/
+ *      DIA/DIB/DIC (unlike LMP) accept whichever AC the compiler
+ *      chooses, the same as zebra.c's and vulcan.c's own "r"-
+ *      constrained inline-asm operands already relied on -- so there
+ *      was never a hard technical reason Kismet's driver needed the
+ *      global+ELDA/ESTA style, just a different (valid, but not
+ *      required) choice made independently by this file's original
+ *      author. Since dskp_common.c's shared dskp_doa/dskp_doc/dskp_dob/
+ *      dskp_dia/dskp_dib primitives all use "r"-constrained operands
+ *      (matching zebra.c/vulcan.c, needed so all three variants can
+ *      share one implementation), this file now calls those directly
+ *      instead of keeping its own global-based copies -- a real
+ *      implementation change, not just a rename, but one this file's
+ *      own prior comment already predicted was safe.
+ *   2. DEVICE NAME REFERENCE: dskp_common.c's own instructions
+ *      reference `DSKP` symbolically combined with a dynamic "r"-
+ *      operand -- confirmed empirically to assemble correctly (a
+ *      combination this file's pre-unification version, which only
+ *      ever used `DSKP` with a fixed literal AC operand, had not
+ *      actually tried -- see DSKP_FAMILY_NOTES.md).
+ *
+ * What stays HERE, unchanged, because it's real, documented Kismet-
+ * specific behavior:
+ *
+ *   - The DOA drive-select field is 1 bit (bit 10 only, drives 0-1) and
+ *     bit 9 must be 0 -- Zebra/Vulcan both use a 2-bit field (bits
+ *     9-10, drives 0-3) instead; Kismet supports only 2 drives per
+ *     controller (KISMET_UNIT_0/_1, kismet.h), a real hardware
+ *     difference, not a simplification made by this driver.
+ *   - The DOA "Clear Seek Done" field is 2 bits (bits 1-2, drives 0-1)
+ *     -- vs. Zebra's/Vulcan's 4-bit "Clear Atten(0-3)" field, again
+ *     tracking the 2-drive-vs-4-drive difference.
+ *   - The "not-SEEK" case needs TWO DOCs, same shape as Vulcan's: a
+ *     first "Specify Extended, Sector and Count" carrying MSBs, then a
+ *     second "Specify Head, Sector and Count" carrying the low bits.
+ *     Kismet's first DOC additionally carries a HEAD ADDRESS MSB (bit
+ *     4) that Vulcan's equivalent DOC does not have -- needed because
+ *     the 6214's 40 heads don't fit in the base 5-bit head field (bits
+ *     1-5 of the second DOC), unlike Vulcan's fixed 19-surface geometry,
+ *     which never needs a surface-address MSB at all.
+ *   - No manual poll for seek completion -- same "fire and forget"
+ *     strategy as Vulcan's driver (both generations' manuals document
+ *     the controller deferring the stored read/write command
+ *     internally until the outstanding seek finishes); Zebra alone
+ *     polls explicitly. Kismet's own manual is in fact the most
+ *     explicit of the three about this: "If a read/write operation is
+ *     to follow, proceed immediately to Phase III without waiting for
+ *     a drive attention interrupt request" (p.11-12, quoted in full in
+ *     KISMET_NOTES.md).
+ *   - The two genuine internal manual inconsistencies KISMET_NOTES.md
+ *     documents (the DOC/DIC bit-1 double-listing between the "Head
+ *     Address" 5-bit field and a separate "bit 1 reserved" prose row;
+ *     and DIB alternate-mode-1's prose claiming an "extended head
+ *     count in bit 4" that the same page's own bit table marks
+ *     "Reserved") are UNCHANGED by this refactor -- this file's bit
+ *     math still follows the field-boundary diagrams (self-consistent)
+ *     over the prose tables' apparently-erroneous rows, exactly as
+ *     before, and DSKP_FAMILY_NOTES.md repeats rather than re-resolves
+ *     either inconsistency. Neither is exercised by this driver's
+ *     read/write skeleton (the DIB alt-mode-1 field isn't read at all;
+ *     the DOC bit-1/Head-Address ambiguity only matters for a head
+ *     value using bit 1, which this driver's 5-bit head field does use
+ *     for heads 2-3/6-7/etc. -- unresolved either way, same as before).
  */
 
-/* asm("dev DSKP = 027") -- see the file-scope-asm rationale in
- * mmpu.c's own header comment (emitted unconditionally regardless of
- * which functions in this file survive dead-code elimination; exactly
- * one declaration, not one per function, or dgasm errors with
- * "Multiple definitions for symbol DSKP"). Device code 027 octal is
- * the *primary* DSKP select code (Programmer's Reference rev 1 p.4,
- * "Programming Summary": "Device code 27(Alt. 67)") -- the manual
- * documents an alternate 067 octal, jumper-selectable on the
- * controller for systems where 027 collides with something else; not
- * used here. */
-asm("dev DSKP = 027");
-
-/* Command register values (Programmer's Reference rev 1 p.5, DOA bits
- * 5-8), pre-shifted into DOA's bit position (bits 5-8 of a 16-bit
- * word = shift left 7 from the raw 4-bit code). */
-#define KISMET_CMD_READ  (0000 << 7)
-#define KISMET_CMD_SEEK  (0002 << 7)
-#define KISMET_CMD_WRITE (0016 << 7)
-
-/* All intermediate register words and the final status readback cross
- * the C/asm boundary through these globals -- see the file header
- * comment on why (nothing here survives in a register across an asm
- * block). */
-static unsigned int _k_doa_seek;  /* Phase I: DOA (select drive + SEEK cmd) */
-static unsigned int _k_dib_status; /* Phase I: DIB readback (ready/fault check) */
-static unsigned int _k_doc_cyl;   /* Phase II: DOC (Specify Cylinder) + P pulse */
-static unsigned int _k_doa_rw;    /* Phase III: DOA (select drive + READ/WRITE cmd) */
-static unsigned int _k_doc1;      /* Phase IV: DOC (Specify Extended, Sector and Count, 1st) */
-static unsigned int _k_doc2;      /* Phase IV: DOC (Specify Head, Sector and Count, 2nd) */
-static unsigned int _k_dob;       /* Phase IV: DOB (Specify Memory Address) + S pulse */
-static unsigned int _k_status;    /* final DIA readback */
+/* One and only one DSKP-family variant may be linked into a given
+ * program -- see dskp_common.h's own comment on this symbol. */
+int dskp_family_active_variant = DSKP_VARIANT_ID;
 
 /* Phase I only: select the drive, load the SEEK command, and read back
- * drive status (Ready/Busy/Write-disable/fault flags) without pulsing
- * anything -- lets kismet_rw_op() (below) decide in plain C whether to
- * proceed, before any seek or transfer is actually started. Mirrors
- * Figure 2's own "Phase I: Select a Drive and Specify a Seek Command"
- * flowchart (Programmer's Reference rev 1 p.11-12): DOA (select
- * drive+store command) -> DIB (inspect drive status) -> branch on
- * Ready. This DIB read does NOT clear anything (no pulse) -- same
- * assumption disk_probe.s made for DSK's un-pulsed DIA, though for
- * DSKP that assumption isn't confirmed against source (there is no
- * simulator source for this device); see KISMET_NOTES.md. */
-static void kismet_select_and_check(int unit) {
-    _k_doa_seek = (unit & 1) << 5 | KISMET_CMD_SEEK;
-    asm volatile(
-        "ELDA 0,_k_doa_seek,0\n\t"
-        "DOA 0,DSKP\n\t"           /* bare: no pulse yet */
-        "DIB 0,DSKP\n\t"           /* bare: read status, don't clear */
-        "ESTA 0,_k_dib_status,0\n\t"
-    );
+ * drive status without pulsing anything -- lets kismet_rw_op() decide
+ * in plain C whether to proceed, before any seek or transfer starts.
+ * Mirrors Figure 2's own "Phase I: Select a Drive and Specify a Seek
+ * Command" flowchart (Programmer's Reference rev 1 p.11-12). */
+static unsigned int kismet_select_and_check(int unit) {
+    unsigned int doa_word = DSKP_DOA_CMD(DSKP_CMD_SEEK) | ((unsigned int)(unit & 1) << 10);
+    dskp_doa(doa_word);          /* bare: no pulse yet */
+    return dskp_dib();           /* bare: read status, don't clear */
 }
 
 /* Phases II-IV: start the seek (P pulse, does NOT touch the
- * controller's Busy/Done flags per the manual's own f=P description --
- * "Does not affect the Busy flag or Done flag"), immediately proceed
- * to select the drive + READ/WRITE command (Phase III's own text:
- * "If a read/write operation is to follow, proceed immediately to
- * Phase III without waiting for a drive attention interrupt request"),
- * load the extended sector/count + head/sector/count + memory address
- * registers, and pulse S to start the transfer. The controller itself
- * is documented to wait for the seek's Seek Busy flag to clear before
- * actually executing the stored read/write command (p.12's Phase IV
- * text) -- so this driver never polls DIB's per-drive Busy bit at all,
- * only the standard controller Busy/Done flag (SKPDN DSKP) for the
- * read/write's own completion, same generic Nova/Eclipse polled-
+ * controller's Busy/Done flags), immediately proceed to select the
+ * drive + READ/WRITE command (per the manual's own "proceed
+ * immediately to Phase III" guidance quoted above), load the extended
+ * sector/count + head/sector/count + memory address registers, and
+ * pulse S to start the transfer. Only the standard controller
+ * Busy/Done flag (SKPDN DSKP, inside dskp_dobs_start()) is polled --
+ * never DIB's per-drive Busy bit -- same generic Nova/Eclipse polled-
  * completion idiom STORAGE_NOTES.md's disk_probe.s already used for
- * DSK. */
-static void kismet_seek_and_xfer(int unit, int cmd, int cyl, int head,
-                                  int sector, void *buf) {
-    unsigned int head_msb = (head >> 5) & 1;
-    unsigned int sector_msb = (sector >> 5) & 1;
-    /* Two's complement of a 1-sector transfer in the 6-bit count
-     * field (bit 10 of the 1st DOC = MSB, bits 11-15 of the 2nd DOC =
-     * low 5 bits): 64 - 1 = 63 decimal = 077 octal = all six bits set.
-     * count_msb=1, count_low5=037 (all five low bits set). */
-    unsigned int count_msb = 1;
-    unsigned int count_low5 = 037;
+ * DSK. Returns the final DIA status word. */
+static unsigned int kismet_seek_and_xfer(int unit, int cmd, int cyl, int head,
+                                          int sector, void *buf) {
+    unsigned int head_msb = ((unsigned int)head >> 5) & 1u;
+    unsigned int sector_msb = ((unsigned int)sector >> 5) & 1u;
+    /* Two's complement of a 1-sector transfer in the 6-bit count field
+     * (bit 10 of the 1st DOC = MSB, bits 11-15 of the 2nd DOC = low 5
+     * bits): 64 - 1 = 63 decimal = 077 octal = all six bits set. */
+    unsigned int count_msb = 1u;
+    unsigned int count_low5 = 037u;
+    unsigned int doa_rw, doc1, doc2, dob;
 
-    _k_doc_cyl = (unsigned int)cyl & 01777;
-    _k_doa_rw = ((unsigned int)(unit & 1) << 5) | (unsigned int)cmd;
-    _k_doc1 = (head_msb << 11) | (sector_msb << 10) | (count_msb << 5);
-    _k_doc2 = (((unsigned int)head & 037) << 10) |
-              (((unsigned int)sector & 037) << 5) |
-              (count_low5 & 037);
-    _k_dob = (unsigned int)buf & 077777;
+    dskp_docp_seek((unsigned int)cyl & 01777u); /* P pulse: starts the SEEK */
 
-    asm volatile(
-        "ELDA 0,_k_doc_cyl,0\n\t"
-        "DOCP 0,DSKP\n\t"          /* P pulse: starts the SEEK */
-        "ELDA 0,_k_doa_rw,0\n\t"
-        "DOA 0,DSKP\n\t"           /* bare: select drive + READ/WRITE cmd,
-                                    *   per the manual proceed immediately,
-                                    *   no wait for seek completion here */
-        "ELDA 0,_k_doc1,0\n\t"
-        "DOC 0,DSKP\n\t"           /* bare: Specify Extended, Sector and Count (1st) */
-        "ELDA 0,_k_doc2,0\n\t"
-        "DOC 0,DSKP\n\t"           /* bare: Specify Head, Sector and Count (2nd) */
-        "ELDA 0,_k_dob,0\n\t"
-        "DOBS 0,DSKP\n\t"          /* S pulse: sets mem addr AND starts the
-                                    *   read/write (f=S per the manual) */
-        "kismet_rwwait%=:\n\t"
-        "SKPDN DSKP\n\t"           /* controller Busy/Done flag -- standard
-                                    *   generic Nova/Eclipse polled
-                                    *   completion, same idiom disk_probe.s
-                                    *   used for DSK */
-        "JMP kismet_rwwait%=\n\t"
-        "DIA 0,DSKP\n\t"           /* bare: read final status, don't clear */
-        "ESTA 0,_k_status,0\n\t"
-    );
+    doa_rw = DSKP_DOA_CMD((unsigned int)cmd) | ((unsigned int)(unit & 1) << 10);
+    dskp_doa(doa_rw); /* bare: select drive + READ/WRITE cmd, per the
+                        * manual proceed immediately, no wait for seek
+                        * completion here */
+
+    doc1 = (head_msb << 11) | (sector_msb << 10) | (count_msb << 5);
+    dskp_doc(doc1); /* bare: Specify Extended, Sector and Count (1st) */
+
+    doc2 = (((unsigned int)head & 037u) << 10) |
+           (((unsigned int)sector & 037u) << 5) |
+           (count_low5 & 037u);
+    dskp_doc(doc2); /* bare: Specify Head, Sector and Count (2nd) */
+
+    dob = (unsigned int)(unsigned long)buf & 077777u;
+    dskp_dobs_start(dob); /* S pulse: sets mem addr AND starts the
+                            * read/write, then polls SKPDN DSKP to
+                            * completion */
+
+    return dskp_dia(); /* bare: read final status, don't clear */
 }
+
+/* cmd values: kismet.h's own KISMET_CMD_* pre-unification constants
+ * (000/002/016, pre-shifted into DOA bits 5-8) are replaced by the
+ * shared, unshifted DSKP_CMD_READ/SEEK/WRITE from dskp_common.h,
+ * shifted by DSKP_DOA_CMD() at the point of use above -- kismet_rw_op()
+ * below now passes the raw (unshifted) command code. */
 
 /* Shared by kismet_read_block/kismet_write_block -- see kismet.h for
  * the full contract (return value convention, CHS division). */
@@ -153,21 +164,21 @@ static int kismet_rw_op(int unit, int heads, unsigned int blockno,
     unsigned int rem = blockno % sectors_per_cyl;
     unsigned int head = rem / KISMET_SECTORS_PER_TRACK;
     unsigned int sector = rem % KISMET_SECTORS_PER_TRACK;
+    unsigned int dib_status;
 
-    kismet_select_and_check(unit);
-    if (!(_k_dib_status & KISMET_DIB_READY) ||
-        (_k_dib_status & KISMET_DIB_DRV_FAULT)) {
+    dib_status = kismet_select_and_check(unit);
+    if (!(dib_status & KISMET_DIB_READY) ||
+        (dib_status & KISMET_DIB_DRV_FAULT)) {
         return -1; /* not ready / faulted -- see kismet.h's return-value doc */
     }
 
-    kismet_seek_and_xfer(unit, cmd, (int)cyl, (int)head, (int)sector, buf);
-    return (int)_k_status;
+    return (int)kismet_seek_and_xfer(unit, cmd, (int)cyl, (int)head, (int)sector, buf);
 }
 
 int kismet_read_block(int unit, int heads, unsigned int blockno, void *buf) {
-    return kismet_rw_op(unit, heads, blockno, buf, KISMET_CMD_READ);
+    return kismet_rw_op(unit, heads, blockno, buf, DSKP_CMD_READ);
 }
 
 int kismet_write_block(int unit, int heads, unsigned int blockno, void *buf) {
-    return kismet_rw_op(unit, heads, blockno, buf, KISMET_CMD_WRITE);
+    return kismet_rw_op(unit, heads, blockno, buf, DSKP_CMD_WRITE);
 }

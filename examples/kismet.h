@@ -22,6 +22,23 @@
  * octal for systems where 027 is already in use by something else --
  * this driver hard-codes the primary 027; see KISMET_NOTES.md if a
  * real system needs the alternate.
+ *
+ * As of this session, kismet.c is implemented on top of a shared DSKP-
+ * family register core (examples/dskp_common.h/.c) also used by
+ * examples/zebra.c and examples/vulcan.c -- the three drivers were
+ * unified after all three independently discovered they share the
+ * identical device select code and DSKP register convention, and after
+ * this file's own KISMET_NOTES.md documented a real, reproduced build
+ * conflict between Kismet's and Vulcan's `dev DSKP = 027` declarations
+ * (see DSKP_FAMILY_NOTES.md at the repo root for the unification
+ * design and confirmation that this conflict is actually fixed). This
+ * header (the public kismet_read_block/kismet_write_block API and
+ * Kismet's own geometry constants) is unchanged in shape by that
+ * refactor -- only kismet.c's internals moved onto the shared core,
+ * including switching its inline-asm register discipline from
+ * global+ELDA/ESTA to the same "r"-constrained operand style
+ * zebra.c/vulcan.c already used (see kismet.c's own header comment on
+ * why that switch is safe here).
  */
 
 /* Which physical drive (0 or 1) -- DSKP supports at most 2 drives per
