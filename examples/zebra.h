@@ -1,14 +1,26 @@
 #ifndef _ZEBRA_H
 #define _ZEBRA_H
 
-/* Driver skeleton for the DG Model 6060/6061/6067 "Zebra" DG-DISC
- * Storage Subsystem (device mnemonic DSKP in the Technical Manual's own
+/* Driver for the DG Model 6060/6061/6067 "Zebra" DG-DISC Storage
+ * Subsystem (device mnemonic DSKP in the Technical Manual's own
  * accumulator-format diagrams; the DG-wide *standard* I/O device code
  * table names the same select code DPF -- "DG/Disc storage subsystem").
  * See ZEBRA_NOTES.md at the repo root for the full register/command/
  * status citation trail against the real 6060 Series Technical Manual
  * (015-000061-03 Rev 3, 1976-1980) and the ECLIPSE S/140 Programmer's
  * Reference (014-000642-02 Rev 02, Apr 1981).
+ *
+ * As of this session, zebra.c is implemented on top of a shared DSKP-
+ * family register core (examples/dskp_common.h/.c) also used by
+ * examples/vulcan.c and examples/kismet.c -- the three drivers were
+ * unified after all three independently discovered they share the
+ * identical device select code and DSKP register convention (see
+ * DSKP_FAMILY_NOTES.md at the repo root for the unification design,
+ * what's shared vs. Zebra-specific, and how the resulting symbol
+ * collision between the three is resolved). This header (the public
+ * zebra_read_block/zebra_write_block/zebra_status API and Zebra's own
+ * geometry constants) is unchanged in shape by that refactor -- only
+ * zebra.c's internals moved onto the shared core.
  *
  * *** UNVERIFIED ON A SIMULATOR OR REAL HARDWARE ***
  * This project's SIMH build (~/dev/simh-src/BIN/eclipse) does not
