@@ -73,14 +73,94 @@
 //   6. POPB -- pops AC0-AC3+PC(+carry), reactivates Usermap per the
 //      DOA just issued (step 5), resumes at the instruction after SYC.
 //
+// ============================================================
+// THE SYC-VS-SCHEDULER RACE FIX (SYSCALL_NOTES.md section 7): mask ALL
+// device interrupts for this handler's ENTIRE duration, not just SYC's
+// own automatic 2-instruction Inhibit window.
+// ============================================================
+// SYSCALL_NOTES.md's own verified-race section found that MapStat bit 0
+// (User Enable) reads as 0 for a syscall's WHOLE duration (SYC clears
+// it; nothing sets it again until step 5/6 above), so a PIT interrupt
+// landing anywhere in this handler makes scheduler_probe.s's INTHANDLER
+// misidentify -- and sometimes corrupt -- whichever process is
+// resident. The fix here does not touch INTHANDLER or the TCB at all:
+// it makes the race impossible to enter in the first place, using a
+// real, documented, general-purpose interrupt mask distinct from SYC's
+// own narrow Inhibit -- Data General 014-000642-02 Rev 02, p.5-77/5-78
+// (PDF pages 83-84), "Interrupt Disable" (`INTDS` / `NIOC CPU` -- "Sets
+// Interrupt On flag to 0") and "Interrupt Enable" (`INTEN` / `NIOS CPU`
+// -- "Sets Interrupt On flag to 1[;] the CPU allows one more instruction
+// to execute before the first I/O interrupt can occur"). `examples/
+// scheduler_probe.s` already relies on this exact ION mechanism (its
+// own `NIOS 077` as literally the last instruction before `EJMP
+// @resume_target`, and PROCESS_NOTES.md section 2's own "int_req >
+// INT_PENDING is algebraically false while ION is off" derivation) --
+// this fix is the same real hardware primitive, reused, not a new one.
+//
+// Cross-checked directly against `eclipse_cpu.c`'s `DEV_CPU` (device
+// 077) dispatch (~line 5143-5149), not assumed from the manual alone:
+//   case iopS: int_req = (int_req | INT_ION) & ~INT_NO_ION_PENDING; break; // NIOS 077 / INTEN
+//   case iopC: int_req = int_req & ~INT_ION; break;                        // NIOC 077 / INTDS
+// `INTDS`/`NIOC 077` clears bit 19 (`INT_ION`) immediately, with no
+// delay bit of its own (unlike enable, it never touches
+// `INT_NO_ION_PENDING`) -- and the main dispatch loop's interrupt gate
+// (`int_req > INT_PENDING && !Inhibit`, `INT_PENDING = INT_ION +
+// INT_NO_ION_PENDING`) can never be satisfied with `INT_ION` clear, no
+// matter what `INT_NO_ION_PENDING` or the device bits hold (their
+// combined maximum, `INT_NO_ION_PENDING | INT_DEV | INT_STK` = 524287,
+// is strictly less than `INT_PENDING` = 786432) -- so once `NIOC 077`
+// runs, NOTHING can preempt this handler, for as long as it runs,
+// until this handler's own `NIOS 077` reinstates `INT_ION`. `pit_svc`
+// (~line 5862-5871) sets `dev_done`/`int_req`'s PIT bit completely
+// independently of `INT_ION` -- a PIT wrap during the mask is not
+// lost, only deferred: it becomes pending and is delivered at the
+// first safe instruction boundary once ION is back on.
+//
+// Placement, verified against the same iteration-by-iteration `Inhibit`
+// trace SYSCALL_NOTES.md's own race section already used:
+//   - `NIOC 077` is this handler's OWN FIRST INSTRUCTION. There is no
+//     gap between SYC's trap and this mask taking effect: SYC's own
+//     dispatch sets `Inhibit=3` as its last act (blocking the interrupt
+//     check for this handler's first instruction unconditionally,
+//     regardless of ION), and `NIOC 077`'s own effect on `int_req` is
+//     immediate (no enable-side delay), so by the time `Inhibit` lapses
+//     (before this handler's 3rd instruction), ION is already off.
+//   - `NIOS 077` is the LAST instruction before `POPB` -- the identical
+//     "NIOS then exactly one more instruction" idiom `scheduler_probe.s`
+//     already uses before `EJMP @resume_target`. Here the guaranteed
+//     next instruction is `POPB` itself: a pending, deferred PIT
+//     interrupt (if the timer wrapped while masked) can only be
+//     delivered starting at the FIRST instruction after this syscall's
+//     own caller resumes -- an ordinary, already-verified preemption
+//     point (PROCESS_NOTES.md), never mid-handler.
+//   - Neither `NIOC 077` nor `NIOS 077` touches `MapStat`/`MapIntMode`
+//     at all (confirmed directly: `DEV_CPU`'s dispatch code never
+//     references either) -- fully orthogonal to, and does not disturb,
+//     the DIA-must-be-first / bit-0-reconstruction discipline above.
+//
+// What this fix costs, honestly: while ION is masked, a genuinely
+// preemptable "other" process gets NO timeslice at all for this
+// syscall's full duration, however long it runs (a real cost for a
+// long polling-loop syscall like block I/O) -- a latency/fairness
+// tradeoff, not a correctness one. See SYSCALL_NOTES.md for the
+// alternative (per-process software state tracking) this was weighed
+// against and why this was chosen instead.
+//
 // See SYSCALL_NOTES.md for the real, single-stepped SIMH trace evidence
 // this handler was verified with, including the scheduler-race-specific
 // verification this file exists to make possible (not just a rehash of
-// syc_intmode_probe.s's own already-verified finding).
+// syc_intmode_probe.s's own already-verified finding), and the fix's
+// own re-verification against the exact race previously demonstrated.
 
 	dev MAP = 03
 
 __syscall_handler:
+	NIOC 077			// INTDS -- mask ALL device interrupts
+					// for this handler's entire duration;
+					// see header section above. Covered by
+					// SYC's own Inhibit=3 for this single
+					// instruction, so there is no window
+					// before the mask itself takes effect.
 	ESTA 0, __sysh_reason
 	ESTA 1, __sysh_arg1
 	ESTA 2, __sysh_arg2
@@ -118,6 +198,11 @@ __syscall_handler:
 	ADI 0, 1			// AC0 += 1 -- sets bit 0 (known-good
 					// constant, not read from DIA)
 	DOA 0, MAP
+	NIOS 077			// INTEN -- unmask interrupts; see
+					// header section above for why POPB
+					// (the guaranteed next instruction) is
+					// always safe to take a deferred
+					// interrupt after, never before.
 	POPB
 
 	var __sysh_mask_no_bit0 = 0177776	// all bits except bit 0

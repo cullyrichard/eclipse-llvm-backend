@@ -6,6 +6,18 @@
 // open ("SYC racing a live, armed scheduler timer interrupt" was never
 // tested) -- this file is that test.
 //
+// UPDATE (SYSCALL_NOTES.md section 7): the first version of this file
+// found and demonstrated a real, corrupting race (Experiments 1/2 in
+// SYSCALL_NOTES.md section 3, reproduced verbatim below in this file's
+// own comments for the historical record). This file's own
+// `__syscall_handler` copy has SINCE been updated in place with the
+// real fix (`examples/syscall_entry.s`'s `NIOC 077`/`NIOS 077`
+// ION-masking, copied verbatim -- see that file's header) -- this is
+// the SAME probe, re-run at the SAME deterministic injection points,
+// now demonstrating the race is closed rather than a new/different
+// probe. See SYSCALL_NOTES.md section 7 for the fixed re-run
+// transcripts and verdict.
+//
 // Built by combining, UNMODIFIED in mechanism, three already-verified
 // pieces:
 //   - examples/scheduler_probe.s's exact TCB layout (examples/proc.h),
@@ -302,14 +314,21 @@ creset_B:
 	EJMP @resume_target
 
 // ============================================================
-// __syscall_handler -- COPIED VERBATIM from examples/syscall_entry.s
-// (same discipline, not modified -- see this file's own header).
-// `dev MAP = 03` is declared once, in the data section below, shared
-// with INTHANDLER's own use of MAP (dgasm errors on a duplicate `dev`
-// declaration -- examples/mmpu.c's own header comment already found
-// this).
+// __syscall_handler -- COPIED VERBATIM from examples/syscall_entry.s,
+// POST-FIX (see that file's header for the full derivation and
+// SYSCALL_NOTES.md section 7 for the race this closes): `NIOC 077`
+// (INTDS) as the handler's own first instruction masks ALL device
+// interrupts for the handler's entire duration, and `NIOS 077` (INTEN)
+// immediately before `POPB` lifts the mask, using the exact same "NIOS
+// then one guaranteed-safe instruction" idiom this file's own
+// resume_A/resume_B (copied from scheduler_probe.s, below) already use
+// before their own EJMP. `dev MAP = 03` is declared once, in the data
+// section below, shared with INTHANDLER's own use of MAP (dgasm errors
+// on a duplicate `dev` declaration -- examples/mmpu.c's own header
+// comment already found this).
 // ============================================================
 __syscall_handler:
+	NIOC 077			// INTDS -- see examples/syscall_entry.s
 	ESTA 0, __sysh_reason
 	ESTA 1, __sysh_arg1
 	ESTA 2, __sysh_arg2
@@ -336,6 +355,7 @@ __syscall_handler:
 	AND 1, 0
 	ADI 0, 1
 	DOA 0, MAP
+	NIOS 077			// INTEN -- see examples/syscall_entry.s
 	POPB
 
 // ============================================================
