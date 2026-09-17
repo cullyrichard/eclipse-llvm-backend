@@ -7029,10 +7029,10 @@ index 000000000..801225763
 +#endif // LLVM_LIB_TARGET_ECLIPSE_MCTARGETDESC_ECLIPSEMCTARGETDESC_H
 diff --git a/llvm/lib/Target/Eclipse/README.md b/llvm/lib/Target/Eclipse/README.md
 new file mode 100644
-index 000000000..a03ca0994
+index 000000000..320542a92
 --- /dev/null
 +++ b/llvm/lib/Target/Eclipse/README.md
-@@ -0,0 +1,299 @@
+@@ -0,0 +1,313 @@
 +# The Eclipse LLVM backend
 +
 +An out-of-tree-style LLVM target (`lib/Target/Eclipse`, built via
@@ -7298,6 +7298,20 @@ index 000000000..a03ca0994
 +  address for paper-tape/console loading, not a relocation base; making
 +  the output truly relocatable would mean reworking global/constant
 +  addressing to go through a runtime-computed base instead.
++- **Hard 32768-word (0-32767) ceiling on every compiled program's own
++  code/globals — no MMPU integration.** `ELDA`/`ESTA`/`EJSR`/`ELEF`'s
++  absolute operand is exactly 15 bits (`dgasm`'s `opcode.c` hard-errors
++  above 32767, refusing to emit output — not a silent wraparound), so a
++  program whose own address space needs more than that fails to
++  assemble, full stop, regardless of installed physical memory. The
++  real S/140 MMPU can remap physical memory well past that (see
++  `MMPU_NOTES.md` for a verified, working proof-of-concept probe), but
++  that only relocates *which physical words* the existing 0-32767
++  logical window lands on — it doesn't widen the window, and nothing in
++  this backend's codegen manages page tables, so there is currently no
++  path from C source to using it. Real support (an eventual OS being the
++  motivating case) needs new codegen work, not just an MMPU-aware
++  runtime — see `MMPU_NOTES.md`'s "What Phase 2 would actually need".
 +- **Page-zero holds only what real extended addressing can't reach —
 +  fixed twice from the same underlying budget problem, most recently by
 +  using real hardware capability instead of another layer of
